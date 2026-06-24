@@ -842,6 +842,48 @@ bool RunCommand(const FString& InCommand, const FString& InPathToGitBinary, cons
 #define GIT_USE_CUSTOM_LFS 1
 #endif
 
+#if PLATFORM_WINDOWS
+// The bundled git-lfs.exe is launched directly (not via `git`), so it does NOT inherit the
+// helper directories that `git` normally injects into its child processes. LFS lock
+// authentication for an SSH remote shells out via `sh -c "ssh ... git-lfs-authenticate"`, which
+// fails with "executable file not found in %PATH%" when Git's usr/bin (containing sh.exe) is not
+// on the editor process PATH. Ensure the Git installation's tool dirs are reachable. Idempotent:
+// any directory already present on PATH is skipped (no duplicate is added).
+static void EnsureGitLfsToolsInPath(const FString& InPathToGitBinary)
+{
+	const FString GitDir = FPaths::GetPath(InPathToGitBinary); // e.g. ".../Git/bin" or ".../Git/cmd"
+	const FString ToolDirs[] = {
+		FPaths::ConvertRelativePathToFull(FPaths::Combine(GitDir, TEXT("../usr/bin"))),     // sh, ssh, unix tools
+		FPaths::ConvertRelativePathToFull(FPaths::Combine(GitDir, TEXT("../mingw64/bin"))), // git-credential-manager, curl
+		FPaths::ConvertRelativePathToFull(GitDir),                                          // git itself
+	};
+
+	FString PathEnv = FPlatformMisc::GetEnvironmentVariable(TEXT("PATH"));
+	bool bModified = false;
+	for (const FString& Dir : ToolDirs)
+	{
+		if (Dir.IsEmpty() || !FPaths::DirectoryExists(Dir))
+		{
+			continue;
+		}
+		const FString DirWin = Dir.Replace(TEXT("/"), TEXT("\\"));
+		// Wrap both sides in delimiters so we match whole entries (and avoid duplicate insertion).
+		const FString Haystack = FString(TEXT(";")) + PathEnv.Replace(TEXT("/"), TEXT("\\")) + TEXT(";");
+		const FString Needle = FString(TEXT(";")) + DirWin + TEXT(";");
+		if (Haystack.Contains(Needle, ESearchCase::IgnoreCase))
+		{
+			continue; // already on PATH -> leave it, no duplicate
+		}
+		PathEnv = DirWin + TEXT(";") + PathEnv;
+		bModified = true;
+	}
+	if (bModified)
+	{
+		FPlatformMisc::SetEnvironmentVar(TEXT("PATH"), *PathEnv);
+	}
+}
+#endif
+
 bool RunLFSCommand(const FString& InCommand, const FString& InRepositoryRoot, const FString& GitBinaryFallback, const TArray<FString>& InParameters, const TArray<FString>& InFiles,
 				   TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
 {
@@ -850,6 +892,8 @@ bool RunLFSCommand(const FString& InCommand, const FString& InRepositoryRoot, co
 	FString BaseDir = IPluginManager::Get().FindPlugin("GitSourceControl")->GetBaseDir();
 #if PLATFORM_WINDOWS
 	FString LFSLockBinary = FString::Printf(TEXT("%s/git-lfs.exe"), *BaseDir);
+	// Make sure the bundled git-lfs.exe can find sh/ssh/credential helpers from the same Git install.
+	EnsureGitLfsToolsInPath(GitBinaryFallback);
 #elif PLATFORM_MAC
 #if ENGINE_MAJOR_VERSION >= 5
 #if PLATFORM_MAC_ARM64
