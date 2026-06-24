@@ -1423,6 +1423,18 @@ static void ParseFileStatusResult(const FString& InPathToGitBinary, const FStrin
 					if (LfsUserName == FileState.State.LockUser)
 					{
 						FileState.State.LockState = ELockState::Locked;
+						// We hold the lock, so the file is checked out and must be writable on disk.
+						// OnFileLockChanged() only syncs the read-only flag on lock *transitions*; if the
+						// file is already locked by us (e.g. from a previous session) or its read-only
+						// attribute was re-applied by a later git operation, it would stay read-only.
+						// Since we report UsesLocalReadOnlyState()==true, the editor trusts the lock state and
+						// skips the "Make Writable" prompt for an already-checked-out file, so saving would
+						// fail with "the file is read-only". Clear it here to keep disk state consistent.
+						IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+						if (PlatformFile.FileExists(*File) && PlatformFile.IsReadOnly(*File))
+						{
+							PlatformFile.SetReadOnly(*File, false);
+						}
 					}
 					else
 					{
