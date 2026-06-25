@@ -30,7 +30,22 @@ FGitSourceControlCommand::FGitSourceControlCommand(const TSharedRef<class ISourc
 
 void FGitSourceControlCommand::UpdateRepositoryRootIfSubmodule(TArray<FString>& AbsoluteFilePaths)
 {
-	PathToRepositoryRoot = GitSourceControlUtils::ChangeRepositoryRootIfSubmodule(AbsoluteFilePaths, PathToRepositoryRoot);
+	const FString NewRepositoryRoot = GitSourceControlUtils::ChangeRepositoryRootIfSubmodule(AbsoluteFilePaths, PathToRepositoryRoot);
+
+	// When the selected files live in a submodule, every git/LFS operation for this command
+	// must run at the submodule's own root. PathToRepositoryRoot drives status/lock-listing,
+	// but the LFS lock/unlock commands (CheckOut/CheckIn/Revert) run against PathToGitRoot --
+	// if that stays the parent repo root, locks for submodule files land on the PARENT repo's
+	// lock server (wrong server: no protection for submodule collaborators, and it pollutes the
+	// parent's lock list). Keep PathToGitRoot in sync so submodule locking targets the submodule.
+	// Only override when a submodule was actually detected, so the "project nested in a larger
+	// git repo" case (where PathToGitRoot is a legitimate parent dir) is left untouched.
+	if (NewRepositoryRoot != PathToRepositoryRoot)
+	{
+		PathToGitRoot = NewRepositoryRoot;
+	}
+
+	PathToRepositoryRoot = NewRepositoryRoot;
 }
 
 bool FGitSourceControlCommand::DoWork()
