@@ -82,9 +82,24 @@ const FString& FGitScopedTempFile::GetFilename() const
 
 FDateTime FGitLockedFilesCache::LastUpdated = FDateTime::MinValue();
 TMap<FString, FString> FGitLockedFilesCache::LockedFiles = TMap<FString, FString>();
+FCriticalSection FGitLockedFilesCache::LockedFilesMutex;
+TMap<FString, int32> FGitLockedFilesCache::MissingStreak;
+TMap<FString, int32> FGitLockedFilesCache::AppearStreak;
+
+TMap<FString, FString> FGitLockedFilesCache::GetLockedFiles()
+{
+	FScopeLock Lock(&LockedFilesMutex);
+	return LockedFiles;
+}
 
 void FGitLockedFilesCache::SetLockedFiles(const TMap<FString, FString>& newLocks)
-{	
+{
+	FScopeLock Lock(&LockedFilesMutex);
+	SetLockedFilesInternal(newLocks);
+}
+
+void FGitLockedFilesCache::SetLockedFilesInternal(const TMap<FString, FString>& newLocks)
+{
 	for (auto lock : LockedFiles)
 	{
 		if (!newLocks.Contains(lock.Key))
@@ -92,13 +107,13 @@ void FGitLockedFilesCache::SetLockedFiles(const TMap<FString, FString>& newLocks
 			OnFileLockChanged(lock.Key, lock.Value, false);
 		}
 	}
-	
+
 	for (auto lock : newLocks)
-	{		
+	{
 		if (!LockedFiles.Contains(lock.Key))
 		{
 			OnFileLockChanged(lock.Key, lock.Value, true);
-		}		
+		}
 	}
 
 	LockedFiles = newLocks;
@@ -106,15 +121,89 @@ void FGitLockedFilesCache::SetLockedFiles(const TMap<FString, FString>& newLocks
 
 void FGitLockedFilesCache::AddLockedFile(const FString& filePath, const FString& lockUser)
 {
+	FScopeLock Lock(&LockedFilesMutex);
 	LockedFiles.Add(filePath, lockUser);
+	// a lock we just took (or released) ourselves is authoritative - reset any damping state
+	MissingStreak.Remove(filePath);
+	AppearStreak.Remove(filePath);
 	OnFileLockChanged(filePath, lockUser, true);
 }
 
 void FGitLockedFilesCache::RemoveLockedFile(const FString& filePath)
 {
+	FScopeLock Lock(&LockedFilesMutex);
 	FString user;
 	LockedFiles.RemoveAndCopyValue(filePath, user);
+	MissingStreak.Remove(filePath);
+	AppearStreak.Remove(filePath);
 	OnFileLockChanged(filePath, user, false);
+}
+
+TMap<FString, FString> FGitLockedFilesCache::UpdateFromServerListing(const TMap<FString, FString>& FreshLocks)
+{
+	// The LFS lock API of some hosts (observed on git.code.tencent.com) is eventually
+	// consistent: for minutes after any lock/unlock, individual listings randomly omit
+	// existing locks or resurrect released ones, each request hitting a differently-stale
+	// replica. Taking every listing at face value made checkout badges and on-disk
+	// read-only bits flip back and forth on the 30s refresh cadence. So a divergence from
+	// our cached view is only accepted once several consecutive listings agree on it.
+	// Lock/unlock operations we perform ourselves bypass this damping entirely via
+	// AddLockedFile/RemoveLockedFile, so our own actions still take effect immediately.
+	constexpr int32 MissingListingsBeforeDrop = 3;
+	constexpr int32 AppearListingsBeforeAdd = 2;
+
+	FScopeLock Lock(&LockedFilesMutex);
+	TMap<FString, FString> Smoothed = FreshLocks;
+	for (const auto& Known : LockedFiles)
+	{
+		if (!FreshLocks.Contains(Known.Key))
+		{
+			int32& Streak = MissingStreak.FindOrAdd(Known.Key);
+			if (++Streak < MissingListingsBeforeDrop)
+			{
+				Smoothed.Add(Known.Key, Known.Value); // keep until the absence is corroborated
+			}
+			else
+			{
+				MissingStreak.Remove(Known.Key);
+			}
+		}
+		else
+		{
+			MissingStreak.Remove(Known.Key);
+		}
+	}
+	for (const auto& Fresh : FreshLocks)
+	{
+		if (!LockedFiles.Contains(Fresh.Key))
+		{
+			int32& Streak = AppearStreak.FindOrAdd(Fresh.Key);
+			if (++Streak < AppearListingsBeforeAdd)
+			{
+				Smoothed.Remove(Fresh.Key); // ignore until the appearance is corroborated
+			}
+			else
+			{
+				AppearStreak.Remove(Fresh.Key);
+			}
+		}
+		else
+		{
+			AppearStreak.Remove(Fresh.Key);
+		}
+	}
+	// drop appear-streaks for locks the server no longer reports, so an on/off flapping
+	// ghost cannot slowly accumulate a qualifying streak across non-consecutive listings
+	for (auto It = AppearStreak.CreateIterator(); It; ++It)
+	{
+		if (!FreshLocks.Contains(It.Key()))
+		{
+			It.RemoveCurrent();
+		}
+	}
+
+	SetLockedFilesInternal(Smoothed);
+	return Smoothed;
 }
 
 void FGitLockedFilesCache::OnFileLockChanged(const FString& filePath, const FString& lockUser, bool locked)
@@ -1655,16 +1744,18 @@ bool GetAllLocks(const FString& InRepositoryRoot, const FString& GitBinaryFallba
 								Results, OutErrorMessages);
 		if (bResult)
 		{
+			TMap<FString, FString> FreshLocks;
 			for (const FString& Result : Results)
 			{
 				FGitLfsLocksParser LockFile(InRepositoryRoot, Result);
 #if UE_BUILD_DEBUG && GIT_DEBUG_STATUS
 				UE_LOG(LogSourceControl, Log, TEXT("LockedFile(%s, %s)"), *LockFile.LocalFilename, *LockFile.LockUser);
 #endif
-				OutLocks.Add(MoveTemp(LockFile.LocalFilename), MoveTemp(LockFile.LockUser));
+				FreshLocks.Add(MoveTemp(LockFile.LocalFilename), MoveTemp(LockFile.LockUser));
 			}
 			FGitLockedFilesCache::LastUpdated = CurrentTime;
-			FGitLockedFilesCache::SetLockedFiles(OutLocks);
+			// smooth over eventually-consistent listings before anyone consumes them
+			OutLocks = FGitLockedFilesCache::UpdateFromServerListing(FreshLocks);
 			return bResult;
 		}
 		// We tried to invalidate the UE cache, but we failed for some reason. Try updating lock state from LFS cache.

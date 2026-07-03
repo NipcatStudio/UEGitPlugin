@@ -44,15 +44,27 @@ class FGitLockedFilesCache
 public:
 	static FDateTime LastUpdated;
 
- static const TMap<FString, FString>& GetLockedFiles() { return LockedFiles; }
+ static TMap<FString, FString> GetLockedFiles();
  static void SetLockedFiles(const TMap<FString, FString>& newLocks);
  static void AddLockedFile(const FString& filePath, const FString& lockUser);
  static void RemoveLockedFile(const FString& filePath);
+ // Feed a fresh remote lock listing through flap damping (the LFS lock API of some hosts is
+ // eventually consistent and individual listings randomly omit or resurrect locks for a while
+ // after any mutation). Returns the smoothed lock set that callers should treat as current.
+ static TMap<FString, FString> UpdateFromServerListing(const TMap<FString, FString>& FreshLocks);
 
 private:
  static void OnFileLockChanged(const FString& filePath, const FString& lockUser, bool locked);
+ static void SetLockedFilesInternal(const TMap<FString, FString>& newLocks);
  // update local read/write state when our own lock statuses change
 	static TMap<FString, FString> LockedFiles;
+	// guards LockedFiles and the streak maps: source control commands run on pooled worker
+	// threads, so listings and lock/unlock completions can touch the cache concurrently
+	static FCriticalSection LockedFilesMutex;
+	// consecutive remote listings a known lock has been missing from / an unknown lock has
+	// appeared in; a divergence is only accepted once corroborated (see UpdateFromServerListing)
+	static TMap<FString, int32> MissingStreak;
+	static TMap<FString, int32> AppearStreak;
 };
 
 namespace GitSourceControlUtils
