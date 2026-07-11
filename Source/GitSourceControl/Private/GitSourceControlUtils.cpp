@@ -1512,18 +1512,6 @@ static void ParseFileStatusResult(const FString& InPathToGitBinary, const FStrin
 					if (LfsUserName == FileState.State.LockUser)
 					{
 						FileState.State.LockState = ELockState::Locked;
-						// We hold the lock, so the file is checked out and must be writable on disk.
-						// OnFileLockChanged() only syncs the read-only flag on lock *transitions*; if the
-						// file is already locked by us (e.g. from a previous session) or its read-only
-						// attribute was re-applied by a later git operation, it would stay read-only.
-						// Since we report UsesLocalReadOnlyState()==true, the editor trusts the lock state and
-						// skips the "Make Writable" prompt for an already-checked-out file, so saving would
-						// fail with "the file is read-only". Clear it here to keep disk state consistent.
-						IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
-						if (PlatformFile.FileExists(*File) && PlatformFile.IsReadOnly(*File))
-						{
-							PlatformFile.SetReadOnly(*File, false);
-						}
 					}
 					else
 					{
@@ -1536,6 +1524,23 @@ static void ParseFileStatusResult(const FString& InPathToGitBinary, const FStrin
 #if UE_BUILD_DEBUG && GIT_DEBUG_STATUS
 					UE_LOG(LogSourceControl, Log, TEXT("Status(%s) Not Locked"), *File);
 #endif
+				}
+				// The editor fully trusts UsesLocalReadOnlyState(): for any state it considers
+				// checked out it skips both the checkout and the "Make Writable" prompts and writes
+				// straight to disk, so a stale read-only bit turns Save into a hard "file is
+				// read-only" failure. IsCheckedOut() covers more than our own locks: it is also
+				// true for locally modified files nobody has locked. The bit goes stale behind our
+				// back - git-lfs re-applies read-only to every 'lockable' file it has no local lock
+				// record for whenever the working tree is touched (pull/checkout/reset). Re-assert
+				// the invariant each time we recompute a state; files locked by someone else are
+				// never touched (LockedOther is not considered checked out).
+				if (FileState.IsCheckedOut())
+				{
+					IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+					if (PlatformFile.FileExists(*File) && PlatformFile.IsReadOnly(*File))
+					{
+						PlatformFile.SetReadOnly(*File, false);
+					}
 				}
 			}
 			else
@@ -1717,6 +1722,31 @@ void CheckRemote(const FString& InPathToGitBinary, const FString& InRepositoryRo
 
 const FTimespan CacheLimit = FTimespan::FromSeconds(30);
 
+// Our lock => the file must be writable on disk: the editor skips every checkout /
+// "Make Writable" prompt for checked-out files and writes directly, so a read-only bit on
+// a file we hold the lock for turns Save into a hard failure. git-lfs re-applies the bit
+// to any 'lockable' file it has no local lock record for whenever the working tree is
+// touched (pull/checkout/reset), which silently breaks the invariant for locks taken in
+// another clone/session or at a different repo root. Sweep every lock we own after each
+// refreshed listing, not just the files covered by the current status query.
+static void EnsureOwnLocksWritable(const TMap<FString, FString>& InLocks)
+{
+	FGitSourceControlModule* GitSourceControl = FGitSourceControlModule::GetThreadSafe();
+	if (!GitSourceControl)
+	{
+		return;
+	}
+	const FString& LockUser = GitSourceControl->GetProvider().GetLockUser();
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	for (const auto& Lock : InLocks)
+	{
+		if (Lock.Value == LockUser && PlatformFile.FileExists(*Lock.Key) && PlatformFile.IsReadOnly(*Lock.Key))
+		{
+			PlatformFile.SetReadOnly(*Lock.Key, false);
+		}
+	}
+}
+
 bool GetAllLocks(const FString& InRepositoryRoot, const FString& GitBinaryFallback, TArray<FString>& OutErrorMessages, TMap<FString, FString>& OutLocks, bool bInvalidateCache)
 {
 	// You may ask, why are we ignoring state cache, and instead maintaining our own lock cache?
@@ -1756,6 +1786,7 @@ bool GetAllLocks(const FString& InRepositoryRoot, const FString& GitBinaryFallba
 			FGitLockedFilesCache::LastUpdated = CurrentTime;
 			// smooth over eventually-consistent listings before anyone consumes them
 			OutLocks = FGitLockedFilesCache::UpdateFromServerListing(FreshLocks);
+			EnsureOwnLocksWritable(OutLocks);
 			return bResult;
 		}
 		// We tried to invalidate the UE cache, but we failed for some reason. Try updating lock state from LFS cache.
@@ -1804,6 +1835,10 @@ bool GetAllLocks(const FString& InRepositoryRoot, const FString& GitBinaryFallba
 				{
 					OutLocks.Add(MoveTemp(LockFile.LocalFilename), MoveTemp(LockFile.LockUser));
 				}
+			}
+			if (bResult)
+			{
+				EnsureOwnLocksWritable(OutLocks);
 			}
 		}
 	}
