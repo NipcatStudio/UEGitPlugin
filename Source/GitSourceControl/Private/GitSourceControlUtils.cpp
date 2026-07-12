@@ -377,6 +377,68 @@ bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitB
 }
 
 // Basic parsing or results & errors from the Git command line process
+// git takes <gitdir>/index.lock for every index mutation and fails immediately when the
+// file already exists. Two situations produce that: a concurrent git process legitimately
+// holding it for a moment (our background status refresh overlaps user operations), and a
+// lock orphaned by a git process that died without cleanup - git never removes those on
+// its own, so every later add/rm/commit fails with a misleading "Git command failed"
+// dialog until someone deletes the file by hand. Returns true if the command is worth
+// retrying: after a short sleep for live contention, or immediately after deleting a lock
+// that is provably stale.
+static bool TryRecoverFromIndexLockFailure(const FString& InErrors, const int32 InAttempt)
+{
+	// The error text is localized, but the embedded lock path always names index.lock.
+	if (!InErrors.Contains(TEXT("index.lock")))
+	{
+		return false;
+	}
+
+	// "fatal: Unable to create '<path>/index.lock': File exists." - lift the path out of
+	// the quotes. Works for submodules too (the message names the real gitdir under
+	// <parent>/.git/modules/...). If the shape ever changes, we still do the plain retry.
+	FString LockPath;
+	int32 QuoteStart = InErrors.Find(TEXT("'"));
+	if (QuoteStart != INDEX_NONE)
+	{
+		const int32 PathStart = QuoteStart + 1;
+		const int32 QuoteEnd = InErrors.Find(TEXT("'"), ESearchCase::CaseSensitive, ESearchDir::FromStart, PathStart);
+		if (QuoteEnd != INDEX_NONE)
+		{
+			const FString Candidate = InErrors.Mid(PathStart, QuoteEnd - PathStart);
+			if (Candidate.EndsWith(TEXT("index.lock")))
+			{
+				LockPath = Candidate;
+			}
+		}
+	}
+
+	if (!LockPath.IsEmpty() && IFileManager::Get().FileExists(*LockPath))
+	{
+		const FDateTime LockTimestamp = IFileManager::Get().GetTimeStamp(*LockPath);
+		const FTimespan LockAge = FDateTime::UtcNow() - LockTimestamp;
+		constexpr double StaleLockAgeSeconds = 5.0 * 60.0;
+		if (LockAge.GetTotalSeconds() > StaleLockAgeSeconds)
+		{
+			// Nothing legitimate holds an index lock for minutes during an editor session;
+			// the owning process is gone. Deleting even a live writer's lock is not
+			// repository corruption: the index is written into the lock file and renamed
+			// over the real index in one step, so the worst case is one lost refresh.
+			if (IFileManager::Get().Delete(*LockPath, /*RequireExists*/ false, /*EvenReadOnly*/ true))
+			{
+				UE_LOG(LogSourceControl, Warning, TEXT("Removed stale git index lock (age %s): %s"), *LockAge.ToString(), *LockPath);
+				return true;
+			}
+			UE_LOG(LogSourceControl, Warning, TEXT("Could not remove stale git index lock: %s"), *LockPath);
+			return false;
+		}
+	}
+
+	// Young lock (or the file is already gone): live contention - give the other process a
+	// moment and retry.
+	FPlatformProcess::Sleep(0.5f * InAttempt);
+	return true;
+}
+
 static bool RunCommandInternal(const FString& InCommand, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters,
 							   const TArray<FString>& InFiles, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
 {
@@ -384,7 +446,17 @@ static bool RunCommandInternal(const FString& InCommand, const FString& InPathTo
 	FString Results;
 	FString Errors;
 
-	bResult = RunCommandInternalRaw(InCommand, InPathToGitBinary, InRepositoryRoot, InParameters, InFiles, Results, Errors);
+	constexpr int32 MaxAttempts = 4; // 1 initial + up to 3 index.lock recovery retries
+	for (int32 Attempt = 1;; ++Attempt)
+	{
+		Results.Reset();
+		Errors.Reset();
+		bResult = RunCommandInternalRaw(InCommand, InPathToGitBinary, InRepositoryRoot, InParameters, InFiles, Results, Errors);
+		if (bResult || Attempt >= MaxAttempts || !TryRecoverFromIndexLockFailure(Errors, Attempt))
+		{
+			break;
+		}
+	}
 	Results.ParseIntoArray(OutResults, TEXT("\n"), true);
 	Errors.ParseIntoArray(OutErrorMessages, TEXT("\n"), true);
 
