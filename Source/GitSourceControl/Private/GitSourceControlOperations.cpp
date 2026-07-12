@@ -123,9 +123,49 @@ bool FGitCheckOutWorker::Execute(FGitSourceControlCommand& InCommand)
 		return InCommand.bCommandSuccessful;
 	}
 
-	const bool bSuccess = GitSourceControlUtils::RunLFSCommand(TEXT("lock"), InCommand.PathToGitRoot, InCommand.PathToGitBinary, FGitSourceControlModule::GetEmptyStringArray(), LockableRelativeFiles, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
-	InCommand.bCommandSuccessful = bSuccess;
+	bool bSuccess = GitSourceControlUtils::RunLFSCommand(TEXT("lock"), InCommand.PathToGitRoot, InCommand.PathToGitBinary, FGitSourceControlModule::GetEmptyStringArray(), LockableRelativeFiles, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
 	const FString& LockUser = FGitSourceControlModule::Get().GetProvider().GetLockUser();
+	if (!bSuccess)
+	{
+		// The lock endpoint of some hosts (observed on git.code.tencent.com) is flaky: the
+		// lock POST can time out client-side while the lock is created server-side, after
+		// which every retry fails with "lock already created" and checkout looks permanently
+		// broken to the user. Confirm against a fresh listing - if we own the lock for every
+		// file we asked for, this checkout has in fact succeeded.
+		TMap<FString, FString> ServerLocks;
+		TArray<FString> LockListingErrors;
+		if (GitSourceControlUtils::GetAllLocks(InCommand.PathToGitRoot, InCommand.PathToGitBinary, LockListingErrors, ServerLocks, true))
+		{
+			bSuccess = true;
+			for (const FString& RelativeFile : LockableRelativeFiles)
+			{
+				FString AbsoluteFile = FPaths::Combine(InCommand.PathToGitRoot, RelativeFile);
+				FPaths::NormalizeFilename(AbsoluteFile);
+				const FString* Owner = ServerLocks.Find(AbsoluteFile);
+				if (!Owner)
+				{
+					for (const auto& Lock : ServerLocks)
+					{
+						if (FPaths::IsSamePath(Lock.Key, AbsoluteFile))
+						{
+							Owner = &Lock.Value;
+							break;
+						}
+					}
+				}
+				if (!Owner || *Owner != LockUser)
+				{
+					bSuccess = false;
+					break;
+				}
+			}
+			if (bSuccess)
+			{
+				UE_LOG(LogSourceControl, Warning, TEXT("CheckOut: 'git lfs lock' reported failure but the server lists us as lock owner of all %d file(s); treating the checkout as successful."), LockableRelativeFiles.Num());
+			}
+		}
+	}
+	InCommand.bCommandSuccessful = bSuccess;
 	if (bSuccess)
 	{
 		TArray<FString> AbsoluteFiles;
