@@ -481,6 +481,77 @@ ECommandResult::Type FGitSourceControlProvider::Execute( const FSourceControlOpe
 		return ECommandResult::Failed;
 	}
 
+	// A git process acts on exactly one repository, but the editor freely batches files from
+	// the project repo and plugin submodules into a single operation (e.g. saving a mixed set
+	// of dirty packages issues one CheckOut for all of them). The old behavior forced such a
+	// batch onto the main root ("Selected files belong to different submodules") and the
+	// whole operation failed. Partition the files by their owning repository and run one
+	// internal command per repository instead; the engine-visible operation completes once,
+	// when the last internal command finishes, failed if any of them failed.
+	TMap<FString, TArray<FString>> FilesByRepositoryRoot;
+	for (const FString& AbsoluteFile : AbsoluteFiles)
+	{
+		FString FileCopy = AbsoluteFile;
+		FString Root = GitSourceControlUtils::ChangeRepositoryRootIfSubmodule(FileCopy, PathToRepositoryRoot);
+		FPaths::NormalizeDirectoryName(Root);
+		FilesByRepositoryRoot.FindOrAdd(MoveTemp(Root)).Add(AbsoluteFile);
+	}
+
+	if (FilesByRepositoryRoot.Num() > 1)
+	{
+		struct FFanOutState
+		{
+			int32 RemainingCommands = 0;
+			bool bAnyFailed = false;
+			FSourceControlOperationComplete OriginalDelegate;
+		};
+		TSharedRef<FFanOutState, ESPMode::ThreadSafe> FanOut = MakeShared<FFanOutState, ESPMode::ThreadSafe>();
+		FanOut->RemainingCommands = FilesByRepositoryRoot.Num();
+		FanOut->OriginalDelegate = InOperationCompleteDelegate;
+
+		// Completion delegates always run on the game thread (Tick, or the pump inside
+		// ExecuteSynchronousCommand), so plain members are safe here.
+		const FSourceControlOperationComplete PerRepositoryDelegate = FSourceControlOperationComplete::CreateLambda(
+			[FanOut](const FSourceControlOperationRef& CompletedOperation, ECommandResult::Type InResult)
+			{
+				FanOut->bAnyFailed |= (InResult != ECommandResult::Succeeded);
+				if (--FanOut->RemainingCommands == 0)
+				{
+					FanOut->OriginalDelegate.ExecuteIfBound(CompletedOperation, FanOut->bAnyFailed ? ECommandResult::Failed : ECommandResult::Succeeded);
+				}
+			});
+
+		ECommandResult::Type AggregatedResult = ECommandResult::Succeeded;
+		for (TPair<FString, TArray<FString>>& FilesForRoot : FilesByRepositoryRoot)
+		{
+			TSharedPtr<IGitSourceControlWorker, ESPMode::ThreadSafe> RepositoryWorker = CreateWorker(InOperation->GetName());
+			FGitSourceControlCommand* RepositoryCommand = new FGitSourceControlCommand(InOperation, RepositoryWorker.ToSharedRef());
+			RepositoryCommand->UpdateRepositoryRootIfSubmodule(FilesForRoot.Value);
+			RepositoryCommand->Files = FilesForRoot.Value;
+			RepositoryCommand->OperationCompleteDelegate = PerRepositoryDelegate;
+#if ENGINE_MAJOR_VERSION == 5
+			TSharedPtr<FGitSourceControlChangelist, ESPMode::ThreadSafe> RepositoryChangelistPtr = StaticCastSharedPtr<FGitSourceControlChangelist>(InChangelist);
+			RepositoryCommand->Changelist = RepositoryChangelistPtr ? RepositoryChangelistPtr.ToSharedRef().Get() : FGitSourceControlChangelist();
+#endif
+			ECommandResult::Type RepositoryResult;
+			if (InConcurrency == EConcurrency::Synchronous)
+			{
+				RepositoryCommand->bAutoDelete = false;
+				RepositoryResult = ExecuteSynchronousCommand(*RepositoryCommand, InOperation->GetInProgressString(), false);
+			}
+			else
+			{
+				RepositoryCommand->bAutoDelete = true;
+				RepositoryResult = IssueCommand(*RepositoryCommand);
+			}
+			if (RepositoryResult != ECommandResult::Succeeded)
+			{
+				AggregatedResult = RepositoryResult;
+			}
+		}
+		return AggregatedResult;
+	}
+
 	FGitSourceControlCommand* Command = new FGitSourceControlCommand(InOperation, Worker.ToSharedRef());
 	Command->UpdateRepositoryRootIfSubmodule(AbsoluteFiles);
 	Command->Files = AbsoluteFiles;
