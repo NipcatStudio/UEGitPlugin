@@ -51,7 +51,7 @@ public:
  // Feed a fresh remote lock listing through flap damping (the LFS lock API of some hosts is
  // eventually consistent and individual listings randomly omit or resurrect locks for a while
  // after any mutation). Returns the smoothed lock set that callers should treat as current.
- static TMap<FString, FString> UpdateFromServerListing(const TMap<FString, FString>& FreshLocks);
+ static TMap<FString, FString> UpdateFromServerListing(const FString& InRepositoryRoot, const TMap<FString, FString>& FreshLocks);
 
 private:
  static void OnFileLockChanged(const FString& filePath, const FString& lockUser, bool locked);

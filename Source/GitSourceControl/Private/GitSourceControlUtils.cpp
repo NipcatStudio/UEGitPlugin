@@ -139,7 +139,7 @@ void FGitLockedFilesCache::RemoveLockedFile(const FString& filePath)
 	OnFileLockChanged(filePath, user, false);
 }
 
-TMap<FString, FString> FGitLockedFilesCache::UpdateFromServerListing(const TMap<FString, FString>& FreshLocks)
+TMap<FString, FString> FGitLockedFilesCache::UpdateFromServerListing(const FString& InRepositoryRoot, const TMap<FString, FString>& FreshLocks)
 {
 	// The LFS lock API of some hosts (observed on git.code.tencent.com) is eventually
 	// consistent: for minutes after any lock/unlock, individual listings randomly omit
@@ -152,10 +152,30 @@ TMap<FString, FString> FGitLockedFilesCache::UpdateFromServerListing(const TMap<
 	constexpr int32 MissingListingsBeforeDrop = 3;
 	constexpr int32 AppearListingsBeforeAdd = 2;
 
+	// A listing covers exactly one repository (the main repo or one submodule), while this
+	// cache spans all of them (keys are absolute paths). Locks belonging to other
+	// repositories are invisible to this listing, not missing - reconcile only the entries
+	// under the listing's root and pass every other repository's entries through untouched,
+	// otherwise a submodule status query would erode the cached main-repo locks (and their
+	// on-disk read-only bits) within a few listings.
+	FString RootPrefix = InRepositoryRoot;
+	FPaths::NormalizeDirectoryName(RootPrefix);
+	RootPrefix += TEXT("/");
+	const auto IsUnderRoot = [&RootPrefix](const FString& Path)
+	{
+		return Path.StartsWith(RootPrefix, ESearchCase::IgnoreCase);
+	};
+
 	FScopeLock Lock(&LockedFilesMutex);
 	TMap<FString, FString> Smoothed = FreshLocks;
 	for (const auto& Known : LockedFiles)
 	{
+		if (!IsUnderRoot(Known.Key))
+		{
+			// out of this listing's scope - keep as-is, no streak accounting
+			Smoothed.Add(Known.Key, Known.Value);
+			continue;
+		}
 		if (!FreshLocks.Contains(Known.Key))
 		{
 			int32& Streak = MissingStreak.FindOrAdd(Known.Key);
@@ -194,9 +214,10 @@ TMap<FString, FString> FGitLockedFilesCache::UpdateFromServerListing(const TMap<
 	}
 	// drop appear-streaks for locks the server no longer reports, so an on/off flapping
 	// ghost cannot slowly accumulate a qualifying streak across non-consecutive listings
+	// (scoped to this listing's repository - other repos' streaks are not our business here)
 	for (auto It = AppearStreak.CreateIterator(); It; ++It)
 	{
-		if (!FreshLocks.Contains(It.Key()))
+		if (IsUnderRoot(It.Key()) && !FreshLocks.Contains(It.Key()))
 		{
 			It.RemoveCurrent();
 		}
@@ -1857,7 +1878,7 @@ bool GetAllLocks(const FString& InRepositoryRoot, const FString& GitBinaryFallba
 			}
 			FGitLockedFilesCache::LastUpdated = CurrentTime;
 			// smooth over eventually-consistent listings before anyone consumes them
-			OutLocks = FGitLockedFilesCache::UpdateFromServerListing(FreshLocks);
+			OutLocks = FGitLockedFilesCache::UpdateFromServerListing(InRepositoryRoot, FreshLocks);
 			EnsureOwnLocksWritable(OutLocks);
 			return bResult;
 		}
