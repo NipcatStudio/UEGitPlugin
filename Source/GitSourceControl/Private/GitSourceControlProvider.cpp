@@ -764,6 +764,32 @@ void FGitSourceControlProvider::Tick()
 	}
 #endif
 
+	// Apply lock transitions observed by the lock cache (background listings, our own
+	// lock/unlock) to the per-file state cache. A state computed while the lock cache was
+	// momentarily wrong - eventually-consistent listings around editor startup - would
+	// otherwise keep showing a checkout badge for a lock released long ago, until something
+	// happened to re-query that specific file.
+	TArray<FGitLockedFilesCache::FLockStateFixup> LockStateFixups = FGitLockedFilesCache::TakePendingStateFixups();
+	if (LockStateFixups.Num() > 0)
+	{
+		const FString& MyLockUser = GetLockUser();
+		for (const FGitLockedFilesCache::FLockStateFixup& Fixup : LockStateFixups)
+		{
+			TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> State = GetStateInternal(Fixup.FilePath);
+			if (Fixup.bLocked)
+			{
+				State->State.LockState = (Fixup.LockUser == MyLockUser) ? ELockState::Locked : ELockState::LockedOther;
+				State->State.LockUser = Fixup.LockUser;
+			}
+			else
+			{
+				State->State.LockState = ELockState::NotLocked;
+				State->State.LockUser.Empty();
+			}
+		}
+		bStatesUpdated = true;
+	}
+
 	for (int32 CommandIndex = 0; CommandIndex < CommandQueue.Num(); ++CommandIndex)
 	{
 		FGitSourceControlCommand& Command = *CommandQueue[CommandIndex];

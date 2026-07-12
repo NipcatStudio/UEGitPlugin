@@ -53,6 +53,20 @@ public:
  // after any mutation). Returns the smoothed lock set that callers should treat as current.
  static TMap<FString, FString> UpdateFromServerListing(const FString& InRepositoryRoot, const TMap<FString, FString>& FreshLocks);
 
+	// A lock transition observed by this cache (our own lock/unlock, or a background listing
+	// diff). Queued on whatever thread noticed it and drained on the game thread by
+	// FGitSourceControlProvider::Tick, which applies it to the per-file state cache and
+	// notifies the UI. Without that propagation, a file state computed while the cache was
+	// momentarily wrong (eventually-consistent listings around editor startup) keeps its
+	// stale checkout badge until something happens to re-query that specific file.
+	struct FLockStateFixup
+	{
+		FString FilePath;
+		FString LockUser;
+		bool bLocked = false;
+	};
+	static TArray<FLockStateFixup> TakePendingStateFixups();
+
 private:
  static void OnFileLockChanged(const FString& filePath, const FString& lockUser, bool locked);
  static void SetLockedFilesInternal(const TMap<FString, FString>& newLocks);
@@ -65,6 +79,8 @@ private:
 	// appeared in; a divergence is only accepted once corroborated (see UpdateFromServerListing)
 	static TMap<FString, int32> MissingStreak;
 	static TMap<FString, int32> AppearStreak;
+	// guarded by LockedFilesMutex; see FLockStateFixup
+	static TArray<FLockStateFixup> PendingStateFixups;
 };
 
 namespace GitSourceControlUtils

@@ -85,6 +85,7 @@ TMap<FString, FString> FGitLockedFilesCache::LockedFiles = TMap<FString, FString
 FCriticalSection FGitLockedFilesCache::LockedFilesMutex;
 TMap<FString, int32> FGitLockedFilesCache::MissingStreak;
 TMap<FString, int32> FGitLockedFilesCache::AppearStreak;
+TArray<FGitLockedFilesCache::FLockStateFixup> FGitLockedFilesCache::PendingStateFixups;
 
 TMap<FString, FString> FGitLockedFilesCache::GetLockedFiles()
 {
@@ -232,8 +233,21 @@ void FGitLockedFilesCache::OnFileLockChanged(const FString& filePath, const FStr
 	const FString& LfsUserName = FGitSourceControlModule::Get().GetProvider().GetLockUser();
 	if (LfsUserName == lockUser)
 	{
-		FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*filePath, !locked);		
+		FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*filePath, !locked);
 	}
+	// Propagate the transition to the per-file state cache (applied on the game thread by
+	// the provider's Tick). FCriticalSection is recursive, so taking the mutex here is safe
+	// whether or not the caller already holds it.
+	{
+		FScopeLock Lock(&LockedFilesMutex);
+		PendingStateFixups.Add({ filePath, lockUser, locked });
+	}
+}
+
+TArray<FGitLockedFilesCache::FLockStateFixup> FGitLockedFilesCache::TakePendingStateFixups()
+{
+	FScopeLock Lock(&LockedFilesMutex);
+	return MoveTemp(PendingStateFixups);
 }
 
 namespace GitSourceControlUtils
