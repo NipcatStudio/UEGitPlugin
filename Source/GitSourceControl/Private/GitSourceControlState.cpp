@@ -254,8 +254,17 @@ bool FGitSourceControlState::CanCheckIn() const
 		return true;
 	}
 
-	// Cannot check back in if conflicted or not current 
+	// Cannot check back in if conflicted or not current
 	if (!IsCurrent() || IsConflicted())
+	{
+		return false;
+	}
+
+	// A clean file whose commits only await push has nothing to check in by itself: the
+	// per-asset dialog would collect a commit message that gets discarded and list one asset
+	// while the push carries every pending commit anyway. That flow is misleading - pushing
+	// is repository-wide, so it lives in the global "Push pending local commits" menu action.
+	if (State.RemoteState == ERemoteState::AheadUnpushed && !IsModified())
 	{
 		return false;
 	}
