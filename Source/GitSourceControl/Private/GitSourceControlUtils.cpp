@@ -1294,8 +1294,11 @@ public:
 		{
 			TreeState = ETreeState::Working;
 		}
-		else if (WCopyState == ' ')
+		else
 		{
+			// The index column carries a change: the file is staged. This includes two-column
+			// states like "AM"/"MM" (staged + further working-copy edits), which previously left
+			// TreeState uninitialized. '?'/'!' are corrected to Untracked/Ignored just below.
 			TreeState = ETreeState::Staged;
 		}
 
@@ -1340,8 +1343,8 @@ public:
 		}
 	}
 
-	EFileState::Type FileState;
-	ETreeState::Type TreeState;
+	EFileState::Type FileState = EFileState::Unknown;
+	ETreeState::Type TreeState = ETreeState::Unset;
 };
 
 /**
@@ -2525,8 +2528,13 @@ bool UpdateCachedStates(const TMap<const FString, FGitState>& InResults)
 		const FGitState& NewState = Pair.Value;
 		if (NewState.FileState != EFileState::Unset)
 		{
-			// Invalid transition
-			if (NewState.FileState == EFileState::Added && !State->IsUnknown() && !State->CanAdd())
+			// Invalid transition: an optimistic Added (a worker assuming the outcome of its own
+			// 'git add' without re-running status) must not clobber a file we believe is already
+			// tracked. States parsed from real 'git status' output are exempt - they are ground
+			// truth, and blocking them froze any transiently wrong cache entry forever: an
+			// already-staged new file kept rendering as a plain controlled file, surviving every
+			// refresh, because each fresh Added parse was discarded right here.
+			if (NewState.FileState == EFileState::Added && !NewState.bFromStatus && !State->IsUnknown() && !State->CanAdd())
 			{
 				continue;
 			}
@@ -2572,7 +2580,11 @@ bool CollectNewStates(const TMap<FString, FGitSourceControlState>& InStates, TMa
 	
 	for (const auto& InState : InStates)
 	{
-		OutResults.Add(InState.Key, InState.Value.State);
+		// These states come from parsing real 'git status' output: mark them as ground truth so
+		// UpdateCachedStates() lets them perform any transition (see the Added guard there).
+		FGitState NewState = InState.Value.State;
+		NewState.bFromStatus = true;
+		OutResults.Add(InState.Key, MoveTemp(NewState));
 	}
 
 	return true;

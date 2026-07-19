@@ -123,6 +123,11 @@ struct FGitState
 	ERemoteState::Type RemoteState = ERemoteState::UpToDate;
 	/** The branch with the latest commit for this file */
 	FString HeadBranch;
+	/** True when this state was parsed from actual 'git status' output. Such states are ground
+	    truth and may perform any transition on the cache; optimistic per-operation states (e.g.
+	    MarkForAdd assuming Added after a successful 'git add') stay subject to the
+	    invalid-transition guard in UpdateCachedStates(). */
+	bool bFromStatus = false;
 };
 
 class GITSOURCECONTROL_API FGitSourceControlState : public ISourceControlState
