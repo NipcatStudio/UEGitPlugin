@@ -393,7 +393,13 @@ bool CollectNewStates(const TArray<FString>& InFiles, TMap<const FString, FGitSt
 		 * @param	OutLocks		    The lock results (file, username)
 		 * @returns true if the command succeeded and returned no errors
 		 */
-	bool GetAllLocks(const FString& InRepositoryRoot, const FString& GitBinaryFallBack, TArray<FString>& OutErrorMessages, TMap<FString, FString>& OutLocks, bool bInvalidateCache = false);
+	/**
+	 * OutRawServerLocks (optional): set to the raw, un-damped server listing when a fresh listing
+	 * was actually fetched (left unset on cache hits and the offline --cached/--local fallback).
+	 * OutLocks is smoothed by flap damping, which keeps a just-released lock alive for a few
+	 * cycles - callers verifying "is this lock really gone" must use the raw listing instead.
+	 */
+	bool GetAllLocks(const FString& InRepositoryRoot, const FString& GitBinaryFallBack, TArray<FString>& OutErrorMessages, TMap<FString, FString>& OutLocks, bool bInvalidateCache = false, TOptional<TMap<FString, FString>>* OutRawServerLocks = nullptr);
 
 /**
  * Gets locks from state cache

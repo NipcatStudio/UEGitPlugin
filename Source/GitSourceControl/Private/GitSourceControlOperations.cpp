@@ -209,6 +209,72 @@ FName FGitCheckInWorker::GetName() const
 
 const FText EmptyCommitMsg;
 
+// 'git lfs unlock' with the same idempotency treatment as the checkout verification above: the
+// unlock POST of a flaky host can time out client-side after succeeding server-side, and the
+// state cache can also carry a lock the server has already released (push-hook autounlock,
+// listing flaps) - either way the desired end state "no lock of ours on these files" may already
+// hold when the command errors, and reporting failure makes the whole operation (e.g. a Revert
+// whose git work has actually completed) look broken to the user. Verify against a fresh RAW
+// server listing - the damped listing keeps a dropped lock alive for a few refresh cycles and
+// would still report it as ours. Returns true when no file is locked by us anymore; on success
+// the files are also removed from the lock cache so a phantom cached lock dies with the
+// operation that discovered it.
+static bool RunLFSUnlockIdempotent(FGitSourceControlCommand& InCommand, const TArray<FString>& InAbsoluteFiles,
+								   TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
+{
+	const TArray<FString>& RelativeFiles = GitSourceControlUtils::RelativeFilenames(InAbsoluteFiles, InCommand.PathToGitRoot);
+	bool bSuccess = GitSourceControlUtils::RunLFSCommand(TEXT("unlock"), InCommand.PathToGitRoot, InCommand.PathToGitBinary,
+														 FGitSourceControlModule::GetEmptyStringArray(), RelativeFiles,
+														 OutResults, OutErrorMessages);
+	if (!bSuccess)
+	{
+		const FString& LockUser = FGitSourceControlModule::Get().GetProvider().GetLockUser();
+		TMap<FString, FString> SmoothedLocks;
+		TOptional<TMap<FString, FString>> RawServerLocks;
+		TArray<FString> LockListingErrors;
+		if (GitSourceControlUtils::GetAllLocks(InCommand.PathToGitRoot, InCommand.PathToGitBinary, LockListingErrors, SmoothedLocks, true, &RawServerLocks)
+			&& RawServerLocks.IsSet())
+		{
+			bSuccess = true;
+			for (const FString& File : InAbsoluteFiles)
+			{
+				FString AbsoluteFile = File;
+				FPaths::NormalizeFilename(AbsoluteFile);
+				const FString* Owner = RawServerLocks->Find(AbsoluteFile);
+				if (!Owner)
+				{
+					for (const auto& Lock : RawServerLocks.GetValue())
+					{
+						if (FPaths::IsSamePath(Lock.Key, AbsoluteFile))
+						{
+							Owner = &Lock.Value;
+							break;
+						}
+					}
+				}
+				if (Owner && *Owner == LockUser)
+				{
+					// We still hold this lock: the unlock genuinely failed.
+					bSuccess = false;
+					break;
+				}
+			}
+			if (bSuccess)
+			{
+				UE_LOG(LogSourceControl, Warning, TEXT("'git lfs unlock' reported failure but the server no longer lists us as lock owner of any of the %d file(s); treating the unlock as successful."), InAbsoluteFiles.Num());
+			}
+		}
+	}
+	if (bSuccess)
+	{
+		for (const FString& File : InAbsoluteFiles)
+		{
+			FGitLockedFilesCache::RemoveLockedFile(File);
+		}
+	}
+	return bSuccess;
+}
+
 bool FGitCheckInWorker::Execute(FGitSourceControlCommand& InCommand)
 {
 	check(InCommand.Operation->GetName() == GetName());
@@ -373,22 +439,10 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& InCommand)
 				GitSourceControlUtils::GetLockedFiles(FilesToCheckIn.Array(), LockedFiles);
 				if (LockedFiles.Num() > 0)
 				{
-					const TArray<FString>& FilesToUnlock = GitSourceControlUtils::RelativeFilenames(LockedFiles, InCommand.PathToGitRoot);
-
-					if (FilesToUnlock.Num() > 0)
-					{
-						// Not strictly necessary to succeed, so don't update command success
-						const bool bUnlockSuccess = GitSourceControlUtils::RunLFSCommand(TEXT("unlock"), InCommand.PathToGitRoot, InCommand.PathToGitBinary,
-																						 FGitSourceControlModule::GetEmptyStringArray(), FilesToUnlock,
-																						 InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
-						if (bUnlockSuccess)
-						{
-							for (const auto& File : LockedFiles)
-							{
-								FGitLockedFilesCache::RemoveLockedFile(File);
-							}
-						}
-					}
+					// Not strictly necessary to succeed, so don't update command success.
+					// The idempotent helper purges the lock cache when the server confirms the
+					// locks are gone, so a failed POST no longer strands phantom locks there.
+					RunLFSUnlockIdempotent(InCommand, LockedFiles, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
 				}
 #if 0
 				for (const FString& File : FilesToCheckIn.Array())
@@ -618,16 +672,10 @@ bool FGitRevertWorker::Execute(FGitSourceControlCommand& InCommand)
 		GitSourceControlUtils::GetLockedFiles(OtherThanAddedExistingFiles, LockedFiles);
 		if (LockedFiles.Num() > 0)
 		{
-			const TArray<FString>& RelativeFiles = GitSourceControlUtils::RelativeFilenames(LockedFiles, InCommand.PathToGitRoot);
-			InCommand.bCommandSuccessful &= GitSourceControlUtils::RunLFSCommand(TEXT("unlock"), InCommand.PathToGitRoot, InCommand.PathToGitBinary, FGitSourceControlModule::GetEmptyStringArray(), RelativeFiles,
-																				 InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
-			if (InCommand.bCommandSuccessful)
-			{
-				for (const auto& File : LockedFiles)
-				{
-					FGitLockedFilesCache::RemoveLockedFile(File);
-				}
-			}
+			// At this point the git revert itself has already completed; only a genuine
+			// still-held lock should fail the operation, not unlocking an already-released
+			// (phantom) lock the state cache remembered.
+			InCommand.bCommandSuccessful &= RunLFSUnlockIdempotent(InCommand, LockedFiles, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
 		}
 	}
 

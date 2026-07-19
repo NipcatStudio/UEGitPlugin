@@ -1860,7 +1860,7 @@ static void EnsureOwnLocksWritable(const TMap<FString, FString>& InLocks)
 	}
 }
 
-bool GetAllLocks(const FString& InRepositoryRoot, const FString& GitBinaryFallback, TArray<FString>& OutErrorMessages, TMap<FString, FString>& OutLocks, bool bInvalidateCache)
+bool GetAllLocks(const FString& InRepositoryRoot, const FString& GitBinaryFallback, TArray<FString>& OutErrorMessages, TMap<FString, FString>& OutLocks, bool bInvalidateCache, TOptional<TMap<FString, FString>>* OutRawServerLocks)
 {
 	// You may ask, why are we ignoring state cache, and instead maintaining our own lock cache?
 	// The answer is that state cache updating is another operation, and those that update status
@@ -1897,6 +1897,10 @@ bool GetAllLocks(const FString& InRepositoryRoot, const FString& GitBinaryFallba
 				FreshLocks.Add(MoveTemp(LockFile.LocalFilename), MoveTemp(LockFile.LockUser));
 			}
 			FGitLockedFilesCache::LastUpdated = CurrentTime;
+			if (OutRawServerLocks)
+			{
+				OutRawServerLocks->Emplace(FreshLocks);
+			}
 			// smooth over eventually-consistent listings before anyone consumes them
 			OutLocks = FGitLockedFilesCache::UpdateFromServerListing(InRepositoryRoot, FreshLocks);
 			EnsureOwnLocksWritable(OutLocks);
