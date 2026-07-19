@@ -5,6 +5,8 @@
 
 #include "GitSourceControlState.h"
 
+#include "GitSourceControlStyle.h"
+
 #if ENGINE_MAJOR_VERSION >= 5
 #include "Textures/SlateIcon.h"
 #if ENGINE_MINOR_VERSION >= 2
@@ -116,9 +118,14 @@ FSlateIcon FGitSourceControlState::GetIcon() const
 	case EGitState::CheckedOut:
 		return GET_ICON_RETURN(CheckedOut);
 	case EGitState::CommittedUnpushed:
-		// Padlock: the lock is still ours, but there is nothing left to edit locally - the
-		// commits just haven't been pushed yet.
-		return GET_ICON_RETURN(Locked);
+#if ENGINE_MAJOR_VERSION >= 5
+		// Plugin-owned blue up-arrow ("commits waiting to be pushed"). Not the engine padlock:
+		// that glyph is the same shape the locked-by-other-user badge uses (only the tint
+		// differs), which would make the two states near-indistinguishable at badge size.
+		return FSlateIcon(FGitSourceControlStyle::GetStyleSetName(), "GitSourceControl.CommittedUnpushed");
+#else
+		return GET_ICON_RETURN(CheckedOut);
+#endif
 	case EGitState::Ignored:
 		return GET_ICON_RETURN(NotInDepot);
 	default:
