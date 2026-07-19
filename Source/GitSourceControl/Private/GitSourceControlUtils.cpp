@@ -1641,10 +1641,13 @@ static void ParseFileStatusResult(const FString& InPathToGitBinary, const FStrin
 				// read-only" failure. IsCheckedOut() covers more than our own locks: it is also
 				// true for locally modified files nobody has locked. The bit goes stale behind our
 				// back - git-lfs re-applies read-only to every 'lockable' file it has no local lock
-				// record for whenever the working tree is touched (pull/checkout/reset). Re-assert
-				// the invariant each time we recompute a state; files locked by someone else are
-				// never touched (LockedOther is not considered checked out).
-				if (FileState.IsCheckedOut())
+				// record for on any hook that touches the tree state (post-checkout, post-merge,
+				// and notably post-commit: ANY commit in the repo re-flags them). Staged new files
+				// (Added) are hit hardest - they never had a lock, so every commit makes them
+				// read-only again. Both checked-out and added files are ours to edit (CanEdit), so
+				// re-assert the invariant each time we recompute a state; files locked by someone
+				// else are never touched (LockedOther is not considered checked out).
+				if (FileState.IsCheckedOut() || FileState.IsAdded())
 				{
 					IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
 					if (PlatformFile.FileExists(*File) && PlatformFile.IsReadOnly(*File))
