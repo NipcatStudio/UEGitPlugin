@@ -409,6 +409,14 @@ bool FGitSourceControlState::IsConflicted() const
 
 bool FGitSourceControlState::CanRevert() const
 {
+	// A clean file whose commits only await push has nothing a revert could undo (a revert
+	// works on the working tree and cannot touch local commits). The only real effect would
+	// be silently dropping our lock while it still protects the unpushed content - so keep
+	// Revert disabled for that state; the lock is released by the push.
+	if (!IsModified() && State.RemoteState == ERemoteState::AheadUnpushed)
+	{
+		return false;
+	}
 	// Can revert the file state if we modified, even if it was locked by someone else.
 	// Useful for when someone locked a file, and you just wanna play around with it locallly, and then revert it.
 	return CanCheckIn() || IsModified();

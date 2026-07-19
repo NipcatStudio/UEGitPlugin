@@ -672,6 +672,24 @@ bool FGitRevertWorker::Execute(FGitSourceControlCommand& InCommand)
 		GitSourceControlUtils::GetLockedFiles(OtherThanAddedExistingFiles, LockedFiles);
 		if (LockedFiles.Num() > 0)
 		{
+			// A revert works on the working tree and cannot undo local commits: files whose
+			// commits still await push keep their lock (releasing it would leave the unpushed
+			// content unprotected while looking like a successful revert). Reachable despite
+			// CanRevert() vetoing such files because a mixed multi-selection runs the whole
+			// batch. The push releases these locks.
+			TArray<TSharedRef<ISourceControlState, ESPMode::ThreadSafe>> LockedStates;
+			FGitSourceControlModule::Get().GetProvider().GetState(LockedFiles, LockedStates, EStateCacheUsage::Use);
+			for (const auto& State : LockedStates)
+			{
+				const TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe>& GitState = StaticCastSharedRef<FGitSourceControlState>(State);
+				if (GitState->State.RemoteState == ERemoteState::AheadUnpushed)
+				{
+					LockedFiles.Remove(GitState->GetFilename());
+				}
+			}
+		}
+		if (LockedFiles.Num() > 0)
+		{
 			// At this point the git revert itself has already completed; only a genuine
 			// still-held lock should fail the operation, not unlocking an already-released
 			// (phantom) lock the state cache remembered.
