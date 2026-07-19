@@ -1830,6 +1830,30 @@ void CheckRemote(const FString& InPathToGitBinary, const FString& InRepositoryRo
 		}
 	}
 
+	// Files touched by local commits the remote branch doesn't have yet: their lock is only
+	// held until the push lands. Lets the UI tell "committed, waiting for push" (padlock)
+	// apart from an actively-edited checkout (red check). Behind-remote states above win -
+	// a file changed on both sides is a sync problem first.
+	if (bDiffAgainstRemoteCurrent)
+	{
+		TArray<FString> UnpushedResults;
+		TArray<FString> UnpushedParams{ TEXT("--pretty="), TEXT("--name-only"), FString::Printf(TEXT("%s.."), *CurrentBranchName), TEXT("--") };
+		if (RunCommand(TEXT("log"), InPathToGitBinary, InRepositoryRoot, UnpushedParams, FilesToDiff, UnpushedResults, ErrorMessages))
+		{
+			for (const FString& UnpushedFileName : UnpushedResults)
+			{
+				const FString UnpushedFilePath = FPaths::ConvertRelativePathToFull(InRepositoryRoot, UnpushedFileName);
+				if (FGitSourceControlState* FileState = OutStates.Find(UnpushedFilePath))
+				{
+					if (FileState->State.RemoteState != ERemoteState::NotAtHead && FileState->State.RemoteState != ERemoteState::NotLatest)
+					{
+						FileState->State.RemoteState = ERemoteState::AheadUnpushed;
+					}
+				}
+			}
+		}
+	}
+
 	OutErrorMessages.Append(ErrorMessages);
 }
 

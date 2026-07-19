@@ -29,6 +29,8 @@ namespace EGitState
 		Modified,
 		/** Not modified, but locked explicitly. */
 		CheckedOut,
+		/** Locked by us, working tree clean, but local commits touching the file await push. */
+		CommittedUnpushed,
 		Untracked,
 		Lockable,
 		Unmodified,
@@ -109,6 +111,8 @@ namespace ERemoteState
 #endif
 		/** Not at the latest revision amongst the tracked branches */
 		NotLatest,
+		/** Local commits touch this file but have not been pushed to the remote branch yet */
+		AheadUnpushed,
 	};
 }
 

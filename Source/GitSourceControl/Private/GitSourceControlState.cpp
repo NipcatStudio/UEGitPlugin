@@ -115,6 +115,10 @@ FSlateIcon FGitSourceControlState::GetIcon() const
 	case EGitState::Modified:
 	case EGitState::CheckedOut:
 		return GET_ICON_RETURN(CheckedOut);
+	case EGitState::CommittedUnpushed:
+		// Padlock: the lock is still ours, but there is nothing left to edit locally - the
+		// commits just haven't been pushed yet.
+		return GET_ICON_RETURN(Locked);
 	case EGitState::Ignored:
 		return GET_ICON_RETURN(NotInDepot);
 	default:
@@ -146,6 +150,7 @@ FName FGitSourceControlState::GetSmallIconName() const
 	  return FName("ContentBrowser.SCC_MarkedForDelete_Small");
 	case EGitState::Modified:
         case EGitState::CheckedOut:
+        case EGitState::CommittedUnpushed:
                 return FName("ContentBrowser.SCC_CheckedOut_Small");
 	case EGitState::Ignored:
 	  return FName("ContentBrowser.SCC_NotInDepot_Small");
@@ -176,6 +181,8 @@ FText FGitSourceControlState::GetDisplayName() const
 	case EGitState::Modified:
 	case EGitState::CheckedOut:
 		return LOCTEXT("CheckedOut", "Checked out");
+	case EGitState::CommittedUnpushed:
+		return LOCTEXT("CommittedUnpushed", "Committed, not pushed");
 	case EGitState::Ignored:
 		return LOCTEXT("Ignore", "Ignore");
 	case EGitState::Lockable:
@@ -208,6 +215,8 @@ FText FGitSourceControlState::GetDisplayTooltip() const
 	case EGitState::Modified:
 	case EGitState::CheckedOut:
 		return LOCTEXT("CheckedOut_Tooltip", "The file(s) are checked out");
+	case EGitState::CommittedUnpushed:
+		return LOCTEXT("CommittedUnpushed_Tooltip", "All local changes are committed and waiting to be pushed; the lock is held until the push lands.");
 	case EGitState::Ignored:
 		return LOCTEXT("Ignored_Tooltip", "Item is being ignored.");
 	case EGitState::Lockable:
@@ -443,6 +452,12 @@ EGitState::Type FGitSourceControlState::GetGitState() const
 
 	if (State.LockState == ELockState::Locked)
 	{
+		// Clean working tree but carrying commits the remote branch doesn't have: the lock is
+		// only held until the push lands - distinguish it from an actively-edited checkout.
+		if (State.RemoteState == ERemoteState::AheadUnpushed)
+		{
+			return EGitState::CommittedUnpushed;
+		}
 		return EGitState::CheckedOut;
 	}
 
