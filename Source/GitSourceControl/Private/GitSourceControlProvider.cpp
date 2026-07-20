@@ -99,6 +99,16 @@ void FGitSourceControlProvider::UpdateSettings()
 
 void FGitSourceControlProvider::CheckRepositoryStatus()
 {
+	// Uncooked -game/-server runs load this module too (UncookedOnly), but they have no revision
+	// control UI or workflow. The boot-time repository scan spawns git/LFS subprocesses and its
+	// game-thread completion task lands in the middle of the initial LoadMap, where it has been
+	// observed corrupting the heap and crashing the boot. Editor-only machinery: skip it entirely.
+	if (!GIsEditor)
+	{
+		bGitRepositoryFound = false;
+		return;
+	}
+
 	GitSourceControlMenu.Register();
 
 	// Make sure our settings our up to date
