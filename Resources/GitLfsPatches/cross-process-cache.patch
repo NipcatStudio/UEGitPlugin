@@ -1,0 +1,638 @@
+锁缓存跨进程持久化修复 / Cross-process lock-cache persistence
+
+保留原并发锁、显式空代理和批量精确 ID 解锁；不升级或替换它们的命令契约。
+Preserves the existing concurrent-lock, explicit-proxy and exact-ID batch command contracts.
+Source: https://github.com/git-lfs/git-lfs.git
+Base: 35ec69f0e544a91a266ebe92ac4cf2198f61cbcd
+Toolchain: Go 1.19.13, CGO_ENABLED=0
+Version suffix: 35ec69f0+proxy-idbatch-cache1
+
+按顺序应用三个补丁，在独立源码目录构建，不构建 Unreal target：
+Apply the three patches in order in a standalone source checkout, not an Unreal target:
+  git checkout --detach 35ec69f0e544a91a266ebe92ac4cf2198f61cbcd
+  git apply --unidiff-zero <explicit-empty-proxy.patch>
+  git apply --unidiff-zero <verified-id-batch.patch>
+  git apply --unidiff-zero <cross-process-cache.patch>
+  go test ./tools/kv ./locking ./lfshttp -run 'Store|Snapshot|Unlock|Proxy' -count=1
+  go build -trimpath -ldflags="-s -w -X github.com/git-lfs/git-lfs/v3/config.GitCommit=35ec69f0+proxy-idbatch-cache1" -o <output> .
+  python <plugin>/Resources/GitLfsPatches/test_cache_cli.py <built-git-lfs-executable>
+  python <plugin>/Resources/GitLfsPatches/test_batch_cli.py <built-git-lfs-executable>
+
+GOOS/GOARCH -> output:
+  windows/amd64 -> git-lfs.exe
+  linux/amd64 -> git-lfs
+  darwin/amd64 -> git-lfs-mac-amd64
+  darwin/arm64 -> git-lfs-mac-arm64
+
+保留 Gob 缓存格式。跨进程锁文件 .lock 保留在缓存旁，句柄关闭/进程退出自动释放内核锁，
+不应按“文件存在”判断仍被占用。原坏缓存显式报错并保留，不能自动当空锁处理。
+The Gob format is unchanged. The persistent .lock sidecar holds an OS lock only while its handle
+is locked; closing or process exit releases it. File existence is not ownership. Corrupt caches
+fail explicitly and are retained rather than silently becoming an empty lock set.
+
+KV 保存和 JSON 快照均以临时文件完整写入后原子替换；保存/发布失败返回非零退出码。
+锁竞争及 Windows 替换重试共用五秒截止。JSON 查询失败也不得输出成功的空列表。
+KV and JSON snapshots publish by atomic replacement after complete temporary-file writes.
+Persistence/publication failures exit nonzero. Lock contention and Windows replacement retries
+share a five-second deadline. JSON query failures must not masquerade as successful empty lists.
+
+未修复的外部 Git LFS 不遵守新旁路锁；多个旧写入者仍可能破坏其共享缓存。
+Win64 执行真实 CLI 并发和失败回归；Linux/macOS 仅交叉编译，未声明运行时验收。
+Unpatched external LFS tools do not honor the sidecar; multiple legacy writers remain unsafe.
+Win64 runs real CLI concurrency/failure tests; Linux/macOS are cross-compiled, not runtime-verified.
+
+diff --git a/commands/command_lock.go b/commands/command_lock.go
+--- a/commands/command_lock.go
++++ b/commands/command_lock.go
+@@ -30 +30 @@
+-	defer lockClient.Close()
++	defer closeLockClient(lockClient)
+diff --git a/commands/command_locks.go b/commands/command_locks.go
+--- a/commands/command_locks.go
++++ b/commands/command_locks.go
+@@ -34 +34 @@
+-	defer lockClient.Close()
++	defer closeLockClient(lockClient)
+@@ -81,0 +82,5 @@
++		// JSON 不能把查询或缓存快照写入失败伪装成成功的空列表。
++		// JSON must not hide query or snapshot-publication failures behind a successful empty list.
++		if err != nil {
++			Exit(tr.Tr.Get("Error while retrieving locks: %v", errors.Cause(err)))
++		}
+@@ -83 +88 @@
+-			Error(err.Error())
++			Exit("%v", err)
+diff --git a/commands/command_unlock.go b/commands/command_unlock.go
+--- a/commands/command_unlock.go
++++ b/commands/command_unlock.go
+@@ -70 +70 @@
+-	defer lockClient.Close()
++	defer closeLockClient(lockClient)
+diff --git a/commands/commands.go b/commands/commands.go
+--- a/commands/commands.go
++++ b/commands/commands.go
+@@ -111,0 +112,8 @@
++}
++
++// 缓存持久化失败必须使命令失败；此前完成的远端操作不会因此被回滚。
++// A cache persistence failure fails the command without claiming to roll back remote operations.
++func closeLockClient(lockClient *locking.Client) {
++	if err := lockClient.Close(); err != nil {
++		Exit(tr.Tr.Get("Unable to save lock cache (remote operations may have completed): %v", err))
++	}
+diff --git a/locking/locks.go b/locking/locks.go
+--- a/locking/locks.go
++++ b/locking/locks.go
+@@ -670,7 +670,3 @@
+-	file, err := os.Create(cacheFile)
+-	if err != nil {
+-		return err
+-	}
+-
+-	defer file.Close()
+-	return writer(file)
++	// JSON 列表缓存也必须整份发布；并发读取只能看到旧快照或新快照，不能看到半份 JSON。
++	// Publish a complete JSON snapshot so concurrent readers never observe a truncated response.
++	return kv.WriteSnapshot(cacheFile, writer)
+diff --git a/tools/kv/keyvaluestore.go b/tools/kv/keyvaluestore.go
+--- a/tools/kv/keyvaluestore.go
++++ b/tools/kv/keyvaluestore.go
+@@ -7,0 +8 @@
++	"time"
+@@ -13,8 +14,5 @@
+-// Store provides an in-memory key/value store which is persisted to
+-// a file. The file handle itself is not kept locked for the duration; it is
+-// only locked during load and save, to make it concurrency friendly. When
+-// saving, the store uses optimistic locking to determine whether the db on disk
+-// has been modified by another process; in which case it loads the latest
+-// version and re-applies modifications made during this session. This means
+-// the Lost Update db concurrency issue is possible; so don't use this if you
+-// need more DB integrity than Read Committed isolation levels.
++// Store 是带磁盘缓存的内存映射；加载及保存使用跨进程锁，合并本次变更后原子发布。
++// 同一键冲突仍以后保存者为准，不把远端锁缓存升级为业务事务数据库。
++// Store serializes disk reads and merge/publication across processes and atomically
++// publishes each complete snapshot. Conflicting edits to one key remain last-writer-wins;
++// this cache is not a transactional source of truth for remote locks.
+@@ -129,26 +127,47 @@
+-	// firstly peek at version; open read/write to keep lock between check & write
+-	f, err := os.OpenFile(k.filename, os.O_RDWR|os.O_CREATE, 0664)
+-	if err != nil {
+-		return err
+-	}
+-
+-	defer f.Close()
+-
+-	// Only try to merge if > 0 bytes, ignore empty files (decoder will fail)
+-	if stat, _ := f.Stat(); stat.Size() > 0 {
+-		k.loadAndMergeReaderIfNeeded(f)
+-		// Now we overwrite the file
+-		f.Seek(0, io.SeekStart)
+-		f.Truncate(0)
+-	}
+-
+-	k.version++
+-
+-	enc := gob.NewEncoder(f)
+-	if err := enc.Encode(k.version); err != nil {
+-		return errors.New(tr.Tr.Get("error while writing version data to %v: %v", k.filename, err))
+-	}
+-	if err := enc.Encode(k.db); err != nil {
+-		return errors.New(tr.Tr.Get("error while writing new key/value data to %v: %v", k.filename, err))
+-	}
+-	// Clear log now that it's saved
++	deadline := time.Now().Add(cacheIOTimeout)
++	guard, err := lockStore(k.filename, deadline)
++	if err != nil {
++		return err
++	}
++	defer guard.Close()
++
++	f, err := openStoreSnapshot(k.filename, deadline)
++	if err != nil && !os.IsNotExist(err) {
++		return err
++	}
++	if err == nil {
++		// Windows 的共享模式保护本次合并读取，包括旧版 LFS；修复版还受旁路锁约束。
++		// Windows sharing protects this merge read even from legacy LFS; patched peers also use the sidecar.
++		defer f.Close()
++		stat, err := f.Stat()
++		if err != nil {
++			return err
++		}
++		if stat.Size() > 0 {
++			if err := k.loadAndMergeReaderIfNeeded(f); err != nil {
++				return err
++			}
++		}
++	}
++
++	// Windows 不允许替换仍被读取的目标文件；旁路锁持续覆盖关闭到替换的间隙。
++	// Close the destination before Windows replacement; the sidecar still excludes patched peers.
++	if f != nil {
++		if err := f.Close(); err != nil {
++			return err
++		}
++	}
++	nextVersion := k.version + 1
++	if err := writeSnapshot(k.filename, deadline, func(writer io.Writer) error {
++		enc := gob.NewEncoder(writer)
++		if err := enc.Encode(nextVersion); err != nil {
++			return errors.New(tr.Tr.Get("error while writing version data to %v: %v", k.filename, err))
++		}
++		if err := enc.Encode(k.db); err != nil {
++			return errors.New(tr.Tr.Get("error while writing new key/value data to %v: %v", k.filename, err))
++		}
++		return nil
++	}); err != nil {
++		return err
++	}
++	k.version = nextVersion
+@@ -156 +174,0 @@
+-
+@@ -165 +183 @@
+-	stat, err := os.Stat(k.filename)
++	_, err := os.Stat(k.filename)
+@@ -172 +190,18 @@
+-	// Do nothing if empty file
++	deadline := time.Now().Add(cacheIOTimeout)
++	guard, err := lockStore(k.filename, deadline)
++	if err != nil {
++		return err
++	}
++	defer guard.Close()
++	f, err := openStoreSnapshot(k.filename, deadline)
++	if os.IsNotExist(err) {
++		return nil
++	}
++	if err != nil {
++		return err
++	}
++	defer f.Close()
++	stat, err := f.Stat()
++	if err != nil {
++		return err
++	}
+@@ -176,8 +211 @@
+-
+-	f, err := os.OpenFile(k.filename, os.O_RDONLY, 0664)
+-	if err == nil {
+-		defer f.Close()
+-		return k.loadAndMergeReaderIfNeeded(f)
+-	} else {
+-		return err
+-	}
++	return k.loadAndMergeReaderIfNeeded(f)
+diff --git a/tools/kv/filelock.go b/tools/kv/filelock.go
+new file mode 100644
+--- /dev/null
++++ b/tools/kv/filelock.go
+@@ -0,0 +1,48 @@
++package kv
++
++import (
++	"fmt"
++	"os"
++	"time"
++)
++
++// 缓存竞争最多等待五秒；失败必须显式返回，不能当作空缓存。
++// Bound cache contention to five seconds; failure is never an empty cache.
++const cacheIOTimeout = 5 * time.Second
++
++// 旁路锁文件拥有跨进程互斥；不删除它，避免等待者锁住已被替换的 inode。
++// Keep a stable sidecar inode for interprocess exclusion; never unlink the lock file.
++func lockStore(filename string, deadline time.Time) (*os.File, error) {
++	file, err := os.OpenFile(filename+".lock", os.O_RDWR|os.O_CREATE, 0600)
++	if err != nil {
++		return nil, err
++	}
++	for {
++		err = tryLockStore(file)
++		if err == nil {
++			return file, nil
++		}
++		if err := retryCacheIO(filename, deadline, err, isCacheContention(err)); err != nil {
++			file.Close()
++			return nil, err
++		}
++	}
++}
++
++// 平台调用端决定哪些错误允许短暂重试；共享截止时间保证不会无限等待。
++// Platform callers classify transient failures; the shared deadline bounds every retry.
++func retryCacheIO(filename string, deadline time.Time, err error, retry bool) error {
++	if !retry {
++		return err
++	}
++	remaining := time.Until(deadline)
++	if remaining <= 0 {
++		return fmt.Errorf("timed out waiting for lock cache %s: %w", filename, err)
++	}
++	delay := 10 * time.Millisecond
++	if remaining < delay {
++		delay = remaining
++	}
++	time.Sleep(delay)
++	return nil
++}
+diff --git a/tools/kv/filelock_windows.go b/tools/kv/filelock_windows.go
+new file mode 100644
+--- /dev/null
++++ b/tools/kv/filelock_windows.go
+@@ -0,0 +1,60 @@
++//go:build windows
++// +build windows
++
++package kv
++
++import (
++	"errors"
++	"os"
++	"time"
++
++	"golang.org/x/sys/windows"
++)
++
++// 关闭句柄即释放内核锁，进程退出不会留下需要人工删除的死锁。
++// The kernel releases this lock on handle close or process exit.
++func tryLockStore(file *os.File) error {
++	return windows.LockFileEx(windows.Handle(file.Fd()),
++		windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY,
++		0, 1, 0, &windows.Overlapped{})
++}
++
++func isCacheContention(err error) bool {
++	return errors.Is(err, windows.ERROR_LOCK_VIOLATION) ||
++		errors.Is(err, windows.ERROR_SHARING_VIOLATION)
++}
++
++// 读取期间拒绝旧 LFS 写入者；发布前关闭句柄，修复版写入者仍由旁路锁排他。
++// Block legacy writes during the read; close before publication while the sidecar excludes patched writers.
++func openStoreSnapshot(filename string, deadline time.Time) (*os.File, error) {
++	path, err := windows.UTF16PtrFromString(filename)
++	if err != nil {
++		return nil, err
++	}
++	for {
++		handle, err := windows.CreateFile(path, windows.GENERIC_READ,
++			windows.FILE_SHARE_READ, nil,
++			windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
++		if err == nil {
++			return os.NewFile(uintptr(handle), filename), nil
++		}
++		if err := retryCacheIO(filename, deadline, err, isCacheContention(err)); err != nil {
++			return nil, &os.PathError{Op: "open", Path: filename, Err: err}
++		}
++	}
++}
++
++func replaceStoreSnapshot(source, destination string, deadline time.Time) error {
++	for {
++		if err := os.Rename(source, destination); err != nil {
++			// Windows 覆盖被读取的目标也可能返回 ACCESS_DENIED；只在重命名处有界重试。
++			// Replacing an open destination can also return ACCESS_DENIED; retry it only for rename.
++			retry := isCacheContention(err) || errors.Is(err, windows.ERROR_ACCESS_DENIED)
++			if err := retryCacheIO(destination, deadline, err, retry); err != nil {
++				return err
++			}
++		} else {
++			return nil
++		}
++	}
++}
+diff --git a/tools/kv/filelock_unix.go b/tools/kv/filelock_unix.go
+new file mode 100644
+--- /dev/null
++++ b/tools/kv/filelock_unix.go
+@@ -0,0 +1,30 @@
++//go:build !windows
++// +build !windows
++
++package kv
++
++import (
++	"errors"
++	"os"
++	"time"
++
++	"golang.org/x/sys/unix"
++)
++
++// 所有修复版读写者共享同一个旁路 inode，关闭句柄自动释放锁。
++// Patched readers and writers share one sidecar inode; close releases its lock.
++func tryLockStore(file *os.File) error {
++	return unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB)
++}
++
++func isCacheContention(err error) bool {
++	return errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EINTR)
++}
++
++func openStoreSnapshot(filename string, deadline time.Time) (*os.File, error) {
++	return os.Open(filename)
++}
++
++func replaceStoreSnapshot(source, destination string, deadline time.Time) error {
++	return os.Rename(source, destination)
++}
+diff --git a/tools/kv/snapshot.go b/tools/kv/snapshot.go
+new file mode 100644
+--- /dev/null
++++ b/tools/kv/snapshot.go
+@@ -0,0 +1,44 @@
++package kv
++
++import (
++	"io"
++	"os"
++	"path/filepath"
++	"time"
++)
++
++// WriteSnapshot 原子发布完整缓存；需要合并数据的调用者必须另持跨进程锁。
++// WriteSnapshot atomically publishes a complete cache; read/merge callers must also hold a process lock.
++func WriteSnapshot(filename string, write func(io.Writer) error) error {
++	return writeSnapshot(filename, time.Now().Add(cacheIOTimeout), write)
++}
++
++func writeSnapshot(filename string, deadline time.Time, write func(io.Writer) error) error {
++	mode := os.FileMode(0600)
++	if info, err := os.Stat(filename); err == nil {
++		mode = info.Mode().Perm()
++	} else if !os.IsNotExist(err) {
++		return err
++	}
++	tmp, err := os.CreateTemp(filepath.Dir(filename), "."+filepath.Base(filename)+".tmp-")
++	if err != nil {
++		return err
++	}
++	defer os.Remove(tmp.Name())
++	defer tmp.Close()
++	if err := tmp.Chmod(mode); err != nil {
++		return err
++	}
++	// 任一步失败均不覆盖旧快照；临时文件不会成为下一次查询的数据源。
++	// Any failure retains the old snapshot; temporary files are never read as cache state.
++	if err := write(tmp); err != nil {
++		return err
++	}
++	if err := tmp.Sync(); err != nil {
++		return err
++	}
++	if err := tmp.Close(); err != nil {
++		return err
++	}
++	return replaceStoreSnapshot(tmp.Name(), filename, deadline)
++}
+diff --git a/tools/kv/keyvaluestore_process_test.go b/tools/kv/keyvaluestore_process_test.go
+new file mode 100644
+--- /dev/null
++++ b/tools/kv/keyvaluestore_process_test.go
+@@ -0,0 +1,163 @@
++package kv
++
++import (
++	"bufio"
++	"bytes"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++// 子进程只操作父测试传入的临时缓存；就绪握手确保多个进程从同一旧版本开始保存。
++// Child helpers touch only a temporary cache; readiness aligns independent stale snapshots.
++func TestStoreProcessHelper(t *testing.T) {
++	mode := os.Getenv("LFS_KV_TEST_HELPER")
++	if mode == "" {
++		return
++	}
++	filename := os.Getenv("LFS_KV_TEST_FILE")
++	if mode == "exit-with-lock" {
++		_, err := lockStore(filename, time.Now().Add(time.Second))
++		if err != nil {
++			fmt.Fprintln(os.Stderr, err)
++			os.Exit(1)
++		}
++		os.Exit(0)
++	}
++	store, err := NewStore(filename)
++	if err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(1)
++	}
++	fmt.Println("ready")
++	_, err = bufio.NewReader(os.Stdin).ReadString('\n')
++	if err != nil {
++		os.Exit(1)
++	}
++	store.Set(os.Getenv("LFS_KV_TEST_KEY"), strings.Repeat("value", 4096))
++	if err := store.Save(); err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(1)
++	}
++}
++
++func TestStoreConcurrentProcessesMerge(t *testing.T) {
++	filename := filepath.Join(t.TempDir(), "lockcache.db")
++	store, err := NewStore(filename)
++	require.NoError(t, err)
++	store.Set("original", "preserved")
++	require.NoError(t, store.Save())
++	// 父测试拥有子进程、放行管道和错误输出，失败路径也必须回收它们。
++	// The parent owns each process, release pipe and error stream, including failure cleanup.
++	type child struct {
++		command *exec.Cmd
++		release func()
++		stderr  *bytes.Buffer
++	}
++	var children []child
++	for i := 0; i < 6; i++ {
++		command := exec.Command(os.Args[0], "-test.run=^TestStoreProcessHelper$")
++		command.Env = append(os.Environ(), "LFS_KV_TEST_HELPER=write", "LFS_KV_TEST_FILE="+filename,
++			fmt.Sprintf("LFS_KV_TEST_KEY=worker-%d", i))
++		stdout, err := command.StdoutPipe()
++		require.NoError(t, err)
++		stdin, err := command.StdinPipe()
++		require.NoError(t, err)
++		stderr := &bytes.Buffer{}
++		command.Stderr = stderr
++		require.NoError(t, command.Start())
++		// 测试失败也关闭 stdin 并回收子进程，不留下后台写入者。
++		// Even assertion failures close stdin and reap the child instead of leaking a writer.
++		t.Cleanup(func() { stdin.Close(); command.Wait() })
++		line, err := bufio.NewReader(stdout).ReadString('\n')
++		require.NoError(t, err, stderr.String())
++		require.Equal(t, "ready\n", line)
++		children = append(children, child{command, func() { fmt.Fprintln(stdin, "save"); stdin.Close() }, stderr})
++	}
++	for _, child := range children {
++		child.release()
++	}
++	for _, child := range children {
++		require.NoError(t, child.command.Wait(), child.stderr.String())
++	}
++	final, err := NewStore(filename)
++	require.NoError(t, err)
++	require.Equal(t, "preserved", final.Get("original"))
++	for i := range children {
++		require.Equal(t, strings.Repeat("value", 4096), final.Get(fmt.Sprintf("worker-%d", i)))
++	}
++}
++
++func TestStoreAtomicEncodeFailure(t *testing.T) {
++	filename := filepath.Join(t.TempDir(), "lockcache.db")
++	store, err := NewStore(filename)
++	require.NoError(t, err)
++	store.Set("original", "preserved")
++	require.NoError(t, store.Save())
++	original, err := os.ReadFile(filename)
++	require.NoError(t, err)
++	store.Set("unencodable", make(chan int))
++	require.Error(t, store.Save())
++	after, err := os.ReadFile(filename)
++	require.NoError(t, err)
++	require.Equal(t, original, after)
++	loaded, err := NewStore(filename)
++	require.NoError(t, err)
++	require.Equal(t, "preserved", loaded.Get("original"))
++	store.Remove("unencodable")
++	store.Set("retry", "saved")
++	require.NoError(t, store.Save())
++	loaded, err = NewStore(filename)
++	require.NoError(t, err)
++	require.Equal(t, "saved", loaded.Get("retry"))
++	residue, err := filepath.Glob(filepath.Join(filepath.Dir(filename), ".lockcache.db.tmp-*"))
++	require.NoError(t, err)
++	require.Empty(t, residue)
++}
++
++func TestStoreCorruptMergePreservesEvidence(t *testing.T) {
++	filename := filepath.Join(t.TempDir(), "lockcache.db")
++	store, err := NewStore(filename)
++	require.NoError(t, err)
++	store.Set("original", "preserved")
++	require.NoError(t, store.Save())
++	corrupt := []byte("invalid gob snapshot")
++	require.NoError(t, os.WriteFile(filename, corrupt, 0600))
++	store.Set("pending", "not published")
++	require.Error(t, store.Save())
++	after, err := os.ReadFile(filename)
++	require.NoError(t, err)
++	require.Equal(t, corrupt, after)
++	require.NotEmpty(t, store.log)
++}
++
++func TestStoreInterprocessLockReleasedOnExit(t *testing.T) {
++	filename := filepath.Join(t.TempDir(), "lockcache.db")
++	command := exec.Command(os.Args[0], "-test.run=^TestStoreProcessHelper$")
++	command.Env = append(os.Environ(), "LFS_KV_TEST_HELPER=exit-with-lock", "LFS_KV_TEST_FILE="+filename)
++	output, err := command.CombinedOutput()
++	require.NoError(t, err, string(output))
++	guard, err := lockStore(filename, time.Now().Add(time.Second))
++	require.NoError(t, err)
++	require.NoError(t, guard.Close())
++	_, err = os.Stat(filename + ".lock")
++	require.NoError(t, err)
++}
++
++func TestStoreLockWaitIsBounded(t *testing.T) {
++	filename := filepath.Join(t.TempDir(), "lockcache.db")
++	guard, err := lockStore(filename, time.Now().Add(time.Second))
++	require.NoError(t, err)
++	defer guard.Close()
++	start := time.Now()
++	_, err = lockStore(filename, start.Add(30*time.Millisecond))
++	require.Error(t, err)
++	require.Contains(t, err.Error(), "timed out waiting for lock cache")
++	require.True(t, time.Since(start) < 2*time.Second)
++}
+diff --git a/tools/kv/snapshot_windows_test.go b/tools/kv/snapshot_windows_test.go
+new file mode 100644
+--- /dev/null
++++ b/tools/kv/snapshot_windows_test.go
+@@ -0,0 +1,39 @@
++//go:build windows
++// +build windows
++
++package kv
++
++import (
++	"io"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++// 旧客户端的读句柄阻止 Windows 替换时，先有界失败并保留旧快照，释放后可正常发布。
++// A legacy reader must cause bounded publication failure, not truncation; release permits a retry.
++func TestSnapshotLegacyReaderContention(t *testing.T) {
++	filename := filepath.Join(t.TempDir(), "verifiable")
++	require.NoError(t, os.WriteFile(filename, []byte("old snapshot"), 0600))
++	reader, err := os.Open(filename)
++	require.NoError(t, err)
++	defer reader.Close()
++	write := func(w io.Writer) error {
++		_, err := io.WriteString(w, "new snapshot")
++		return err
++	}
++	err = writeSnapshot(filename, time.Now().Add(40*time.Millisecond), write)
++	require.Error(t, err)
++	require.Contains(t, err.Error(), "timed out waiting for lock cache")
++	content, err := os.ReadFile(filename)
++	require.NoError(t, err)
++	require.Equal(t, "old snapshot", string(content))
++	require.NoError(t, reader.Close())
++	require.NoError(t, WriteSnapshot(filename, write))
++	content, err = os.ReadFile(filename)
++	require.NoError(t, err)
++	require.Equal(t, "new snapshot", string(content))
++}
