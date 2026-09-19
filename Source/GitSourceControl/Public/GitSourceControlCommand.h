@@ -85,6 +85,21 @@ public:
 	/** Tell if using the Git LFS file Locking workflow */
 	bool bUsingGitLfsLocking;
 
+	/** 命令创建时与配置代次一起冻结的 Git LFS owner 名称。 */
+	FString LfsUserName;
+
+	/** 命令创建时 Editor 设置中是否开启 Git LFS；与仓库能力计算后的运行模式分离。 */
+	bool bSettingsUsingGitLfsLocking = false;
+
+	/** 命令创建时冻结的锁配置代次；任一相关设置变化后不再允许远端写入。 */
+	uint64 LockSettingsGeneration = 0;
+
+	/** 状态计算期间配置或分支已换代；结果按只读失败关闭，并请求 Provider 立即重新刷新。 */
+	bool bStatusSettingsSuperseded = false;
+
+	/** 命令创建时锁工作流的明确分支；游离 HEAD 会在写操作前显式失败。 */
+	FString LockBranch;
+
 	/** Operation we want to perform - contains outward-facing parameters & results */
 	TSharedRef<class ISourceControlOperation, ESPMode::ThreadSafe> Operation;
 

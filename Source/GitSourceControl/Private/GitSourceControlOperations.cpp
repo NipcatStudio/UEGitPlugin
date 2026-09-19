@@ -11,21 +11,71 @@
 #include "ISourceControlModule.h"
 #include "GitSourceControlModule.h"
 #include "GitSourceControlCommand.h"
+#include "GitMessageLog.h"
+#include "GitSourceControlSettings.h"
 #include "GitSourceControlUtils.h"
 #include "SourceControlHelpers.h"
 #include "Logging/MessageLog.h"
 #include "Misc/MessageDialog.h"
 #include "HAL/PlatformProcess.h"
-#include "GenericPlatform/GenericPlatformFile.h"
-#if ENGINE_MAJOR_VERSION >= 5
-#include "HAL/PlatformFileManager.h"
-#else
-#include "HAL/PlatformFilemanager.h"
-#endif
 
 #include <thread>
 
 #define LOCTEXT_NAMESPACE "GitSourceControl"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+static bool RunUpdateStatusForCommand(
+	FGitSourceControlCommand& InCommand,
+	const TArray<FString>& InFiles,
+	TArray<FString>& OutErrorMessages,
+	TMap<FString, FGitSourceControlState>& OutStates)
+{
+	return GitSourceControlUtils::RunUpdateStatus(InCommand.PathToGitBinary,
+		InCommand.PathToRepositoryRoot, InCommand.bUsingGitLfsLocking,
+		InFiles, OutErrorMessages, OutStates);
+}
+
+
+
+
+
+
+
+
+
+
 
 FName FGitConnectWorker::GetName() const
 {
@@ -209,16 +259,8 @@ FName FGitCheckInWorker::GetName() const
 
 const FText EmptyCommitMsg;
 
-// 'git lfs unlock' with the same idempotency treatment as the checkout verification above: the
-// unlock POST of a flaky host can time out client-side after succeeding server-side, and the
-// state cache can also carry a lock the server has already released (push-hook autounlock,
-// listing flaps) - either way the desired end state "no lock of ours on these files" may already
-// hold when the command errors, and reporting failure makes the whole operation (e.g. a Revert
-// whose git work has actually completed) look broken to the user. Verify against a fresh RAW
-// server listing - the damped listing keeps a dropped lock alive for a few refresh cycles and
-// would still report it as ours. Returns true when no file is locked by us anymore; on success
-// the files are also removed from the lock cache so a phantom cached lock dies with the
-// operation that discovered it.
+
+
 static bool RunLFSUnlockIdempotent(FGitSourceControlCommand& InCommand, const TArray<FString>& InAbsoluteFiles,
 								   TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
 {
@@ -777,8 +819,12 @@ FName FGitFetchWorker::GetName() const
 
 bool FGitFetchWorker::Execute(FGitSourceControlCommand& InCommand)
 {
-	InCommand.bCommandSuccessful = GitSourceControlUtils::FetchRemote(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, InCommand.bUsingGitLfsLocking,
-																	  InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+	InCommand.bCommandSuccessful = GitSourceControlUtils::FetchRemote(
+		InCommand.PathToGitBinary,
+		InCommand.PathToRepositoryRoot,
+		InCommand.bUsingGitLfsLocking,
+		InCommand.ResultInfo.InfoMessages,
+		InCommand.ResultInfo.ErrorMessages);
 	if (!InCommand.bCommandSuccessful)
 	{
 		return false;
@@ -789,12 +835,16 @@ bool FGitFetchWorker::Execute(FGitSourceControlCommand& InCommand)
 
 	if (Operation->bUpdateStatus)
 	{
+
 		// Now update the status of all our files
 		const TArray<FString> ProjectDirs = GitSourceControlUtils::GetSourceControlledAssetPaths();
 
 		TMap<FString, FGitSourceControlState> UpdatedStates;
-		InCommand.bCommandSuccessful = GitSourceControlUtils::RunUpdateStatus(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, InCommand.bUsingGitLfsLocking,
-																			  ProjectDirs, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
+		InCommand.bCommandSuccessful = RunUpdateStatusForCommand(
+			InCommand,
+			ProjectDirs,
+			InCommand.ResultInfo.ErrorMessages,
+			UpdatedStates);
 		GitSourceControlUtils::RemoveRedundantErrors(InCommand, TEXT("' is outside repository"));
 		if (InCommand.bCommandSuccessful)
 		{

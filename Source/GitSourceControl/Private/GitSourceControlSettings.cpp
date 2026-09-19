@@ -16,10 +16,19 @@ static const FString SettingsSection = TEXT("GitSourceControl.GitSourceControlSe
 
 }
 
-const FString & FGitSourceControlSettings::GetBinaryPath() const
+void FGitSourceControlSettings::AdvanceLockSettingsGenerationLocked()
+{
+	++LockSettingsGeneration;
+	if (LockSettingsGeneration == 0)
+	{
+		++LockSettingsGeneration;
+	}
+}
+
+FString FGitSourceControlSettings::GetBinaryPath() const
 {
 	FScopeLock ScopeLock(&CriticalSection);
-	return BinaryPath; // Return a copy to be thread-safe
+	return BinaryPath;
 }
 
 bool FGitSourceControlSettings::SetBinaryPath(const FString& InString)
@@ -44,8 +53,13 @@ bool FGitSourceControlSettings::IsUsingGitLfsLocking() const
 bool FGitSourceControlSettings::SetUsingGitLfsLocking(const bool InUsingGitLfsLocking)
 {
 	FScopeLock ScopeLock(&CriticalSection);
+
 	const bool bChanged = (bUsingGitLfsLocking != InUsingGitLfsLocking);
 	bUsingGitLfsLocking = InUsingGitLfsLocking;
+	if (bChanged)
+	{
+		AdvanceLockSettingsGenerationLocked();
+	}
 	return bChanged;
 }
 
@@ -62,8 +76,19 @@ bool FGitSourceControlSettings::SetLfsUserName(const FString& InString)
 	if (bChanged)
 	{
 		LfsUserName = InString;
+		AdvanceLockSettingsGenerationLocked();
 	}
 	return bChanged;
+}
+
+FGitLockSettingsSnapshot FGitSourceControlSettings::GetLockSettingsSnapshot() const
+{
+	FScopeLock ScopeLock(&CriticalSection);
+	FGitLockSettingsSnapshot Snapshot;
+	Snapshot.Generation = LockSettingsGeneration;
+	Snapshot.bUsingGitLfsLocking = bUsingGitLfsLocking;
+	Snapshot.LfsUserName = LfsUserName;
+	return Snapshot;
 }
 
 // This is called at startup nearly before anything else in our module: BinaryPath will then be used by the provider
@@ -74,6 +99,7 @@ void FGitSourceControlSettings::LoadSettings()
 	GConfig->GetString(*GitSettingsConstants::SettingsSection, TEXT("BinaryPath"), BinaryPath, IniFile);
 	GConfig->GetBool(*GitSettingsConstants::SettingsSection, TEXT("UsingGitLfsLocking"), bUsingGitLfsLocking, IniFile);
 	GConfig->GetString(*GitSettingsConstants::SettingsSection, TEXT("LfsUserName"), LfsUserName, IniFile);
+	AdvanceLockSettingsGenerationLocked();
 }
 
 void FGitSourceControlSettings::SaveSettings() const

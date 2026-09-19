@@ -12,22 +12,25 @@
 #include "GitSourceControlCommand.h"
 #include "ISourceControlModule.h"
 #include "GitSourceControlModule.h"
+#include "GitSourceControlOperations.h"
+#include "GitSourceControlSettings.h"
 #include "GitSourceControlUtils.h"
 #include "SGitSourceControlSettings.h"
-#include "GitSourceControlRunner.h"
 #include "GitSourceControlChangelistState.h"
 #include "Logging/MessageLog.h"
 #include "ScopedSourceControlProgress.h"
 #include "SourceControlHelpers.h"
 #include "SourceControlOperations.h"
 #include "AssetRegistry/AssetRegistryModule.h"
-#include "Async/Async.h"
+#include "Async/AsyncWork.h"
+#include "Async/TaskGraphInterfaces.h"
 #include "GenericPlatform/GenericPlatformFile.h"
 #include "HAL/FileManager.h"
 #include "Interfaces/IPluginManager.h"
 #include "Misc/App.h"
 #include "Misc/EngineVersion.h"
 #include "Misc/MessageDialog.h"
+#include "Misc/ScopeLock.h"
 
 #include "Runtime/Launch/Resources/Version.h"
 #if ENGINE_MAJOR_VERSION == 5
@@ -38,10 +41,178 @@
 
 #define LOCTEXT_NAMESPACE "GitSourceControl"
 
+/**
+ * 仓库初始化的不可变输入和完整输出；后台任务只持有这些值，不捕获 Provider 或模块回调。
+ * Immutable input and complete output for repository initialization. The background task owns only
+ * these values and captures neither the provider nor module callbacks.
+ */
+struct FGitRepositoryInitializationRequest
+{
+	/** Git 可执行文件。 */
+	FString GitBinaryPath;
+	/** 仓库根目录。 */
+	FString RepositoryRoot;
+};
+
+struct FGitRepositoryInitializationResult
+{
+	/** 仓库身份与分支探测是否成功。 */
+	bool bSucceeded = false;
+	/** .umap 与 .uasset 是否都由当前仓库声明为 lockable。 */
+	bool bLockableAttributesAvailable = false;
+	/** Git 用户名。 */
+	FString UserName;
+	/** Git 邮箱。 */
+	FString UserEmail;
+	/** 当前分支。 */
+	FString BranchName;
+	/** 远端跟踪分支。 */
+	FString RemoteBranchName;
+	/** origin URL。 */
+	FString RemoteUrl;
+	/** 后台阶段产生的诊断。 */
+	TArray<FString> ErrorMessages;
+};
+
+/**
+ * 线程池中的纯值仓库探测；完成前由 FAsyncTask 持有，绝不投递无法等待的 GT continuation。
+ * Value-only repository discovery on the thread pool. FAsyncTask owns it through completion and it
+ * never posts an untracked game-thread continuation.
+ */
+class FGitRepositoryInitializationWork : public FNonAbandonableTask
+{
+	friend class FAsyncTask<FGitRepositoryInitializationWork>;
+
+public:
+	explicit FGitRepositoryInitializationWork(
+		FGitRepositoryInitializationRequest&& InRequest)
+		: Request(MoveTemp(InRequest))
+	{
+	}
+
+	/** 仅在任务完成并同步后读取。 */
+	FGitRepositoryInitializationResult&& TakeResult()
+	{
+		return MoveTemp(Result);
+	}
+
+private:
+	void DoWork()
+	{
+		GitSourceControlUtils::GetUserConfig(
+			Request.GitBinaryPath,
+			Request.RepositoryRoot,
+			Result.UserName,
+			Result.UserEmail);
+
+		if (!GitSourceControlUtils::GetBranchName(
+				Request.GitBinaryPath,
+				Request.RepositoryRoot,
+				Result.BranchName))
+		{
+			Result.ErrorMessages.Add(
+				TEXT("仓库初始化时无法读取当前 Git 分支。"));
+			return;
+		}
+
+		GitSourceControlUtils::GetRemoteBranchName(
+			Request.GitBinaryPath,
+			Request.RepositoryRoot,
+			Result.RemoteBranchName);
+		GitSourceControlUtils::GetRemoteUrl(
+			Request.GitBinaryPath,
+			Request.RepositoryRoot,
+			Result.RemoteUrl);
+
+		const TArray<FString> Files{TEXT("*.uasset"), TEXT("*.umap")};
+		TArray<FString> LockableErrorMessages;
+		if (!GitSourceControlUtils::CheckLFSLockable(
+				Request.GitBinaryPath,
+				Request.RepositoryRoot,
+				Files,
+				LockableErrorMessages))
+		{
+			Result.ErrorMessages.Append(LockableErrorMessages);
+		}
+		else
+		{
+			Result.bLockableAttributesAvailable =
+				GitSourceControlUtils::IsFileLFSLockable(TEXT(".umap"))
+				&& GitSourceControlUtils::IsFileLFSLockable(TEXT(".uasset"));
+		}
+
+		Result.bSucceeded = true;
+	}
+
+	FORCEINLINE TStatId GetStatId() const
+	{
+		RETURN_QUICK_DECLARE_CYCLE_STAT(
+			FGitRepositoryInitializationWork,
+			STATGROUP_ThreadPoolAsyncTasks);
+	}
+
+	/** 任务私有输入。 */
+	FGitRepositoryInitializationRequest Request;
+	/** 任务完成后由 Provider 单次取走。 */
+	FGitRepositoryInitializationResult Result;
+};
+
+/**
+ * 对 FAsyncTask 的非模板 Provider 句柄；IsDone/EnsureCompletion 保证销毁前线程池已完全退出。
+ * Non-template provider handle for FAsyncTask. IsDone/EnsureCompletion guarantee that the pool task
+ * has fully left before destruction.
+ */
+class FGitRepositoryInitializationTask
+{
+public:
+	explicit FGitRepositoryInitializationTask(
+		FGitRepositoryInitializationRequest&& InRequest)
+		: Task(MakeUnique<FAsyncTask<FGitRepositoryInitializationWork>>(
+			MoveTemp(InRequest)))
+	{
+	}
+
+	/** 在当前线程立即运行。 */
+	void StartSynchronous()
+	{
+		Task->StartSynchronousTask();
+	}
+
+	/** 在线程池排队；排队对象由本句柄持有，Close 可等待。 */
+	void StartBackground()
+	{
+		Task->StartBackgroundTask();
+	}
+
+	/** 单帧非阻塞完成检查；true 时已经同步到任务尾部。 */
+	bool IsDone()
+	{
+		return Task->IsDone();
+	}
+
+	/** 等待或收回尚未启动的任务，并保证执行尾部已完成。 */
+	void EnsureCompletion()
+	{
+		Task->EnsureCompletion();
+	}
+
+	/** 同步完成后单次取走结果。 */
+	FGitRepositoryInitializationResult TakeResult()
+	{
+		return Task->GetTask().TakeResult();
+	}
+
+private:
+	/** 完整拥有后台任务，析构前必须已完成。 */
+	TUniquePtr<FAsyncTask<FGitRepositoryInitializationWork>> Task;
+};
+
 static FName ProviderName("Git LFS 2");
 
 void FGitSourceControlProvider::Init(bool bForceConnection)
 {
+	bClosing = false;
+
 	// Init() is called multiple times at startup: do not check git each time
 	if(!bGitAvailable)
 	{
@@ -57,7 +228,7 @@ void FGitSourceControlProvider::Init(bool bForceConnection)
 #if ENGINE_MAJOR_VERSION == 5
 	UPackage::PackageSavedWithContextEvent.AddStatic(&GitSourceControlUtils::UpdateFileStagingOnSaved);
 #endif
-	
+
 	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
 	AssetRegistryModule.Get().OnAssetRenamed().AddStatic(&GitSourceControlUtils::UpdateStateOnAssetRename);	
 
@@ -93,16 +264,72 @@ void FGitSourceControlProvider::CheckGitAvailability()
 void FGitSourceControlProvider::UpdateSettings()
 {
 	const FGitSourceControlModule& GitSourceControl = FGitSourceControlModule::Get();
-	bUsingGitLfsLocking = GitSourceControl.AccessSettings().IsUsingGitLfsLocking();
-	LockUser = GitSourceControl.AccessSettings().GetLfsUserName();
+	const FGitLockSettingsSnapshot Settings =
+		GitSourceControl.AccessSettings().GetLockSettingsSnapshot();
+	const bool bPreviousUsingGitLfsLocking = bUsingGitLfsLocking;
+	const bool bPreviousLockingConfigurationValid =
+		bLockingConfigurationValid;
+	const FString PreviousLockUser = LockUser;
+	const uint64 PreviousGeneration = LockSettingsGeneration;
+	ApplyEffectiveLockingSettings(Settings);
+	const bool bLockSettingsChanged =
+		PreviousGeneration != LockSettingsGeneration
+		|| bPreviousUsingGitLfsLocking != bUsingGitLfsLocking
+		|| bPreviousLockingConfigurationValid
+			!= bLockingConfigurationValid
+		|| PreviousLockUser != LockUser;
+	if (bLockSettingsChanged && bGitRepositoryFound)
+	{
+		bBackgroundRefreshRequested = true;
+		NextBackgroundRefreshTimeSeconds = 0.0;
+	}
 }
+
+void FGitSourceControlProvider::ApplyEffectiveLockingSettings(
+	const FGitLockSettingsSnapshot& InSettings)
+{
+	LockingConfigurationError.Reset();
+	if (LockingConfigurationError.IsEmpty()
+		&& InSettings.bUsingGitLfsLocking
+		&& bLockableAttributesCapabilityKnown
+		&& !bLockableAttributesAvailable)
+	{
+		LockingConfigurationError = TEXT(
+			"Git Source Control 锁配置无法生效：已启用 Git LFS 锁，但仓库未为"
+			" .uasset/.umap 提供有效 lockable 属性；Provider 已停止操作，"
+			"请修复根目录 .gitattributes 或显式关闭 Git LFS 锁。");
+	}
+	bLockingConfigurationValid =
+		LockingConfigurationError.IsEmpty();
+	bUsingGitLfsLocking =
+		bLockingConfigurationValid
+		&& InSettings.bUsingGitLfsLocking
+		&& bLockableAttributesAvailable;
+	LockUser = InSettings.LfsUserName;
+	LockSettingsGeneration = InSettings.Generation;
+}
+
+#if WITH_DEV_AUTOMATION_TESTS
+void FGitSourceControlProvider::ApplyLockingSettingsForTests(
+	const FGitLockSettingsSnapshot& InSettings,
+	bool bInLockableAttributesAvailable)
+{
+	bGitRepositoryFound = true;
+	bLockableAttributesCapabilityKnown = true;
+	bLockableAttributesAvailable =
+		bInLockableAttributesAvailable;
+	ApplyEffectiveLockingSettings(InSettings);
+}
+#endif
 
 void FGitSourceControlProvider::CheckRepositoryStatus()
 {
-	// Uncooked -game/-server runs load this module too (UncookedOnly), but they have no revision
-	// control UI or workflow. The boot-time repository scan spawns git/LFS subprocesses and its
-	// game-thread completion task lands in the middle of the initial LoadMap, where it has been
-	// observed corrupting the heap and crashing the boot. Editor-only machinery: skip it entirely.
+	// Uncooked -game/-server 进程也会加载本模块（UncookedOnly），但并不拥有版本控制 UI 或工作流。
+	// 启动期仓库扫描会创建 Git/LFS 子进程，其游戏线程完成任务可能落在初始 LoadMap 中段；实测这会破坏堆并导致启动崩溃。
+	// 因此该 Provider 的扫描属于纯 Editor 机制，非 Editor 进程必须完全跳过。
+	// Uncooked -game/-server processes also load this module (UncookedOnly), but have no revision control UI or workflow.
+	// The boot-time repository scan spawns Git/LFS subprocesses whose game-thread completion may land during the initial LoadMap;
+	// this has been observed corrupting the heap and crashing startup, so non-Editor processes must skip this Editor-only scan.
 	if (!GIsEditor)
 	{
 		bGitRepositoryFound = false;
@@ -111,6 +338,12 @@ void FGitSourceControlProvider::CheckRepositoryStatus()
 
 	GitSourceControlMenu.Register();
 
+	// 每次仓库探测都先撤销旧能力，只有本轮成功结果才能重新授予 checkout。
+	// Revoke stale repository capability before every probe. Only this probe's successful result
+	// may enable checkout again.
+	bGitRepositoryFound = false;
+	bLockableAttributesCapabilityKnown = false;
+	bLockableAttributesAvailable = false;
 	// Make sure our settings our up to date
 	UpdateSettings();
 
@@ -132,112 +365,117 @@ void FGitSourceControlProvider::CheckRepositoryStatus()
 		return;
 	}
 
-	TUniqueFunction<void()> InitFunc = [this]()
+	// 重复 Init/连接请求复用已经排队的初始化；任务结果只能由 Tick 或同步路径消费。
+	// Repeated Init/connect requests reuse an already queued initialization. Only Tick or the
+	// synchronous path may consume its result.
+	if (RepositoryInitializationTask.IsValid())
 	{
-		if (!IsInGameThread())
-		{
-			// Wait until the module interface is valid
-			do
-			{
-				if (FModuleManager::Get().IsModuleLoaded("GitSourceControl"))
-				{
-					break;
-				}
-				FPlatformProcess::Sleep(0.01f);
-			} while (true);
-		}
+		return;
+	}
 
-		// Get user name & email (of the repository, else from the global Git config)
-		GitSourceControlUtils::GetUserConfig(PathToGitBinary, PathToRepositoryRoot, UserName, UserEmail);
-		
-		TMap<FString, FGitSourceControlState> States;
-		auto ConditionalRepoInit = [this, &States]()
-		{
-			if (!GitSourceControlUtils::GetBranchName(PathToGitBinary, PathToRepositoryRoot, BranchName))
-			{
-				return false;
-			}
-			GitSourceControlUtils::GetRemoteBranchName(PathToGitBinary, PathToRepositoryRoot, RemoteBranchName);
-			GitSourceControlUtils::GetRemoteUrl(PathToGitBinary, PathToRepositoryRoot, RemoteUrl);
-			const TArray<FString> Files{TEXT("*.uasset"), TEXT("*.umap")};
-			TArray<FString> LockableErrorMessages;
-			if (!GitSourceControlUtils::CheckLFSLockable(PathToGitBinary, PathToRepositoryRoot, Files, LockableErrorMessages))
-			{
-				for (const auto &ErrorMessage : LockableErrorMessages)
-				{
-					UE_LOG(LogSourceControl, Error, TEXT("%s"), *ErrorMessage);
-				}
-			}
-			else if (bUsingGitLfsLocking)
-			{
-				if (!GitSourceControlUtils::IsFileLFSLockable(".umap")
-					|| !GitSourceControlUtils::IsFileLFSLockable(".uasset"))
-				{
-					UE_LOG(LogSourceControl, Error, TEXT("Git LFS Locking is disabled. Files .uasset or .umap are not lockable. Make sure your .gitattributes is setting lockable attributes for .uasset or .umap at the root of the git repository."));
-					bUsingGitLfsLocking = false;
-				}
-				else
-				{
-					UE_LOG(LogSourceControl, Log, TEXT("Git LFS Locking is enabled."));
-				}
-			}
-
-			const TArray<FString> ProjectDirs = GitSourceControlUtils::GetSourceControlledAssetPaths();
-
-			TArray<FString> StatusErrorMessages;
-			if (!GitSourceControlUtils::RunUpdateStatus(PathToGitBinary, PathToRepositoryRoot, bUsingGitLfsLocking, ProjectDirs, StatusErrorMessages, States))
-			{
-				return false;
-			}
-			return true;
-		};
-		if (ConditionalRepoInit())
-		{
-			TUniqueFunction<void()> SuccessFunc = [States, this]()
-			{
-				TMap<const FString, FGitState> Results;
-				if (GitSourceControlUtils::CollectNewStates(States, Results))
-				{
-					GitSourceControlUtils::UpdateCachedStates(Results);
-				}
-				Runner = new FGitSourceControlRunner();
-				bGitRepositoryFound = true;
-			};
-			if (FApp::IsUnattended() || IsRunningCommandlet())
-			{
-				SuccessFunc();
-			}
-			else
-			{
-				AsyncTask(ENamedThreads::GameThread, MoveTemp(SuccessFunc));
-			}
-		}
-		else
-		{
-			TUniqueFunction<void()> ErrorFunc = [States, this]()
-			{
-				UE_LOG(LogSourceControl, Error, TEXT("Failed to update repo on initialization."));
-				bGitRepositoryFound = false;
-			};
-			if (FApp::IsUnattended() || IsRunningCommandlet())
-			{
-				ErrorFunc();
-			}
-			else
-			{
-				AsyncTask(ENamedThreads::GameThread, MoveTemp(ErrorFunc));
-			}
-		}
-	};
+	FGitRepositoryInitializationRequest Request;
+	Request.GitBinaryPath = PathToGitBinary;
+	Request.RepositoryRoot = PathToRepositoryRoot;
+	RepositoryInitializationTask =
+		MakeShared<FGitRepositoryInitializationTask, ESPMode::ThreadSafe>(
+			MoveTemp(Request));
 
 	if (FApp::IsUnattended() || IsRunningCommandlet())
 	{
-		InitFunc();
+		RepositoryInitializationTask->StartSynchronous();
+		FinalizeRepositoryInitialization(true, true);
 	}
 	else
 	{
-		AsyncTask(ENamedThreads::AnyHiPriThreadNormalTask, MoveTemp(InitFunc));
+		RepositoryInitializationTask->StartBackground();
 	}
+}
+
+void FGitSourceControlProvider::FinalizeRepositoryInitialization(
+	bool bWaitForCompletion,
+	bool bApplyResult)
+{
+	if (!RepositoryInitializationTask.IsValid())
+	{
+		return;
+	}
+	if (!bWaitForCompletion && !RepositoryInitializationTask->IsDone())
+	{
+		return;
+	}
+
+	RepositoryInitializationTask->EnsureCompletion();
+	FGitRepositoryInitializationResult Result =
+		RepositoryInitializationTask->TakeResult();
+	RepositoryInitializationTask.Reset();
+
+	if (!bApplyResult || bClosing)
+	{
+		return;
+	}
+
+	UserName = MoveTemp(Result.UserName);
+	UserEmail = MoveTemp(Result.UserEmail);
+	for (const FString& ErrorMessage : Result.ErrorMessages)
+	{
+		UE_LOG(LogSourceControl, Error, TEXT("%s"), *ErrorMessage);
+	}
+	if (!Result.bSucceeded)
+	{
+		UE_LOG(
+			LogSourceControl,
+			Error,
+			TEXT("Failed to update repo on initialization."));
+		bGitRepositoryFound = false;
+		return;
+	}
+
+	BranchName = MoveTemp(Result.BranchName);
+	RemoteBranchName = MoveTemp(Result.RemoteBranchName);
+	RemoteUrl = MoveTemp(Result.RemoteUrl);
+	const FGitLockSettingsSnapshot CurrentSettings =
+		FGitSourceControlModule::Get()
+			.AccessSettings()
+			.GetLockSettingsSnapshot();
+	// Editor 可见设置仍是运行时事实来源；后台结果只提供仓库能力，绝不能恢复旧的开关快照。
+	// Editor-visible settings remain the runtime source of truth. The background result contributes
+	// only repository capability and can never restore a stale enable/disable snapshot.
+	bLockableAttributesAvailable =
+		Result.bLockableAttributesAvailable;
+	bLockableAttributesCapabilityKnown = true;
+	ApplyEffectiveLockingSettings(CurrentSettings);
+	if (bUsingGitLfsLocking)
+	{
+		UE_LOG(LogSourceControl, Log, TEXT("Git LFS Locking is enabled."));
+	}
+	else if (CurrentSettings.bUsingGitLfsLocking)
+	{
+		UE_LOG(
+			LogSourceControl,
+			Error,
+			TEXT(
+				"Git LFS Locking is disabled. Files .uasset or .umap are not "
+				"lockable. Make sure your .gitattributes is setting lockable "
+				"attributes for .uasset or .umap at the root of the git repository."));
+	}
+	bGitRepositoryFound = true;
+	NextBackgroundRefreshTimeSeconds =
+		FPlatformTime::Seconds() + 30.0;
+
+	// 仓库初始化只负责只读探测；状态刷新进入 Provider 拥有的标准命令队列。
+	// Initialization is read-only; refresh state through the provider-owned command queue.
+#if ENGINE_MAJOR_VERSION >= 5
+	Execute(
+		ISourceControlOperation::Create<FUpdateStatus>(),
+		FSourceControlChangelistPtr(),
+		FGitSourceControlModule::GetEmptyStringArray(),
+		EConcurrency::Asynchronous);
+#else
+	Execute(
+		ISourceControlOperation::Create<FUpdateStatus>(),
+		FGitSourceControlModule::GetEmptyStringArray(),
+		EConcurrency::Asynchronous);
+#endif
 }
 
 void FGitSourceControlProvider::SetLastErrors(const TArray<FText>& InErrors)
@@ -262,6 +500,36 @@ int32 FGitSourceControlProvider::GetNumLastErrors() const
 
 void FGitSourceControlProvider::Close()
 {
+	bClosing = true;
+	// 初始化任务从排队时即由 Provider 持有；这里等待其完整退出并丢弃结果，不依赖 GT
+	// continuation，因此 Close 在 GameThread 等待也不会形成互等。
+	// The provider owns initialization from enqueue time. Wait for complete exit and discard the
+	// result here without a game-thread continuation, so waiting in Close cannot deadlock the GT.
+	FinalizeRepositoryInitialization(true, false);
+
+	// 关闭阶段继续 Tick 直到全部已接收命令完成；bClosing 阻止回调再次排队。
+	// 模块卸载前必须交付全部状态与 completion，不能留下仍使用本模块的 worker。
+	// Tick until all admitted commands complete; bClosing prevents callbacks from enqueueing more.
+	// Deliver state and completion before unload so no worker outlives this module.
+	while (!CommandQueue.IsEmpty())
+	{
+		// 部分已接收 Git worker 会在 pull 的包卸载/重载边界同步等待 GT 任务。Close
+		// 本身运行在 GT，因此必须泵已排队 TaskGraph 工作再轮询命令，避免双方互等。
+		// Some admitted Git workers synchronously await GT package unlink/reload tasks during pull.
+		// Close itself runs on the GT, so pump queued TaskGraph work before polling commands to
+		// prevent a worker/Close deadlock.
+		if (IsInGameThread())
+		{
+			FTaskGraphInterface::Get().ProcessThreadUntilIdle(
+				ENamedThreads::GameThread);
+		}
+		Tick();
+		if (!CommandQueue.IsEmpty())
+		{
+			FPlatformProcess::Sleep(0.01f);
+		}
+	}
+
 	// clear the cache
 	StateCache.Empty();
 	// Remove all extensions to the "Revision Control" menu in the Editor Toolbar
@@ -269,13 +537,17 @@ void FGitSourceControlProvider::Close()
 
 	bGitAvailable = false;
 	bGitRepositoryFound = false;
+	bLockableAttributesCapabilityKnown = false;
+	bLockableAttributesAvailable = false;
+	bUsingGitLfsLocking = false;
+	bLockingConfigurationValid = true;
+	LockingConfigurationError.Reset();
+	LockSettingsGeneration = 0;
 	UserName.Empty();
 	UserEmail.Empty();
-	if (Runner)
-	{
-		delete Runner;
-		Runner = nullptr;
-	}
+	bBackgroundRefreshInFlight = false;
+	bBackgroundRefreshRequested = false;
+	NextBackgroundRefreshTimeSeconds = 0.0;
 }
 
 TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> FGitSourceControlProvider::GetStateInternal(const FString& Filename)
@@ -327,30 +599,56 @@ FText FGitSourceControlProvider::GetStatusText() const
 	Args.Add( TEXT("CommitSummary"), FText::FromString(CommitSummary) );
 
 	FText FormattedError;
-	const TArray<FText>& RecentErrors = GetLastErrors();
-	if (RecentErrors.Num() > 0)
+	if (!bLockingConfigurationValid)
 	{
 		FFormatNamedArguments ErrorArgs;
-		ErrorArgs.Add(TEXT("ErrorText"), RecentErrors[0]);
+		ErrorArgs.Add(
+			TEXT("ErrorText"),
+			FText::FromString(LockingConfigurationError));
 
-		FormattedError = FText::Format(LOCTEXT("GitErrorStatusText", "Error: {ErrorText}\n\n"), ErrorArgs);
+		FormattedError = FText::Format(
+			LOCTEXT(
+				"GitLockingConfigurationErrorStatusText",
+				"Error: {ErrorText}\n\n"),
+			ErrorArgs);
+	}
+	else
+	{
+		const TArray<FText>& RecentErrors = GetLastErrors();
+		if (RecentErrors.Num() > 0)
+		{
+			FFormatNamedArguments ErrorArgs;
+			ErrorArgs.Add(TEXT("ErrorText"), RecentErrors[0]);
+
+			FormattedError = FText::Format(
+				LOCTEXT(
+					"GitErrorStatusText",
+					"Error: {ErrorText}\n\n"),
+				ErrorArgs);
+		}
 	}
 
 	Args.Add(TEXT("ErrorText"), FormattedError);
 
-	return FText::Format( NSLOCTEXT("GitStatusText", "{ErrorText}Enabled: {IsAvailable}", "Local repository: {RepositoryName}\nRemote: {RemoteUrl}\nUser: {UserName}\nE-mail: {UserEmail}\n[{BranchName} {CommitId}] {CommitSummary}"), Args );
+	return FText::Format(
+		LOCTEXT(
+			"GitStatusText",
+			"{ErrorText}Enabled: {IsAvailable}\nLocal repository: {RepositoryName}\n"
+			"Remote: {RemoteUrl}\nUser: {UserName}\nE-mail: {UserEmail}\n"
+			"[{BranchName} {CommitId}] {CommitSummary}"),
+		Args);
 }
 
 /** Quick check if revision control is enabled */
 bool FGitSourceControlProvider::IsEnabled() const
 {
-	return bGitRepositoryFound;
+	return bGitRepositoryFound && bLockingConfigurationValid;
 }
 
 /** Quick check if revision control is available for use (useful for server-based providers) */
 bool FGitSourceControlProvider::IsAvailable() const
 {
-	return bGitRepositoryFound;
+	return bGitRepositoryFound && bLockingConfigurationValid;
 }
 
 const FName& FGitSourceControlProvider::GetName(void) const
@@ -466,6 +764,13 @@ ECommandResult::Type FGitSourceControlProvider::Execute( const FSourceControlOpe
 ECommandResult::Type FGitSourceControlProvider::Execute( const FSourceControlOperationRef& InOperation, FSourceControlChangelistPtr InChangelist, const TArray<FString>& InFiles, EConcurrency::Type InConcurrency, const FSourceControlOperationComplete& InOperationCompleteDelegate )
 #endif
 {
+	if (bClosing)
+	{
+		InOperationCompleteDelegate.ExecuteIfBound(
+			InOperation,
+			ECommandResult::Failed);
+		return ECommandResult::Failed;
+	}
 	if(!IsEnabled() && !(InOperation->GetName() == "Connect")) // Only Connect operation allowed while not Enabled (Repository found)
 	{
 		InOperationCompleteDelegate.ExecuteIfBound(InOperation, ECommandResult::Failed);
@@ -571,7 +876,7 @@ ECommandResult::Type FGitSourceControlProvider::Execute( const FSourceControlOpe
 	TSharedPtr<FGitSourceControlChangelist, ESPMode::ThreadSafe> ChangelistPtr = StaticCastSharedPtr<FGitSourceControlChangelist>(InChangelist);
 	Command->Changelist = ChangelistPtr ? ChangelistPtr.ToSharedRef().Get() : FGitSourceControlChangelist();
 #endif
-	
+
 	// fire off operation
 	if(InConcurrency == EConcurrency::Synchronous)
 	{
@@ -754,6 +1059,15 @@ void FGitSourceControlProvider::OutputCommandMessages(const FGitSourceControlCom
 
 void FGitSourceControlProvider::UpdateRepositoryStatus(const class FGitSourceControlCommand& InCommand)
 {
+	if (InCommand.bStatusSettingsSuperseded)
+	{
+		// 旧代状态只用于暂时失败关闭；立即排队同代刷新，不能等待常规 30 秒周期。
+		// Superseded states only fail closed temporarily. Queue a same-generation refresh
+		// immediately instead of waiting for the regular 30-second interval.
+		bBackgroundRefreshRequested = true;
+		NextBackgroundRefreshTimeSeconds = 0.0;
+	}
+
 	// For all operations running UpdateStatus, get Commit information:
 	if (!InCommand.CommitId.IsEmpty())
 	{
@@ -762,8 +1076,67 @@ void FGitSourceControlProvider::UpdateRepositoryStatus(const class FGitSourceCon
 	}
 }
 
+void FGitSourceControlProvider::StartBackgroundRefreshIfDue()
+{
+	const double CurrentTimeSeconds = FPlatformTime::Seconds();
+	if (bClosing
+		|| !IsEnabled()
+		|| bBackgroundRefreshInFlight
+		|| (!bBackgroundRefreshRequested
+			&& (NextBackgroundRefreshTimeSeconds <= 0.0
+				|| CurrentTimeSeconds
+					< NextBackgroundRefreshTimeSeconds)))
+	{
+		return;
+	}
+
+	TSharedRef<FGitFetch, ESPMode::ThreadSafe> RefreshOperation =
+		ISourceControlOperation::Create<FGitFetch>();
+	RefreshOperation->bUpdateStatus = true;
+	bBackgroundRefreshInFlight = true;
+	bBackgroundRefreshRequested = false;
+	NextBackgroundRefreshTimeSeconds = 0.0;
+#if ENGINE_MAJOR_VERSION >= 5
+	const ECommandResult::Type Result = Execute(
+		RefreshOperation,
+		FSourceControlChangelistPtr(),
+		FGitSourceControlModule::GetEmptyStringArray(),
+		EConcurrency::Asynchronous,
+		FSourceControlOperationComplete::CreateRaw(
+			this,
+			&FGitSourceControlProvider::OnBackgroundRefreshComplete));
+#else
+	const ECommandResult::Type Result = Execute(
+		RefreshOperation,
+		FGitSourceControlModule::GetEmptyStringArray(),
+		EConcurrency::Asynchronous,
+		FSourceControlOperationComplete::CreateRaw(
+			this,
+			&FGitSourceControlProvider::OnBackgroundRefreshComplete));
+#endif
+	if (Result != ECommandResult::Succeeded && bBackgroundRefreshInFlight)
+	{
+		bBackgroundRefreshInFlight = false;
+		NextBackgroundRefreshTimeSeconds = FPlatformTime::Seconds() + 30.0;
+	}
+}
+
+void FGitSourceControlProvider::OnBackgroundRefreshComplete(
+	const FSourceControlOperationRef& InOperation,
+	ECommandResult::Type InResult)
+{
+	(void)InOperation;
+	(void)InResult;
+	bBackgroundRefreshInFlight = false;
+	NextBackgroundRefreshTimeSeconds = bBackgroundRefreshRequested
+		? FPlatformTime::Seconds()
+		: FPlatformTime::Seconds() + 30.0;
+}
+
 void FGitSourceControlProvider::Tick()
 {
+	FinalizeRepositoryInitialization(false, true);
+	StartBackgroundRefreshIfDue();
 #if ENGINE_MAJOR_VERSION < 5
 	bool bStatesUpdated = false;
 #else
@@ -872,7 +1245,7 @@ TArray<FSourceControlChangelistRef> FGitSourceControlProvider::GetChangelists( E
 	{
 		return TArray<FSourceControlChangelistRef>();
 	}
-	
+
 	TArray<FSourceControlChangelistRef> Changelists;
 	Algo::Transform(ChangelistsStateCache, Changelists, [](const auto& Pair) { return MakeShared<FGitSourceControlChangelist, ESPMode::ThreadSafe>(Pair.Key); });
 	return Changelists;
@@ -936,14 +1309,25 @@ ECommandResult::Type FGitSourceControlProvider::ExecuteSynchronousCommand(FGitSo
 		{
 			Result = ECommandResult::Cancelled;
 		}
-		if (InCommand.bCommandSuccessful)
+		else if (InCommand.bCommandSuccessful)
 		{
 			Result = ECommandResult::Succeeded;
 		}
 		else if (!bSuppressResponseMsg)
 		{
-			FMessageDialog::Open( EAppMsgType::Ok, LOCTEXT("Git_ServerUnresponsive", "Git command failed. Please check your connection and try again, or check the output log for more information.") );
-			UE_LOG(LogSourceControl, Error, TEXT("Command '%s' Failed!"), *InCommand.Operation->GetName().ToString());
+			// 失败不是统一的网络故障，也不表示之前步骤已回滚；保留完整明细，非模态通知可直接打开日志。
+			// Failure is neither necessarily a network error nor a rollback; retain details in a non-modal, linked notification.
+			const FString Detail = InCommand.ResultInfo.ErrorMessages.IsEmpty()
+				? TEXT("命令未提供具体原因，请查看版本控制日志。")
+				: InCommand.ResultInfo.ErrorMessages[0];
+			const FText Summary = FText::Format(
+				LOCTEXT("Git_CommandIncomplete", "{0} 未全部完成。{1}\n点击查看具体文件、失败原因及已完成步骤。"),
+				FText::FromName(InCommand.Operation->GetName()),
+				FText::FromString(Detail.Len() > 180 ? Detail.Left(180) + TEXT("…") : Detail));
+			UE_LOG(LogSourceControl, Error, TEXT("Command '%s' failed in %s: %s"),
+				*InCommand.Operation->GetName().ToString(), *InCommand.PathToGitRoot,
+				*FString::Join(InCommand.ResultInfo.ErrorMessages, TEXT("\n")));
+			FMessageLog("SourceControl").Notify(Summary, EMessageSeverity::Error, true);
 		}
 	}
 
@@ -1056,7 +1440,7 @@ TArray<FString> FGitSourceControlProvider::GetStatusBranchNames() const
 	TArray<FString> StatusBranches;
 	if (PathToGitBinary.IsEmpty() || PathToRepositoryRoot.IsEmpty())
 		return StatusBranches;
-	
+
 	for (int i = 0; i < StatusBranchNamePatternsInternal.Num(); i++)
 	{
 		TArray<FString> Matches;
@@ -1069,7 +1453,7 @@ TArray<FString> FGitSourceControlProvider::GetStatusBranchNames() const
 			}
 		}
 	}
-	
+
 	return StatusBranches;
 }
 

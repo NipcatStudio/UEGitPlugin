@@ -9,7 +9,9 @@
 #include "GitSourceControlCommand.h"
 #include "GitSourceControlModule.h"
 #include "GitSourceControlProvider.h"
+#include "GitSourceControlSettings.h"
 #include "HAL/PlatformProcess.h"
+#include "SourceControlOperations.h"
 
 #include "HAL/PlatformFile.h"
 #if ENGINE_MAJOR_VERSION >= 5
@@ -30,6 +32,9 @@
 #include "Misc/DateTime.h"
 #include "Misc/ScopeLock.h"
 #include "Misc/Timespan.h"
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 
 #include "PackageTools.h"
 #include "FileHelpers.h"
@@ -92,6 +97,8 @@ TMap<FString, FString> FGitLockedFilesCache::GetLockedFiles()
 	FScopeLock Lock(&LockedFilesMutex);
 	return LockedFiles;
 }
+
+
 
 void FGitLockedFilesCache::SetLockedFiles(const TMap<FString, FString>& newLocks)
 {
@@ -252,6 +259,16 @@ TArray<FGitLockedFilesCache::FLockStateFixup> FGitLockedFilesCache::TakePendingS
 
 namespace GitSourceControlUtils
 {
+
+
+
+
+
+
+
+
+
+
 	FString ChangeRepositoryRootIfSubmodule(TArray<FString>& AbsoluteFilePaths, const FString& PathToRepositoryRoot)
 	{
 		FString Ret = PathToRepositoryRoot;
@@ -473,6 +490,8 @@ static bool TryRecoverFromIndexLockFailure(const FString& InErrors, const int32 
 	FPlatformProcess::Sleep(0.5f * InAttempt);
 	return true;
 }
+
+
 
 static bool RunCommandInternal(const FString& InCommand, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters,
 							   const TArray<FString>& InFiles, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
@@ -956,7 +975,7 @@ bool GetRemoteBranchesWildcard(const FString& InPathToGitBinary, const FString& 
 	}
 	return bResults;	
 }
-	
+
 bool GetCommitInfo(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutCommitId, FString& OutCommitSummary)
 {
 	bool bResults;
@@ -1002,6 +1021,8 @@ TArray<FString> GetSourceControlledAssetPaths()
 	};
 }
 
+
+
 bool RunCommand(const FString& InCommand, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters,
 				const TArray<FString>& InFiles, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
 {
@@ -1033,6 +1054,12 @@ bool RunCommand(const FString& InCommand, const FString& InPathToGitBinary, cons
 
 	return bResult;
 }
+
+
+
+
+
+
 
 #ifndef GIT_USE_CUSTOM_LFS
 #define GIT_USE_CUSTOM_LFS 1
@@ -1079,6 +1106,10 @@ static void EnsureGitLfsToolsInPath(const FString& InPathToGitBinary)
 	}
 }
 #endif
+
+
+
+
 
 bool RunLFSCommand(const FString& InCommand, const FString& InRepositoryRoot, const FString& GitBinaryFallback, const TArray<FString>& InParameters, const TArray<FString>& InFiles,
 				   TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
@@ -1213,6 +1244,10 @@ public:
 	// Name of user who has file locked
 	FString LockUser;
 };
+
+
+
+
 
 /**
  * @brief Extract the relative filename from a Git status result.
@@ -2028,7 +2063,7 @@ bool UpdateChangelistStateByCommand()
 		UE_LOG(LogSourceControl, Warning, TEXT("GitSourceControl module is not loaded."));
 		return false;
 	}
-	
+
 	FGitSourceControlModule& GitSourceControl = FModuleManager::GetModuleChecked<FGitSourceControlModule>("GitSourceControl");
 	FGitSourceControlProvider& Provider = GitSourceControl.GetProvider();
 	if (!Provider.IsGitAvailable())
@@ -2046,7 +2081,13 @@ bool UpdateChangelistStateByCommand()
 	Parameters.Add(TEXT("--porcelain"));
 	TArray<FString> Results;
 	TArray<FString> ErrorMsg;
-	const bool bResult = RunCommand(TEXT("--no-optional-locks status"), Provider.GetGitBinaryPath(), Provider.GetPathToRepositoryRoot(), Parameters, Files, Results, ErrorMsg);
+	const bool bResult = RunCommand(TEXT("status"),
+		Provider.GetGitBinaryPath(),
+		Provider.GetPathToRepositoryRoot(),
+		Parameters,
+		Files,
+		Results,
+		ErrorMsg);
 	for (const auto& Result : Results)
 	{
 		FString File = GetFullPathFromGitStatus(Result, Provider.GetPathToRepositoryRoot());
@@ -2055,7 +2096,6 @@ bool UpdateChangelistStateByCommand()
 		if (!TChar<TCHAR>::IsWhitespace(Result[0]))
 		{
 			WorkingChangelist->Files.Remove(State);
-			UpdateFileStagingOnSavedInternal(Result);
 			State->Changelist = FGitSourceControlChangelist::StagedChangelist;
 			StagedChangelist->Files.AddUnique(State);
 			continue;
@@ -2071,7 +2111,7 @@ bool UpdateChangelistStateByCommand()
 	return true;
 }
 #endif
-	
+
 // Run a batch of Git "status" command to update status of given files and/or directories.
 bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool InUsingLfsLocking, const TArray<FString>& InFiles,
 					 TArray<FString>& OutErrorMessages, TMap<FString, FGitSourceControlState>& OutStates)
@@ -2117,31 +2157,39 @@ void UpdateFileStagingOnSaved(const FString& Filename, UPackage* Pkg, FObjectPos
 {
 	UpdateFileStagingOnSavedInternal(Filename);
 }
-	
+
 bool UpdateFileStagingOnSavedInternal(const FString& Filename)
 {
-	bool bResult = false;
 	FGitSourceControlModule& GitSourceControl = FModuleManager::GetModuleChecked<FGitSourceControlModule>("GitSourceControl");
 	FGitSourceControlProvider& Provider = GitSourceControl.GetProvider();
 	if (!Provider.IsGitAvailable())
 	{
-		return bResult;
+		return false;
 	}
 	TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> State = Provider.GetStateInternal(Filename);
 
 	if (State->Changelist.GetName().Equals(TEXT("Staged")))
 	{
-		TArray<FString> File;
-		File.Add(Filename);
-		TArray<FString> DummyResults;
-		TArray<FString> DummyMsgs;
-		bResult = RunCommand(TEXT("add"), Provider.GetGitBinaryPath(), Provider.GetPathToRepositoryRoot(), FGitSourceControlModule::GetEmptyStringArray(), File, DummyResults, DummyMsgs);
+		// 保存回调不再绕过 command 快照直接写 index；排队到 MoveToChangelist worker 后，
+		// add 会和所有其他 mutation 一样在实际写入前复核设置与 live branch。
+		// The save callback no longer writes the index outside a command snapshot. Queueing the
+		// MoveToChangelist worker makes its add revalidate settings and the live branch at the write.
+		FSourceControlChangelistPtr StagedChangelist =
+			MakeShared<FGitSourceControlChangelist, ESPMode::ThreadSafe>(
+				FGitSourceControlChangelist::StagedChangelist);
+		const TArray<FString> Files{Filename};
+		return Provider.Execute(
+			ISourceControlOperation::Create<FMoveToChangelist>(),
+			StagedChangelist,
+			Files,
+			EConcurrency::Asynchronous)
+			== ECommandResult::Succeeded;
 	}
-	
-	return bResult;
+
+	return false;
 }
 #endif
-	
+
 void UpdateStateOnAssetRename(const FAssetData& InAssetData, const FString& InOldName)
 {
 	FGitSourceControlModule& GitSourceControl = FModuleManager::GetModuleChecked<FGitSourceControlModule>("GitSourceControl");
@@ -2701,7 +2749,10 @@ void RemoveRedundantErrors(FGitSourceControlCommand& InCommand, const FString& I
 	}
 }
 
+/** 当前仓库 check-attr 得到的 lockable 扩展名。 */
 static TArray<FString> LockableTypes;
+/** 保护后台初始化与状态命令共享的 lockable 扩展名。 */
+static FCriticalSection LockableTypesMutex;
 
 bool IsFileLFSLockable(const FString& InFile)
 {

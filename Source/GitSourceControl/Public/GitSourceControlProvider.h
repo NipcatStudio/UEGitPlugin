@@ -13,6 +13,8 @@
 
 class FGitSourceControlChangelistState;
 class FGitSourceControlState;
+class FGitRepositoryInitializationTask;
+struct FGitLockSettingsSnapshot;
 
 class FGitSourceControlCommand;
 
@@ -179,6 +181,13 @@ public:
 		return LockUser;
 	}
 
+#if WITH_DEV_AUTOMATION_TESTS
+	/** 用指定仓库能力应用一次设置快照，供回归测试验证能力不会被后续设置刷新绕过。 */
+	void ApplyLockingSettingsForTests(
+		const FGitLockSettingsSnapshot& InSettings,
+		bool bInLockableAttributesAvailable);
+#endif
+
 	/** Helper function used to update state cache */
 	TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> GetStateInternal(const FString& Filename);
 
@@ -186,7 +195,7 @@ public:
 	/** Helper function used to update changelists state cache */
 	TSharedRef<FGitSourceControlChangelistState, ESPMode::ThreadSafe> GetStateInternal(const FGitSourceControlChangelist& InChangelist);
 #endif
-	
+
 	/**
 	 * Register a worker with the provider.
 	 * This is used internally so the provider can maintain a map of all available operations.
@@ -220,7 +229,7 @@ public:
 	const FString& GetRemoteBranchName() const { return RemoteBranchName; }
 
 	TArray<FString> GetStatusBranchNames() const;
-	
+
 	/** Indicates editor binaries are to be updated upon next sync */
 	bool bPendingRestart;
 
@@ -229,14 +238,41 @@ public:
 #endif
 
 private:
+	/** Provider 正在关闭；关闭阶段拒绝再接收命令。 */
+	bool bClosing = false;
+
 	/** Is git binary found and working. */
 	bool bGitAvailable = false;
 
 	/** Is git repository found. */
 	bool bGitRepositoryFound = false;
 
+	/** 当前仓库是否已验证存在所需的 lockable 属性；所有设置刷新都必须保留此能力门。 */
+	bool bLockableAttributesAvailable = false;
+
+	/** 当前仓库的 lockable 能力探测是否已完成；重新探测期间 Provider 保守不可用。 */
+	bool bLockableAttributesCapabilityKnown = false;
+
 	/** Is LFS locking enabled? */
 	bool bUsingGitLfsLocking = false;
+
+	/** 持久锁开关及仓库能力是否能满足用户要求；无效时整个 Provider 失败关闭。 */
+	bool bLockingConfigurationValid = true;
+
+	/** 非法持久开关或仓库能力不足的可见错误。 */
+	FString LockingConfigurationError;
+
+	/** 最近应用到 Provider 的 Editor 锁设置代次。 */
+	uint64 LockSettingsGeneration = 0;
+
+	/** 周期刷新是否已有受管命令在途。 */
+	bool bBackgroundRefreshInFlight = false;
+
+	/** 旧配置或旧分支命令已失败关闭；下一 Tick 必须优先提交新鲜刷新。 */
+	bool bBackgroundRefreshRequested = false;
+
+	/** 下一次周期刷新使用的单调时钟秒数。 */
+	double NextBackgroundRefreshTimeSeconds = 0.0;
 
 	FString PathToGitBinary;
 
@@ -261,6 +297,29 @@ private:
 
 	/** Update repository status on Connect and UpdateStatus operations */
 	void UpdateRepositoryStatus(const class FGitSourceControlCommand& InCommand);
+
+	/** 到期时提交一个受 CommandQueue 管理的周期刷新；关闭阶段不会再提交。 */
+	void StartBackgroundRefreshIfDue();
+
+	/** 周期刷新完成回调；命令队列在 Close 返回前保证交付。 */
+	void OnBackgroundRefreshComplete(
+		const FSourceControlOperationRef& InOperation,
+		ECommandResult::Type InResult);
+
+	/**
+	 * 将 Editor 设置与仓库 lockable 能力合成为唯一有效锁模式；设置刷新不能绕过仓库能力。
+	 * Combine editor settings with the repository lockable capability into the sole effective
+	 * locking mode. A later settings refresh must never bypass repository capability.
+	 */
+	void ApplyEffectiveLockingSettings(
+		const FGitLockSettingsSnapshot& InSettings);
+
+	/**
+	 * 完成或轮询 Provider 自有的仓库初始化任务；仅在调用线程消费结果，Close 可等待后丢弃。
+	 * Completes or polls the provider-owned repository initialization task. Results are consumed only
+	 * on the calling thread, while Close can wait and discard them.
+	 */
+	void FinalizeRepositoryInitialization(bool bWaitForCompletion, bool bApplyResult);
 
 	/** Path to the root of the Unreal revision control repository: usually the ProjectDir */
 	FString PathToRepositoryRoot;
@@ -318,6 +377,11 @@ private:
 
 	/** Array of branch name patterns for status queries */
 	TArray<FString> StatusBranchNamePatternsInternal;
-		
-	class FGitSourceControlRunner* Runner = nullptr;
+
+	/**
+	 * Provider 自有、可等待的仓库初始化任务；任务不捕获 Provider，结果由 Tick 消费。
+	 * Provider-owned, waitable repository initialization task. It never captures the provider and
+	 * Tick consumes its result.
+	 */
+	TSharedPtr<FGitRepositoryInitializationTask, ESPMode::ThreadSafe> RepositoryInitializationTask;
 };

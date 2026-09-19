@@ -7,6 +7,7 @@
 
 #include "Modules/ModuleManager.h"
 #include "GitSourceControlModule.h"
+#include "GitSourceControlSettings.h"
 #include "GitSourceControlUtils.h"
 
 FGitSourceControlCommand::FGitSourceControlCommand(const TSharedRef<class ISourceControlOperation, ESPMode::ThreadSafe>& InOperation, const TSharedRef<class IGitSourceControlWorker, ESPMode::ThreadSafe>& InWorker, const FSourceControlOperationComplete& InOperationCompleteDelegate)
@@ -22,30 +23,60 @@ FGitSourceControlCommand::FGitSourceControlCommand(const TSharedRef<class ISourc
 	// cache the providers settings here
 	const FGitSourceControlModule& GitSourceControl = FGitSourceControlModule::Get();
 	const FGitSourceControlProvider& Provider = GitSourceControl.GetProvider();
+	const FGitLockSettingsSnapshot LockSettings =
+		GitSourceControl.AccessSettings().GetLockSettingsSnapshot();
 	PathToGitBinary = Provider.GetGitBinaryPath();
-	bUsingGitLfsLocking = Provider.UsesCheckout();
 	PathToRepositoryRoot = Provider.GetPathToRepositoryRoot();
 	PathToGitRoot = Provider.GetPathToGitRoot();
+	bUsingGitLfsLocking = Provider.UsesCheckout();
+	LfsUserName = LockSettings.LfsUserName;
+	bSettingsUsingGitLfsLocking =
+		LockSettings.bUsingGitLfsLocking;
+	LockSettingsGeneration = LockSettings.Generation;
+	if (bUsingGitLfsLocking)
+	{
+		// 任一 LFS 锁工作流都必须在命令创建时直接冻结 live branch；外部 UGit 切分支后
+		// 不能复用 Editor 启动时的 Provider 显示缓存。
+		// Every LFS lock workflow freezes the live branch when the command is created. An external
+		// UGit branch switch must not reuse the provider's editor-startup display cache.
+		GitSourceControlUtils::GetBranchName(
+			PathToGitBinary,
+			PathToGitRoot,
+			LockBranch);
+	}
+	else
+	{
+		LockBranch = Provider.GetBranchName();
+	}
 }
 
 void FGitSourceControlCommand::UpdateRepositoryRootIfSubmodule(TArray<FString>& AbsoluteFilePaths)
 {
 	const FString NewRepositoryRoot = GitSourceControlUtils::ChangeRepositoryRootIfSubmodule(AbsoluteFilePaths, PathToRepositoryRoot);
 
-	// When the selected files live in a submodule, every git/LFS operation for this command
-	// must run at the submodule's own root. PathToRepositoryRoot drives status/lock-listing,
-	// but the LFS lock/unlock commands (CheckOut/CheckIn/Revert) run against PathToGitRoot --
-	// if that stays the parent repo root, locks for submodule files land on the PARENT repo's
-	// lock server (wrong server: no protection for submodule collaborators, and it pollutes the
-	// parent's lock list). Keep PathToGitRoot in sync so submodule locking targets the submodule.
-	// Only override when a submodule was actually detected, so the "project nested in a larger
-	// git repo" case (where PathToGitRoot is a legitimate parent dir) is left untouched.
+	// 当所选文件位于子模块时，本命令的全部 Git/LFS 操作都必须改用子模块根。只有实际检测到
+	// 子模块才覆盖 PathToGitRoot，避免破坏“工程嵌套在更大主仓”这一合法情况。
+	// When selected files live in a submodule, every Git/LFS operation must use that submodule root.
+	// Override PathToGitRoot only for an actual submodule so a project nested in a larger repository
+	// keeps its legitimate parent Git root.
 	if (NewRepositoryRoot != PathToRepositoryRoot)
 	{
 		PathToGitRoot = NewRepositoryRoot;
 	}
 
 	PathToRepositoryRoot = NewRepositoryRoot;
+	if (bUsingGitLfsLocking)
+	{
+		// 构造函数先看到主 Provider 根；切换为子模块后必须重抓该仓的 live branch，后续
+		// commit/push 边界与显式 refspec 才不会拿主仓分支校验子模块。
+		// Construction initially sees the provider root. Refresh the repo-scoped live branch after a
+		// submodule switch so commit/push boundaries and explicit refspecs target the same repository.
+		LockBranch.Reset();
+		GitSourceControlUtils::GetBranchName(
+			PathToGitBinary,
+			PathToGitRoot,
+			LockBranch);
+	}
 }
 
 bool FGitSourceControlCommand::DoWork()

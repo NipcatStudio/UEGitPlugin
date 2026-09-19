@@ -17,6 +17,20 @@ class FGitSourceControlState;
 class FGitSourceControlCommand;
 
 /**
+ * UEGitPlugin 对本地文件只读位的显式收敛决策；它不表示远端锁所有权。
+ * Explicit convergence decision for a local file's read-only bit; it does not represent remote
+ * lock ownership.
+ */
+enum class EGitLocalReadOnlyPolicy : uint8
+{
+	Preserve,
+	ReadOnly,
+	Writable,
+	/** 枚举哨兵，仅用于完整遍历测试；不得作为运行时策略。 */
+	Count,
+};
+
+/**
  * Helper struct for maintaining temporary files for passing to commands
  */
 class FGitScopedTempFile
@@ -85,6 +99,16 @@ private:
 
 namespace GitSourceControlUtils
 {
+
+
+
+
+
+
+
+
+
+
 	/**
 		*  Returns an updated repo root if all selected files are in a plugin subfolder, and the plugin subfolder is a git repo
 		*  This supports the case where each plugin is a sub module
@@ -175,7 +199,7 @@ bool GetRemoteBranchName(const FString& InPathToGitBinary, const FString& InRepo
  * @returns false if no matching branches
  */
  bool GetRemoteBranchesWildcard(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& PatternMatch, TArray<FString>& OutBranchNames);
- 
+
 /**
  * Get Git current commit details
  * @param	InPathToGitBinary	The path to the Git binary
@@ -211,7 +235,15 @@ TArray<FString> GetSourceControlledAssetPaths();
  * @returns true if the command succeeded and returned no errors
  */
 GITSOURCECONTROL_API  bool RunCommand( const FString & InCommand, const FString & InPathToGitBinary, const FString & InRepositoryRoot, const TArray< FString > & InParameters, const TArray< FString > & InFiles, TArray< FString > & OutResults, TArray< FString > & OutErrorMessages );
+
+
 bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters, const TArray<FString>& InFiles, FString& OutResults, FString& OutErrors, const int32 ExpectedReturnCode = 0);
+
+
+
+
+
+
 
 /**
  * Unloads packages of specified named files
@@ -293,12 +325,13 @@ void UpdateFileStagingOnSaved(const FString& Filename, UPackage* Pkg, FObjectPos
 #endif
 
 /**
- * Keep Consistency of being file staged with simple argument
+ * 保存已位于 Staged changelist 的文件后，排队受管的重新暂存命令。
  *
- * @param	Filename			Saved filename
+ * @param	Filename			已保存文件的绝对路径。
+ * @returns 文件需要重新暂存且命令成功进入队列时返回 true；不等待 Git add 完成。
  */
 bool UpdateFileStagingOnSavedInternal(const FString& Filename);
-	
+
 /**
  * 
  *
@@ -318,7 +351,7 @@ void UpdateStateOnAssetRename(const FAssetData& InAssetData, const FString& InOl
  */
 bool UpdateChangelistStateByCommand();
 #endif
-	
+
 /**
  * Run a Git "cat-file" command to dump the binary content of a revision into a file.
  *
@@ -366,6 +399,10 @@ void RemoveRedundantErrors(FGitSourceControlCommand& InCommand, const FString& I
 
 	bool RunLFSCommand(const FString& InCommand, const FString& InRepositoryRoot, const FString& GitBinaryFallback, const TArray<FString>& InParameters, const TArray<FString>& InFiles, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages);
 
+
+
+
+
 /**
  * Helper function for various commands to update cached states.
  * @returns true if any states were updated
@@ -377,7 +414,7 @@ GITSOURCECONTROL_API bool UpdateCachedStates( const TMap< const FString, FGitSta
 * @returns true if any states were updated
 */
 GITSOURCECONTROL_API bool CollectNewStates( const TMap< FString, FGitSourceControlState > & InStates, TMap< const FString, FGitState > & OutResults );
-	
+
 /**
  * Helper function for various commands to collect new states.
  * @returns true if any states were updated
@@ -400,6 +437,10 @@ bool CollectNewStates(const TArray<FString>& InFiles, TMap<const FString, FGitSt
 	 * cycles - callers verifying "is this lock really gone" must use the raw listing instead.
 	 */
 	bool GetAllLocks(const FString& InRepositoryRoot, const FString& GitBinaryFallBack, TArray<FString>& OutErrorMessages, TMap<FString, FString>& OutLocks, bool bInvalidateCache = false, TOptional<TMap<FString, FString>>* OutRawServerLocks = nullptr);
+
+
+
+
 
 /**
  * Gets locks from state cache
