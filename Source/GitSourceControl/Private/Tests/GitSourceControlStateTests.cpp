@@ -493,6 +493,83 @@ bool FGitSourceControlLiteralPathScopeTest::RunTest(const FString& Parameters)
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FGitSourceControlAuthoritativeLfsJsonTest,
+	"GitSourceControl.State.AuthoritativeLfsJson",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitSourceControlAuthoritativeLfsJsonTest::RunTest(const FString& Parameters)
+{
+	const FString RepositoryRoot = FPaths::ConvertRelativePathToFull(
+		FPaths::ProjectSavedDir(),
+		TEXT("Automation/UEGitStrictLfsJson"));
+	TMap<FString, FString> Locks;
+	FString Error;
+	const FString ValidJson =
+		TEXT("[{\"id\":\"lock-1\",\"path\":\"Content/中文 资产.uasset\",\"owner\":{\"name\":\"artist\"},\"locked_at\":\"2026-08-06T00:00:00Z\"}]");
+	TestTrue(
+		TEXT("strict LFS JSON parser accepts a complete canonical listing"),
+		GitSourceControlUtils::ParseAuthoritativeLfsLockJson(
+			RepositoryRoot,
+			ValidJson,
+			Locks,
+			Error));
+	TestEqual(TEXT("strict LFS JSON listing returns exactly one lock"), Locks.Num(), 1);
+	const FString ExpectedPath = FPaths::ConvertRelativePathToFull(
+		RepositoryRoot,
+		TEXT("Content/中文 资产.uasset"));
+	const FString* ParsedOwner = Locks.Find(ExpectedPath);
+	TestNotNull(TEXT("strict LFS JSON listing preserves the literal asset path"), ParsedOwner);
+	if (ParsedOwner)
+	{
+		TestEqual(TEXT("strict LFS JSON listing preserves explicit owner"), *ParsedOwner, FString(TEXT("artist")));
+	}
+
+	auto ExpectRejected = [this, &RepositoryRoot](
+		const TCHAR* Label,
+		const FString& Json)
+	{
+		TMap<FString, FString> RejectedLocks;
+		FString Rejection;
+		TestFalse(
+			Label,
+			GitSourceControlUtils::ParseAuthoritativeLfsLockJson(
+				RepositoryRoot,
+				Json,
+				RejectedLocks,
+				Rejection));
+		TestTrue(
+			*FString::Printf(TEXT("%s returns no partial authorization"), Label),
+			RejectedLocks.IsEmpty());
+		TestTrue(
+			*FString::Printf(TEXT("%s remains diagnosable"), Label),
+			!Rejection.IsEmpty());
+	};
+	ExpectRejected(
+		TEXT("truncated LFS JSON listing is rejected"),
+		TEXT("[{\"id\":\"lock-1\""));
+	ExpectRejected(
+		TEXT("non-array LFS JSON listing is rejected"),
+		TEXT("{\"locks\":[]}"));
+	ExpectRejected(
+		TEXT("missing owner object is rejected"),
+		TEXT("[{\"id\":\"lock-1\",\"path\":\"Content/A.uasset\"}]"));
+	ExpectRejected(
+		TEXT("empty owner is rejected instead of inferred as current user"),
+		TEXT("[{\"id\":\"lock-1\",\"path\":\"Content/A.uasset\",\"owner\":{\"name\":\"\"}}]"));
+	ExpectRejected(
+		TEXT("unsafe repository-relative path is rejected"),
+		TEXT("[{\"id\":\"lock-1\",\"path\":\"../Outside.uasset\",\"owner\":{\"name\":\"artist\"}}]"));
+	ExpectRejected(
+		TEXT("duplicate lock path rejects the whole listing"),
+		TEXT("[{\"id\":\"lock-1\",\"path\":\"Content/A.uasset\",\"owner\":{\"name\":\"artist\"}},{\"id\":\"lock-2\",\"path\":\"Content/A.uasset\",\"owner\":{\"name\":\"other\"}}]"));
+	ExpectRejected(
+		TEXT("duplicate lock id rejects the whole listing"),
+		TEXT("[{\"id\":\"lock-1\",\"path\":\"Content/A.uasset\",\"owner\":{\"name\":\"artist\"}},{\"id\":\"lock-1\",\"path\":\"Content/B.uasset\",\"owner\":{\"name\":\"artist\"}}]"));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FGitSourceControlModifiedPresentationTest,
 	"GitSourceControl.State.ModifiedPresentation",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -564,6 +641,304 @@ bool FGitSourceControlModifiedPresentationTest::RunTest(const FString& Parameter
 		TEXT("UE Checked Out Filter 对 no-checkout provider 保留 Unlockable 兼容例外"),
 		State.IsCheckedOut() || State.IsAdded());
 	TestTrue(TEXT("非锁模式的已跟踪文件仍应允许编辑"), State.CanEdit());
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FGitSourceControlMutationBatchBoundaryTest,
+	"GitSourceControl.State.MutationBatchBoundary",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitSourceControlMutationBatchBoundaryTest::RunTest(const FString& Parameters)
+{
+	const FString GitBinary = GetAutomationTestGitBinary();
+	TestTrue(TEXT("写边界集成测试需要可用 Git"), !GitBinary.IsEmpty());
+	if (GitBinary.IsEmpty())
+	{
+		return false;
+	}
+
+	IPlatformFile& PlatformFile =
+		FPlatformFileManager::Get().GetPlatformFile();
+	const FString TempRoot = FPaths::ConvertRelativePathToFull(
+		FPaths::Combine(
+			FPaths::ProjectSavedDir(),
+			TEXT("Automation"),
+			FString::Printf(
+				TEXT("UEGitMutationBoundary-%s"),
+				*FGuid::NewGuid().ToString(EGuidFormats::Digits))));
+	TestTrue(
+		TEXT("应创建写边界集成测试目录"),
+		PlatformFile.CreateDirectoryTree(*TempRoot));
+	ON_SCOPE_EXIT
+	{
+		if (PlatformFile.DirectoryExists(*TempRoot))
+		{
+			PlatformFile.DeleteDirectoryRecursively(*TempRoot);
+		}
+	};
+	if (!PlatformFile.DirectoryExists(*TempRoot))
+	{
+		return false;
+	}
+
+	auto InitializeRepository = [
+		this,
+		&GitBinary
+	](const FString& InRepositoryRoot)
+	{
+		TArray<FString> Results;
+		TArray<FString> Errors;
+		if (!GitSourceControlUtils::RunCommand(
+				TEXT("init"),
+				GitBinary,
+				InRepositoryRoot,
+				FGitSourceControlModule::GetEmptyStringArray(),
+				FGitSourceControlModule::GetEmptyStringArray(),
+				Results,
+				Errors))
+		{
+			AddError(TEXT("无法初始化写边界测试仓库：") + FString::Join(Errors, TEXT(" | ")));
+			return false;
+		}
+		Results.Reset();
+		Errors.Reset();
+		if (!GitSourceControlUtils::RunCommand(
+				TEXT("config"),
+				GitBinary,
+				InRepositoryRoot,
+				{TEXT("user.name"), TEXT("UEGitBoundaryAutomation")},
+				FGitSourceControlModule::GetEmptyStringArray(),
+				Results,
+				Errors))
+		{
+			AddError(TEXT("无法设置写边界测试提交用户：") + FString::Join(Errors, TEXT(" | ")));
+			return false;
+		}
+		Results.Reset();
+		Errors.Reset();
+		if (!GitSourceControlUtils::RunCommand(
+				TEXT("config"),
+				GitBinary,
+				InRepositoryRoot,
+				{TEXT("user.email"), TEXT("uegit-boundary@example.invalid")},
+				FGitSourceControlModule::GetEmptyStringArray(),
+				Results,
+				Errors))
+		{
+			AddError(TEXT("无法设置写边界测试提交邮箱：") + FString::Join(Errors, TEXT(" | ")));
+			return false;
+		}
+		return true;
+	};
+
+	// 51 个文件强制进入 50 + 1 两批。第二次边界拒绝后，最后一批不能启动。
+	// Fifty-one files force a 50 + 1 split. Rejecting the second boundary must prevent the final
+	// batch from starting.
+	const FString BatchRepository = FPaths::Combine(TempRoot, TEXT("Batch"));
+	TestTrue(
+		TEXT("应创建批处理测试仓库"),
+		PlatformFile.CreateDirectoryTree(*BatchRepository));
+	if (!InitializeRepository(BatchRepository))
+	{
+		return false;
+	}
+	TArray<FString> BatchFiles;
+	for (int32 FileIndex = 0; FileIndex < 51; ++FileIndex)
+	{
+		const FString RelativeFile = FString::Printf(
+			TEXT("Content/Batch/Item_%02d.txt"),
+			FileIndex);
+		const FString AbsoluteFile = FPaths::Combine(
+			BatchRepository,
+			RelativeFile);
+		TestTrue(
+			TEXT("应创建批处理测试文件目录"),
+			PlatformFile.CreateDirectoryTree(*FPaths::GetPath(AbsoluteFile)));
+		TestTrue(
+			TEXT("应创建批处理测试文件"),
+			FFileHelper::SaveStringToFile(
+				FString::FromInt(FileIndex),
+				*AbsoluteFile));
+		BatchFiles.Add(RelativeFile);
+	}
+
+	TArray<FString> Results;
+	TArray<FString> Errors;
+	int32 BatchBoundaryChecks = 0;
+	const bool bBatchMutationSucceeded =
+		GitSourceControlUtils::RunCommandWithPreWriteBoundary(
+			TEXT("add"),
+			GitBinary,
+			BatchRepository,
+			FGitSourceControlModule::GetEmptyStringArray(),
+			BatchFiles,
+			[&BatchBoundaryChecks]()
+			{
+				++BatchBoundaryChecks;
+				return BatchBoundaryChecks == 1;
+			},
+			Results,
+			Errors);
+	TestFalse(TEXT("第二批写边界拒绝后 add 应返回失败"), bBatchMutationSucceeded);
+	TestEqual(TEXT("每一批前都应重新调用写边界"), BatchBoundaryChecks, 2);
+
+	Results.Reset();
+	Errors.Reset();
+	TestTrue(
+		TEXT("应查询边界拒绝后的 index"),
+		GitSourceControlUtils::RunCommandWithLiteralPaths(
+			TEXT("diff"),
+			GitBinary,
+			BatchRepository,
+			{TEXT("--cached"), TEXT("--name-only"), TEXT("--")},
+			FGitSourceControlModule::GetEmptyStringArray(),
+			Results,
+			Errors));
+	TestEqual(TEXT("只有第一批 50 个文件可进入 index"), Results.Num(), 50);
+	for (int32 FileIndex = 0; FileIndex < 50; ++FileIndex)
+	{
+		TestTrue(
+			TEXT("第一批文件应已暂存"),
+			Results.Contains(BatchFiles[FileIndex]));
+	}
+	TestFalse(
+		TEXT("被拒绝的第二批文件不得进入 index"),
+		Results.Contains(BatchFiles.Last()));
+
+	// 年轻 index.lock 会让同一批内部重启 Git；第二次尝试也必须重新通过边界。
+	// A young index.lock makes the same batch restart Git internally. The second attempt must pass
+	// the boundary again as well.
+	const FString RetryRepository = FPaths::Combine(TempRoot, TEXT("Retry"));
+	TestTrue(
+		TEXT("应创建 index.lock 重试测试仓库"),
+		PlatformFile.CreateDirectoryTree(*RetryRepository));
+	if (!InitializeRepository(RetryRepository))
+	{
+		return false;
+	}
+	const FString RetryRelativeFile = TEXT("Content/Retry.txt");
+	const FString RetryAbsoluteFile = FPaths::Combine(
+		RetryRepository,
+		RetryRelativeFile);
+	TestTrue(
+		TEXT("应创建 index.lock 重试文件目录"),
+		PlatformFile.CreateDirectoryTree(*FPaths::GetPath(RetryAbsoluteFile)));
+	TestTrue(
+		TEXT("应创建 index.lock 重试文件"),
+		FFileHelper::SaveStringToFile(TEXT("retry"), *RetryAbsoluteFile));
+	const FString YoungIndexLock = FPaths::Combine(
+		RetryRepository,
+		TEXT(".git/index.lock"));
+	TestTrue(
+		TEXT("应创建年轻 index.lock 竞争夹具"),
+		FFileHelper::SaveStringToFile(TEXT("live contention"), *YoungIndexLock));
+
+	Results.Reset();
+	Errors.Reset();
+	int32 RetryBoundaryChecks = 0;
+	const bool bRetryMutationSucceeded =
+		GitSourceControlUtils::RunCommandWithPreWriteBoundary(
+			TEXT("add"),
+			GitBinary,
+			RetryRepository,
+			FGitSourceControlModule::GetEmptyStringArray(),
+			{RetryRelativeFile},
+			[&RetryBoundaryChecks]()
+			{
+				++RetryBoundaryChecks;
+				return RetryBoundaryChecks == 1;
+			},
+			Results,
+			Errors);
+	TestFalse(
+		TEXT("index.lock 后的第二次写边界拒绝应停止重试"),
+		bRetryMutationSucceeded);
+	TestEqual(
+		TEXT("同一批的 index.lock 重试也应再次调用写边界"),
+		RetryBoundaryChecks,
+		2);
+	TestFalse(
+		TEXT("被拒绝的 index.lock 重试不得创建 Git index"),
+		PlatformFile.FileExists(
+			*FPaths::Combine(RetryRepository, TEXT(".git/index"))));
+
+	// Commit helper 自己含有 add 与 commit 两个写子进程；第二次拒绝必须留下 staged 文件且无 HEAD。
+	// RunCommit owns an add and a commit subprocess. Rejecting the second boundary must leave the
+	// file staged without creating HEAD.
+	const FString CommitRepository = FPaths::Combine(TempRoot, TEXT("Commit"));
+	TestTrue(
+		TEXT("应创建 commit 写边界测试仓库"),
+		PlatformFile.CreateDirectoryTree(*CommitRepository));
+	if (!InitializeRepository(CommitRepository))
+	{
+		return false;
+	}
+	const FString CommitRelativeFile = TEXT("Content/Commit.txt");
+	const FString CommitAbsoluteFile = FPaths::Combine(
+		CommitRepository,
+		CommitRelativeFile);
+	TestTrue(
+		TEXT("应创建 commit 测试文件目录"),
+		PlatformFile.CreateDirectoryTree(*FPaths::GetPath(CommitAbsoluteFile)));
+	TestTrue(
+		TEXT("应创建 commit 测试文件"),
+		FFileHelper::SaveStringToFile(TEXT("boundary"), *CommitAbsoluteFile));
+
+	Results.Reset();
+	Errors.Reset();
+	int32 CommitBoundaryChecks = 0;
+	const bool bCommitSucceeded = GitSourceControlUtils::RunCommit(
+		GitBinary,
+		CommitRepository,
+		{TEXT("-m"), TEXT("must-not-commit")},
+		{CommitRelativeFile},
+		[&CommitBoundaryChecks]()
+		{
+			++CommitBoundaryChecks;
+			return CommitBoundaryChecks == 1;
+		},
+		Results,
+		Errors);
+	TestFalse(TEXT("commit 子进程边界拒绝后 RunCommit 应失败"), bCommitSucceeded);
+	TestEqual(TEXT("RunCommit 应在 add 与 commit 前分别复核"), CommitBoundaryChecks, 2);
+
+	Results.Reset();
+	Errors.Reset();
+	TestTrue(
+		TEXT("应查询 commit 拒绝后的 index"),
+		GitSourceControlUtils::RunCommandWithLiteralPaths(
+			TEXT("diff"),
+			GitBinary,
+			CommitRepository,
+			{TEXT("--cached"), TEXT("--name-only"), TEXT("--")},
+			FGitSourceControlModule::GetEmptyStringArray(),
+			Results,
+			Errors));
+	TestEqual(TEXT("commit 被拒绝前 add 已执行一次"), Results.Num(), 1);
+	if (Results.Num() == 1)
+	{
+		TestEqual(TEXT("暂存文件应是 commit fixture"), Results[0], CommitRelativeFile);
+	}
+
+	FString HeadContents;
+	TestTrue(
+		TEXT("应读取未提交仓库 HEAD symbolic ref"),
+		FFileHelper::LoadFileToString(
+			HeadContents,
+			*FPaths::Combine(CommitRepository, TEXT(".git/HEAD"))));
+	HeadContents.TrimStartAndEndInline();
+	const FString HeadPrefix = TEXT("ref: ");
+	TestTrue(TEXT("新仓库 HEAD 应为 symbolic ref"), HeadContents.StartsWith(HeadPrefix));
+	if (HeadContents.StartsWith(HeadPrefix))
+	{
+		const FString HeadRef = HeadContents.RightChop(HeadPrefix.Len());
+		TestFalse(
+			TEXT("commit 边界拒绝后不得创建分支 HEAD"),
+			PlatformFile.FileExists(
+				*FPaths::Combine(CommitRepository, TEXT(".git"), HeadRef)));
+	}
 
 	return true;
 }

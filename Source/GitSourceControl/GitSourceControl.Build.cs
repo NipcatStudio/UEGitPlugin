@@ -18,6 +18,7 @@ public class GitSourceControl : ModuleRules
 				"InputCore",
 				"DesktopWidgets",
 				"EditorStyle",
+				"Json",
 				"UnrealEd",
 				"SourceControl",
 				"SourceControlWindows",

@@ -338,16 +338,27 @@ void ReloadPackages(TArray<UPackage*>& InPackagesToReload);
 bool ListFilesInDirectoryRecurse(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InDirectory, TArray<FString>& OutFiles);
 
 /**
- * Run a Git "commit" command by batches.
+ * 按批次执行组成一次提交的 add、commit 与 amend。每个真实写子进程以及 index.lock 恢复重试
+ * 启动前都会调用 InPreWriteBoundary；返回 false 时停止尚未启动的后续尝试并返回失败。
+ * 已完成的暂存、提交或修订不会自动回滚，调用方必须把该返回值视为显式失败并重新核对仓库状态。
  *
- * @param	InPathToGitBinary	The path to the Git binary
- * @param	InRepositoryRoot	The Git repository from where to run the command - usually the Game directory
- * @param	InParameter			The parameters to the Git commit command
- * @param	InFiles				The files to be operated on
- * @param	OutErrorMessages	Any errors (from StdErr) as an array per-line
- * @returns true if the command succeeded and returned no errors
+ * @param	InPathToGitBinary	Git 可执行文件路径。
+ * @param	InRepositoryRoot	执行提交的 Git 仓库根目录。
+ * @param	InParameters		传给 commit/amend 的参数。
+ * @param	InFiles				需要纳入提交的文件；超过批次上限时会拆分执行。
+ * @param	InPreWriteBoundary	每次实际写尝试前调用的有效性门；false 表示停止后续尝试且不回滚前序写入。
+ * @param	OutResults			各子进程的标准输出行。
+ * @param	OutErrorMessages	各子进程的标准错误行，以及边界拒绝产生的失败信息。
+ * @returns 所有写步骤均成功时返回 true；边界拒绝或任一 Git 步骤失败时返回 false。
  */
-bool RunCommit(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters, const TArray<FString>& InFiles, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages);
+bool RunCommit(
+	const FString& InPathToGitBinary,
+	const FString& InRepositoryRoot,
+	const TArray<FString>& InParameters,
+	const TArray<FString>& InFiles,
+	TFunctionRef<bool()> InPreWriteBoundary,
+	TArray<FString>& OutResults,
+	TArray<FString>& OutErrorMessages);
 
 /**
  * @brief Detects how to parse the result of a "status" command to get workspace file states
@@ -545,9 +556,22 @@ bool CollectNewStates(const TArray<FString>& InFiles, TMap<const FString, FGitSt
 	 */
 	bool GetAllLocks(const FString& InRepositoryRoot, const FString& GitBinaryFallBack, TArray<FString>& OutErrorMessages, TMap<FString, FString>& OutLocks, bool bInvalidateCache = false, TOptional<TMap<FString, FString>>* OutRawServerLocks = nullptr);
 
+	/**
+	 * 严格解析 `git lfs locks --json` 的完整数组；任一坏对象、空字段、不安全/重复路径或重复 ID
+	 * 都使整份列表失败且不返回部分结果。
+	 */
+	bool ParseAuthoritativeLfsLockJson(
+		const FString& InRepositoryRoot,
+		const FString& InJson,
+		TMap<FString, FString>& OutLocks,
+		FString& OutError);
 
-
-
+	/** 直接查询并严格解析新鲜 LFS JSON 锁列表；不允许 cache/offline fallback。 */
+	bool GetAuthoritativeLfsLocks(
+		const FString& InRepositoryRoot,
+		const FString& InGitBinaryFallback,
+		TMap<FString, FString>& OutLocks,
+		TArray<FString>& OutErrorMessages);
 
 /**
  * Gets locks from state cache
@@ -564,10 +588,51 @@ bool IsFileLFSLockable(const FString& InFile);
  */
 bool CheckLFSLockable(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InFiles, TArray<FString>& OutErrorMessages);
 
-GITSOURCECONTROL_API bool FetchRemote( const FString & InPathToGitBinary, const FString & InPathToRepositoryRoot, bool InUsingGitLfsLocking, TArray< FString > & OutResults, TArray< FString > & OutErrorMessages );
+/**
+ * 刷新远端引用；启用旧式 LFS 锁缓存时会先刷新锁列表，再在实际 fetch 紧前调用
+ * InPreFetchBoundary。边界返回 false 时不会执行 fetch、不会改写远端引用缓存；已经完成的
+ * 前序锁缓存刷新不会回滚。
+ *
+ * @param	InPathToGitBinary	Git 可执行文件路径。
+ * @param	InPathToRepositoryRoot	需要刷新的 Git 仓库根目录。
+ * @param	InUsingGitLfsLocking	命令创建时是否启用 Git LFS 锁。
+ * @param	InPreFetchBoundary	实际 fetch 子进程启动前调用的有效性门；false 表示跳过 fetch。
+ * @param	OutResults			fetch 的标准输出行。
+ * @param	OutErrorMessages	锁刷新或 fetch 的错误行，以及边界拒绝产生的失败信息。
+ * @returns fetch 成功时返回 true；边界拒绝或 Git 失败时返回 false。
+ */
+GITSOURCECONTROL_API bool FetchRemote(
+	const FString& InPathToGitBinary,
+	const FString& InPathToRepositoryRoot,
+	bool InUsingGitLfsLocking,
+	TFunctionRef<bool()> InPreFetchBoundary,
+	TArray<FString>& OutResults,
+	TArray<FString>& OutErrorMessages);
 
-bool PullOrigin(const FString& InPathToGitBinary, const FString& InPathToRepositoryRoot, const TArray<FString>& InFiles, TArray<FString>& OutFiles,
-				TArray<FString>& OutResults, TArray<FString>& OutErrorMessages);
+/**
+ * 拉取当前 upstream，或在 InExplicitOriginBranch 非空时显式拉取同名 origin 分支。
+ * 完成差异预检并临时卸载受影响包后，在实际 pull 紧前调用 InPrePullBoundary。边界返回
+ * false 时跳过 pull，并重新加载已经卸载的包；前序预检结果和输出数组不会自动回滚。
+ *
+ * @param	InPathToGitBinary	Git 可执行文件路径。
+ * @param	InPathToRepositoryRoot	需要拉取的 Git 仓库根目录。
+ * @param	InFiles				调用方已经处理、无需再次报告的绝对文件路径。
+ * @param	OutFiles			本次 pull 可能影响且需要调用方处理的绝对文件路径。
+ * @param	OutResults			pull 的标准输出行。
+ * @param	OutErrorMessages	差异预检或 pull 的错误行，以及边界拒绝产生的失败信息。
+ * @param	InPrePullBoundary	实际 pull 子进程启动前调用的有效性门；false 表示跳过 pull 且不改写仓库。
+ * @param	InExplicitOriginBranch	非空时，差异基线与实际 pull 都固定到 origin 的该分支；默认空字符串沿用当前 upstream。
+ * @returns 无差异或 pull 成功时返回 true；边界拒绝、预检失败或 pull 失败时返回 false。
+ */
+bool PullOrigin(
+	const FString& InPathToGitBinary,
+	const FString& InPathToRepositoryRoot,
+	const TArray<FString>& InFiles,
+	TArray<FString>& OutFiles,
+	TArray<FString>& OutResults,
+	TArray<FString>& OutErrorMessages,
+	TFunctionRef<bool()> InPrePullBoundary,
+	const FString& InExplicitOriginBranch = FString());
 
 
 GITSOURCECONTROL_API TSharedPtr< class ISourceControlRevision, ESPMode::ThreadSafe > GetOriginRevisionOnBranch( const FString & InPathToGitBinary, const FString & InRepositoryRoot, const FString & InRelativeFileName, TArray< FString > & OutErrorMessages, const FString & BranchName );

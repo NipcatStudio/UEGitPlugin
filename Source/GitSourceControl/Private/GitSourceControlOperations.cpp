@@ -106,12 +106,78 @@ static bool EnsureLockCommandWriteBoundary(
 	return true;
 }
 
+static bool EnsureCommandLockWriteBoundary(
+	const FGitSourceControlCommand& InCommand,
+	const FString& InAction,
+	TArray<FString>& OutErrorMessages)
+{
+	return EnsureLockCommandWriteBoundary(InCommand, InAction, OutErrorMessages);
+}
 
 
+/**
+ * 所有会改动 Git 索引、工作区或引用的 worker 都从此处紧邻写入复核命令快照。
+ * Every worker mutation of the Git index, working tree, or refs revalidates the command snapshot
+ * here immediately before the write.
+ */
+static bool RunMutationAfterCommandLockBoundary(
+	FGitSourceControlCommand& InCommand,
+	const FString& InAction,
+	TFunctionRef<bool()> InMutation,
+	bool* bOutBoundaryPassed = nullptr)
+{
+	const bool bBoundaryPassed = EnsureCommandLockWriteBoundary(
+		InCommand,
+		InAction,
+		InCommand.ResultInfo.ErrorMessages);
+	if (bOutBoundaryPassed != nullptr)
+	{
+		*bOutBoundaryPassed = bBoundaryPassed;
+	}
+	return bBoundaryPassed && InMutation();
+}
 
-
-
-
+/**
+ * Git 通用写命令的唯一生产入口；参数与文件列表仍由 owning worker 明确提供。
+ * Single production entry for generic mutating Git commands; the owning worker still supplies the
+ * exact parameters and file set.
+ */
+static bool RunGitCommandMutationAfterLockBoundary(
+	FGitSourceControlCommand& InCommand,
+	const FString& InAction,
+	const FString& InSubCommand,
+	const TArray<FString>& InParameters,
+	const TArray<FString>& InFiles,
+	TArray<FString>& OutResults,
+	TArray<FString>& OutErrorMessages,
+	bool* bOutBoundaryPassed = nullptr)
+{
+	bool bBoundaryAttempted = false;
+	bool bEveryBoundaryPassed = true;
+	const bool bResult = GitSourceControlUtils::RunCommandWithPreWriteBoundary(
+		InSubCommand,
+		InCommand.PathToGitBinary,
+		InCommand.PathToRepositoryRoot,
+		InParameters,
+		InFiles,
+		[&]()
+		{
+			bBoundaryAttempted = true;
+			const bool bBoundaryPassed = EnsureCommandLockWriteBoundary(
+				InCommand,
+				InAction,
+				InCommand.ResultInfo.ErrorMessages);
+			bEveryBoundaryPassed &= bBoundaryPassed;
+			return bBoundaryPassed;
+		},
+		OutResults,
+		OutErrorMessages);
+	if (bOutBoundaryPassed != nullptr)
+	{
+		*bOutBoundaryPassed = bBoundaryAttempted && bEveryBoundaryPassed;
+	}
+	return bResult;
+}
 
 bool GitSourceControlOperations::RunAfterLockWriteBoundary(
 	TFunctionRef<bool()> InBoundaryCheck,
@@ -140,7 +206,15 @@ bool GitSourceControlOperations::RunFreshStateCommitBeforeLockTransitions(
 
 
 
-
+bool GitSourceControlOperations::IsStateEligibleForCheckInBoundary(
+	const FGitSourceControlState& InState)
+{
+	if (!InState.CanCheckIn())
+	{
+		return false;
+	}
+	return true;
+}
 
 
 
@@ -154,9 +228,68 @@ ELockState::Type GitSourceControlOperations::GetIndexMutationFallbackLockState(
 			: ELockState::Unlockable;
 }
 
+void GitSourceControlOperations::BuildPostPullPushValidationScope(
+	bool bRefreshSucceeded,
+	const TArray<FString>& InPrePullFiles,
+	const TArray<FString>& InRefreshedFiles,
+	TArray<FString>& OutValidationFiles)
+{
+	// 参数保留 pull 前范围是为了让调用契约显式可测：成功后绝不能意外复用它。
+	// Keeping the pre-pull scope in the signature makes the invariant testable: it must never be
+	// reused after a successful refresh.
+	(void)InPrePullFiles;
+	OutValidationFiles = bRefreshSucceeded
+		? InRefreshedFiles
+		: TArray<FString>();
+}
 
+bool GitSourceControlOperations::BuildLfsPushRefs(
+	const FString& InLocalBranch,
+	const FString& InUpstreamBranch,
+	FString& OutLocalBranchRef,
+	FString& OutRemoteTrackingRef,
+	FString& OutPushRefSpec,
+	bool& OutHasRemoteBaseline)
+{
+	OutLocalBranchRef.Reset();
+	OutRemoteTrackingRef.Reset();
+	OutPushRefSpec.Reset();
+	OutHasRemoteBaseline = false;
 
+	if (InLocalBranch.IsEmpty()
+		|| InLocalBranch.StartsWith(TEXT("HEAD detached at ")))
+	{
+		return false;
+	}
 
+	FString OriginBranch = InLocalBranch;
+	if (!InUpstreamBranch.IsEmpty())
+	{
+		const FString OriginPrefix(TEXT("origin/"));
+		if (!InUpstreamBranch.StartsWith(OriginPrefix))
+		{
+			return false;
+		}
+		OriginBranch = InUpstreamBranch.RightChop(OriginPrefix.Len());
+		if (OriginBranch.IsEmpty())
+		{
+			return false;
+		}
+		OutHasRemoteBaseline = true;
+	}
+
+	OutLocalBranchRef = FString::Printf(
+		TEXT("refs/heads/%s"),
+		*InLocalBranch);
+	OutRemoteTrackingRef = FString::Printf(
+		TEXT("refs/remotes/origin/%s"),
+		*OriginBranch);
+	OutPushRefSpec = FString::Printf(
+		TEXT("%s:refs/heads/%s"),
+		*OutLocalBranchRef,
+		*OriginBranch);
+	return true;
+}
 
 bool GitSourceControlOperations::RunLiteralPathListCommand(
 	const FString& InSubCommand,
@@ -176,7 +309,77 @@ bool GitSourceControlOperations::RunLiteralPathListCommand(
 		OutErrorMessages);
 }
 
+/**
+ * 将 LFS 锁工作流的比较基线、本地来源和实际 push 目的统一绑定到命令分支。
+ * Binds the LFS lock workflow's comparison baseline, local source, and actual push destination to
+ * the command branch as one coherent target.
+ */
+static bool ResolveLockedPushRefs(
+	const FGitSourceControlCommand& InCommand,
+	FString& OutLocalBranchRef,
+	FString& OutRemoteTrackingRef,
+	FString& OutPushRefSpec,
+	bool& OutHasRemoteBaseline,
+	TArray<FString>& OutErrorMessages)
+{
+	if (!EnsureCommandLockWriteBoundary(
+		InCommand,
+		TEXT("LFS 锁工作流 push 目标解析"),
+		OutErrorMessages))
+	{
+		return false;
+	}
 
+	FString UpstreamBranch;
+	GitSourceControlUtils::GetRemoteBranchName(
+		InCommand.PathToGitBinary,
+		InCommand.PathToRepositoryRoot,
+		UpstreamBranch);
+	if (!GitSourceControlOperations::BuildLfsPushRefs(
+			InCommand.LockBranch,
+			UpstreamBranch,
+			OutLocalBranchRef,
+			OutRemoteTrackingRef,
+			OutPushRefSpec,
+			OutHasRemoteBaseline))
+	{
+		OutErrorMessages.Add(FString::Printf(
+			TEXT(
+				"LFS 锁工作流不支持本地分支“%s”的 upstream“%s”；只支持 origin。"),
+			*InCommand.LockBranch,
+			*UpstreamBranch));
+		return false;
+	}
+
+	if (!OutHasRemoteBaseline)
+	{
+		return true;
+	}
+
+	TArray<FString> VerificationResults;
+	const TArray<FString> VerificationParameters{
+		TEXT("--verify"),
+		TEXT("--quiet"),
+		FString::Printf(
+			TEXT("%s^{commit}"),
+			*OutRemoteTrackingRef)};
+	if (!GitSourceControlUtils::RunCommand(
+		TEXT("rev-parse"),
+		InCommand.PathToGitBinary,
+		InCommand.PathToRepositoryRoot,
+		VerificationParameters,
+		FGitSourceControlModule::GetEmptyStringArray(),
+		VerificationResults,
+		OutErrorMessages))
+	{
+		OutErrorMessages.Add(FString::Printf(
+			TEXT(
+				"LFS 锁工作流无法读取 upstream 基线“%s”；请先 fetch 并确认远端分支存在。"),
+			*OutRemoteTrackingRef));
+		return false;
+	}
+	return true;
+}
 
 /**
  * 用命令的同代锁快照运行状态计算，并把过期结果请求传回 Provider。
@@ -201,15 +404,186 @@ static bool RunUpdateStatusForCommand(
 		InCommand.bStatusSettingsSuperseded);
 }
 
+static const FGitSourceControlState* FindStateByPath(
+	const TMap<FString, FGitSourceControlState>& InStates,
+	const FString& InFile)
+{
+	if (const FGitSourceControlState* ExactState = InStates.Find(InFile))
+	{
+		return ExactState;
+	}
+	for (const auto& State : InStates)
+	{
+		if (FPaths::IsSamePath(State.Key, InFile))
+		{
+			return &State.Value;
+		}
+	}
+	return nullptr;
+}
+
+/**
+ * index 已成功变化后立即读取真实 Git/锁状态；只有本地 status 本身失败才投影保守 fallback。
+ * Refreshes actual Git/lock state immediately after a successful index mutation. A conservative
+ * fallback is projected only when local status itself fails.
+ */
+static void CollectStatesAfterIndexMutation(
+	FGitSourceControlCommand& InCommand,
+	const TArray<FString>& InFiles,
+	EFileState::Type InFallbackFileState,
+	TMap<const FString, FGitState>& OutStates)
+{
+	TMap<FString, FGitSourceControlState> UpdatedStates;
+	if (RunUpdateStatusForCommand(
+			InCommand,
+			InFiles,
+			InCommand.ResultInfo.ErrorMessages,
+			UpdatedStates))
+	{
+		GitSourceControlUtils::CollectNewStates(UpdatedStates, OutStates);
+		return;
+	}
+
+	const FString Warning = TEXT(
+		"Git index 已更新，但无法刷新文件状态；lockable LFS 文件保持失败关闭，下一次 Refresh 将重试。");
+	UE_LOG(LogSourceControl, Warning, TEXT("%s"), *Warning);
+	FTSMessageLog SourceControlLog("SourceControl");
+	SourceControlLog.Warning(FText::FromString(Warning));
+	for (const FString& File : InFiles)
+	{
+		const ELockState::Type FallbackLockState =
+			GitSourceControlOperations::GetIndexMutationFallbackLockState(
+				InCommand.bUsingGitLfsLocking,
+				File);
+		GitSourceControlUtils::CollectNewStates(
+			TArray<FString>{File},
+			OutStates,
+			InFallbackFileState,
+			ETreeState::Staged,
+			FallbackLockState);
+		if (FallbackLockState == ELockState::LockedOther)
+		{
+			OutStates.FindChecked(File).LockUser = TEXT("状态刷新失败");
+			if (FPaths::FileExists(File))
+			{
+				GitSourceControlUtils::ApplyLocalReadOnlyPolicy(
+					File,
+					EGitLocalReadOnlyPolicy::ReadOnly);
+			}
+		}
+	}
+}
+
+/**
+ * CheckIn 必须重新读取本地 Git 状态，再进入所属操作的能力门，不能仅凭旧 UI 缓存提交。
+ * Refresh local Git state before the operation-owned CheckIn gate instead of trusting the old UI cache.
+ */
+static bool ValidateStatesBeforeCheckIn(FGitSourceControlCommand& InCommand)
+{
+	TMap<FString, FGitSourceControlState> UpdatedStates;
+	if (!RunUpdateStatusForCommand(
+			InCommand,
+			InCommand.Files,
+			InCommand.ResultInfo.ErrorMessages,
+			UpdatedStates))
+	{
+		InCommand.ResultInfo.ErrorMessages.Add(
+			TEXT("提交被阻止：无法刷新所选文件的本地 Git 状态。"));
+		return false;
+	}
+
+	for (const FString& File : InCommand.Files)
+	{
+		const FGitSourceControlState* State = FindStateByPath(UpdatedStates, File);
+		if (!State)
+		{
+			InCommand.ResultInfo.ErrorMessages.Add(FString::Printf(
+				TEXT("提交被阻止：状态刷新没有返回文件：%s"),
+				*File));
+			return false;
+		}
+	}
+
+	for (const FString& File : InCommand.Files)
+	{
+		const FGitSourceControlState* RefreshedState = FindStateByPath(UpdatedStates, File);
+		check(RefreshedState != nullptr);
+		FGitSourceControlState BoundaryState = *RefreshedState;
+
+		if (!GitSourceControlOperations::IsStateEligibleForCheckInBoundary(
+				BoundaryState))
+		{
+			InCommand.ResultInfo.ErrorMessages.Add(FString::Printf(
+				TEXT("提交被阻止：文件状态不允许 Check In（file=%d tree=%d lock=%d）：%s"),
+				static_cast<int32>(BoundaryState.State.FileState),
+				static_cast<int32>(BoundaryState.State.TreeState),
+				static_cast<int32>(BoundaryState.State.LockState),
+				*File));
+			return false;
+		}
+	}
+	return true;
+}
 
 
 
+/**
+ * 单端 LFS 允许断网 local commit，但 push 前必须用 raw 新鲜列表拒绝其他用户的锁。
+ * Single-endpoint LFS permits an offline local commit, but push must use a fresh raw listing to
+ * reject locks owned by another user.
+ */
+static bool ValidateLegacyLfsLocksBeforePush(
+	FGitSourceControlCommand& InCommand,
+	const TArray<FString>& InFiles)
+{
+	if (!InCommand.bUsingGitLfsLocking)
+	{
+		return true;
+	}
+	TArray<FString> LockableFiles = InFiles.FilterByPredicate(
+		GitSourceControlUtils::IsFileLFSLockable);
+	if (LockableFiles.IsEmpty())
+	{
+		return true;
+	}
 
+	TMap<FString, FString> RawLocks;
+	if (!GitSourceControlUtils::GetAuthoritativeLfsLocks(
+			InCommand.PathToGitRoot,
+			InCommand.PathToGitBinary,
+			RawLocks,
+			InCommand.ResultInfo.ErrorMessages))
+	{
+		InCommand.ResultInfo.ErrorMessages.Add(
+			TEXT("Push 被阻止：无法取得新鲜 Git LFS 锁列表；本地 commit 已保留，可联网后重试 Push。"));
+		return false;
+	}
 
-
-
-
-
+	for (const FString& File : LockableFiles)
+	{
+		const FString* Owner = RawLocks.Find(File);
+		if (!Owner)
+		{
+			for (const auto& Lock : RawLocks)
+			{
+				if (FPaths::IsSamePath(Lock.Key, File))
+				{
+					Owner = &Lock.Value;
+					break;
+				}
+			}
+		}
+		if (Owner && *Owner != InCommand.LfsUserName)
+		{
+			InCommand.ResultInfo.ErrorMessages.Add(FString::Printf(
+				TEXT("Push 被阻止：文件当前由其他 Git LFS 用户“%s”锁定：%s"),
+				**Owner,
+				*File));
+			return false;
+		}
+	}
+	return true;
+}
 
 FName FGitConnectWorker::GetName() const
 {
@@ -247,12 +621,12 @@ bool FGitConnectWorker::Execute(FGitSourceControlCommand& InCommand)
 	}
 
 	// Get default branch: git remote show
-	
+
 	TArray<FString> Parameters {
 		TEXT("-h"), // Only limit to branches
 		TEXT("-q") // Skip printing out remote URL, we don't use it
 	};
-	
+
 	// Check if remote matches our refs.
 	// Could be useful in the future, but all we want to know right now is if connection is up.
 	// Parameters.Add("--exit-code");
@@ -420,7 +794,64 @@ FName FGitCheckInWorker::GetName() const
 
 const FText EmptyCommitMsg;
 
+/**
+ * pull 后从最新远端基线重算提交范围，供 LFS push 门重新校验。
+ * Recompute the committed scope from the refreshed remote baseline after a pull for LFS push validation.
+ */
+static bool RefreshPushScope(
+	FGitSourceControlCommand& InCommand,
+	const FString& InRemoteBranch,
+	const FString& InLocalBranch,
+	TArray<FString>& OutCommittedFiles,
+	TArray<FString>& OutNewlyAddedFiles)
+{
+	OutCommittedFiles.Reset();
+	OutNewlyAddedFiles.Reset();
+	const TArray<FString> DiffParameters{
+		TEXT("--name-only"),
+		FString::Printf(
+			TEXT("%s...%s"),
+			*InRemoteBranch,
+			*InLocalBranch),
+		TEXT("--")};
+	if (!GitSourceControlOperations::RunLiteralPathListCommand(
+			TEXT("diff"),
+			InCommand.PathToGitBinary,
+			InCommand.PathToRepositoryRoot,
+			DiffParameters,
+			OutCommittedFiles,
+			InCommand.ResultInfo.ErrorMessages))
+	{
+		return false;
+	}
 
+	const TArray<FString> AddedParameters{
+		TEXT("--name-only"),
+		TEXT("--diff-filter=A"),
+		FString::Printf(
+			TEXT("%s...%s"),
+			*InRemoteBranch,
+			*InLocalBranch),
+		TEXT("--")};
+	if (!GitSourceControlOperations::RunLiteralPathListCommand(
+			TEXT("diff"),
+			InCommand.PathToGitBinary,
+			InCommand.PathToRepositoryRoot,
+			AddedParameters,
+			OutNewlyAddedFiles,
+			InCommand.ResultInfo.ErrorMessages))
+	{
+		return false;
+	}
+
+	OutCommittedFiles = GitSourceControlUtils::AbsoluteFilenames(
+		OutCommittedFiles,
+		InCommand.PathToRepositoryRoot);
+	OutNewlyAddedFiles = GitSourceControlUtils::AbsoluteFilenames(
+		OutNewlyAddedFiles,
+		InCommand.PathToRepositoryRoot);
+	return true;
+}
 
 /**
  * 解锁使用完整认证核验、精确 ID 与操作内重试；不把查询失败伪装成无锁，也不重复还原文件。
@@ -548,6 +979,11 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& InCommand)
 
 		if (bDoCommit)
 		{
+			if (!ValidateStatesBeforeCheckIn(InCommand))
+			{
+				InCommand.bCommandSuccessful = false;
+				return false;
+			}
 			FString ParamCommitMsgFilename = TEXT("--file=\"");
 			ParamCommitMsgFilename += FPaths::ConvertRelativePathToFull(CommitMsgFile.GetFilename());
 			ParamCommitMsgFilename += TEXT("\"");
@@ -555,8 +991,55 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& InCommand)
 			const TArray<FString>& FilesToCommit = GitSourceControlUtils::RelativeFilenames(InCommand.Files, InCommand.PathToRepositoryRoot);
 
 			// If no files were committed, this is false, so we treat it as if we never wanted to commit in the first place.
-			bDoCommit = GitSourceControlUtils::RunCommit(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, CommitParameters,
-														FilesToCommit, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+			bool bCommitBoundaryRejected = false;
+			bool bCommitStarted = false;
+			bDoCommit = RunMutationAfterCommandLockBoundary(
+				InCommand,
+				TEXT("Git commit"),
+				[
+					&InCommand,
+					&CommitParameters,
+					&FilesToCommit,
+					&bCommitBoundaryRejected
+				]()
+				{
+					return GitSourceControlUtils::RunCommit(
+						InCommand.PathToGitBinary,
+						InCommand.PathToRepositoryRoot,
+						CommitParameters,
+						FilesToCommit,
+						[&InCommand, &bCommitBoundaryRejected]()
+						{
+							const bool bBoundaryPassed =
+								EnsureCommandLockWriteBoundary(
+								InCommand,
+								TEXT("Git commit 子进程"),
+								InCommand.ResultInfo.ErrorMessages);
+							bCommitBoundaryRejected |= !bBoundaryPassed;
+							return bBoundaryPassed;
+						},
+						InCommand.ResultInfo.InfoMessages,
+						InCommand.ResultInfo.ErrorMessages);
+				},
+				&bCommitStarted);
+			if (!bCommitStarted)
+			{
+				InCommand.bCommandSuccessful = false;
+				return false;
+			}
+			if (bCommitBoundaryRejected)
+			{
+				// 子进程边界拒绝不是“没有可提交内容”；前一批 add/commit 可能已经成功，必须
+				// 保持现场并明确失败，禁止继续 push 或 unlock。
+				// A rejected subprocess boundary is not "nothing to commit". An earlier add/commit may
+				// already have succeeded, so preserve it and fail explicitly without push or unlock.
+				InCommand.ResultInfo.ErrorMessages.Add(
+					TEXT(
+						"Git commit 子进程写边界被拒绝；此前已完成的暂存或提交保持原样，"
+						"请刷新 Source Control 状态后确认。"));
+				InCommand.bCommandSuccessful = false;
+				return false;
+			}
 		}
 
 		// If we commit, we can push up the deleted state to gone
@@ -581,19 +1064,88 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& InCommand)
 		// Collect difference between the remote and what we have on top of remote locally. This is to handle unpushed commits other than the one we just did.
 		// Doesn't matter that we're not synced. Because our local branch is always based on the remote.
 		TArray<FString> CommittedFiles;
+		TArray<FString> NewlyAddedCommittedFiles;
 		FString BranchName;
-		bool bDiffSuccess;
-		if (GitSourceControlUtils::GetRemoteBranchName(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, BranchName))
+		FString LocalBranchName = TEXT("HEAD");
+		FString OriginPullBranchName;
+		TArray<FString> PushParameters{
+			TEXT("-u"),
+			TEXT("origin"),
+			TEXT("HEAD")};
+		bool bDiffSuccess = false;
+		bool bHasRemoteBaseline = false;
+		bool bLfsPushRefsReady = !InCommand.bUsingGitLfsLocking;
+		if (InCommand.bUsingGitLfsLocking)
 		{
-			TArray<FString> Parameters {"--name-only", FString::Printf(TEXT("%s...HEAD"), *BranchName), "--"};
-			bDiffSuccess = GitSourceControlUtils::RunCommand(TEXT("diff"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, Parameters,
-															  FGitSourceControlModule::GetEmptyStringArray(), CommittedFiles, InCommand.ResultInfo.ErrorMessages);
+			FString PushRefSpec;
+			bLfsPushRefsReady = ResolveLockedPushRefs(
+				InCommand,
+				LocalBranchName,
+				BranchName,
+				PushRefSpec,
+				bHasRemoteBaseline,
+				InCommand.ResultInfo.ErrorMessages);
+
+			if (bLfsPushRefsReady)
+			{
+				PushParameters[2] = MoveTemp(PushRefSpec);
+				const FString TrackingPrefix(TEXT("refs/remotes/origin/"));
+				if (BranchName.StartsWith(TrackingPrefix))
+				{
+					OriginPullBranchName = BranchName.RightChop(TrackingPrefix.Len());
+				}
+			}
 		}
 		else
 		{
-			// Get all non-remote commits and list out their files
-			TArray<FString> Parameters {"--branches", "--not" "--remotes", "--name-only", "--pretty="};
-			bDiffSuccess = GitSourceControlUtils::RunCommand(TEXT("log"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, Parameters, FGitSourceControlModule::GetEmptyStringArray(), CommittedFiles, InCommand.ResultInfo.ErrorMessages);
+			bHasRemoteBaseline = GitSourceControlUtils::GetRemoteBranchName(
+				InCommand.PathToGitBinary,
+				InCommand.PathToRepositoryRoot,
+				BranchName);
+		}
+
+		if (bHasRemoteBaseline)
+		{
+			TArray<FString> Parameters{
+				TEXT("--name-only"),
+				FString::Printf(
+					TEXT("%s...%s"),
+					*BranchName,
+					*LocalBranchName),
+				TEXT("--")};
+			bDiffSuccess = GitSourceControlOperations::RunLiteralPathListCommand(
+				TEXT("diff"),
+				InCommand.PathToGitBinary,
+				InCommand.PathToRepositoryRoot,
+				Parameters,
+				CommittedFiles,
+				InCommand.ResultInfo.ErrorMessages);
+
+
+		}
+		else if (bLfsPushRefsReady)
+		{
+			// 首推必须绑定冻结的本地分支，不能用 --branches 把其他本地分支的提交混入锁范围。
+			// A first push is bound to the frozen local branch; --branches would mix commits from other
+			// local branches into the lock scope.
+			TArray<FString> Parameters;
+			Parameters.Add(
+				InCommand.bUsingGitLfsLocking
+					? LocalBranchName
+					: TEXT("--branches"));
+			Parameters.Append({
+				TEXT("--not"),
+				TEXT("--remotes"),
+				TEXT("--name-only"),
+				TEXT("--pretty="),
+				TEXT("--")});
+			bDiffSuccess = GitSourceControlOperations::RunLiteralPathListCommand(
+				TEXT("log"),
+				InCommand.PathToGitBinary,
+				InCommand.PathToRepositoryRoot,
+				Parameters,
+				CommittedFiles,
+				InCommand.ResultInfo.ErrorMessages);
 			// Dedup files list between commits
 			CommittedFiles = TSet<FString>{CommittedFiles}.Array();
 		}
@@ -605,6 +1157,9 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& InCommand)
 			// Only push if we have a difference (any commits at all, not just the one we just did)
 			bUnpushedFiles = CommittedFiles.Num() > 0;
 			CommittedFiles = GitSourceControlUtils::AbsoluteFilenames(CommittedFiles, InCommand.PathToRepositoryRoot);
+			NewlyAddedCommittedFiles = GitSourceControlUtils::AbsoluteFilenames(
+				NewlyAddedCommittedFiles,
+				InCommand.PathToRepositoryRoot);
 			FilesToCheckIn.Append(CommittedFiles.FilterByPredicate(GitSourceControlUtils::IsFileLFSLockable));
 		}
 		else
@@ -614,15 +1169,35 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& InCommand)
 		}
 
 		TArray<FString> PulledFiles;
+		bool bLegacyLfsPushPreflightSucceeded = true;
+		if (bUnpushedFiles
+			&& InCommand.bUsingGitLfsLocking)
+		{
+			if (!bLfsPushRefsReady || !bDiffSuccess)
+			{
+				InCommand.ResultInfo.ErrorMessages.Add(
+					TEXT("Push 被阻止：无法确定全部未推送文件的范围；本地 commit 已保留。"));
+				bLegacyLfsPushPreflightSucceeded = false;
+			}
+			else
+			{
+				bLegacyLfsPushPreflightSucceeded =
+					ValidateLegacyLfsLocksBeforePush(InCommand, CommittedFiles);
+			}
+		}
 
 		// If we have unpushed files, push
-		if (bUnpushedFiles)
+		if (bUnpushedFiles
+			&& bLegacyLfsPushPreflightSucceeded)
 		{
-			// TODO: configure remote
-			TArray<FString> PushParameters {TEXT("-u"), TEXT("origin"), TEXT("HEAD")};
-			InCommand.bCommandSuccessful = GitSourceControlUtils::RunCommand(TEXT("push"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot,
-																			 PushParameters, FGitSourceControlModule::GetEmptyStringArray(),
-																			 InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+			InCommand.bCommandSuccessful = RunGitCommandMutationAfterLockBoundary(
+				InCommand,
+				TEXT("Git push"),
+				TEXT("push"),
+				PushParameters,
+				FGitSourceControlModule::GetEmptyStringArray(),
+				InCommand.ResultInfo.InfoMessages,
+				InCommand.ResultInfo.ErrorMessages);
 
 			if (!InCommand.bCommandSuccessful)
 			{
@@ -641,19 +1216,87 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& InCommand)
 				if (bWasOutOfDate)
 				{
 					// Get latest
-					const bool bFetched = GitSourceControlUtils::FetchRemote(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, false,
-																			 InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+					const bool bFetched = GitSourceControlUtils::FetchRemote(
+						InCommand.PathToGitBinary,
+						InCommand.PathToRepositoryRoot,
+						false,
+						[&InCommand]()
+						{
+							return EnsureCommandLockWriteBoundary(
+								InCommand,
+								TEXT("Git fetch before push retry"),
+								InCommand.ResultInfo.ErrorMessages);
+						},
+						InCommand.ResultInfo.InfoMessages,
+						InCommand.ResultInfo.ErrorMessages);
 					if (bFetched)
 					{
 						// Update local with latest
-						const bool bPulled = GitSourceControlUtils::PullOrigin(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot,
-																			   FGitSourceControlModule::GetEmptyStringArray(), PulledFiles,
-																			   InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+						const bool bPulled = RunMutationAfterCommandLockBoundary(
+							InCommand,
+							TEXT("Git pull 重试"),
+							[&]()
+							{
+								return GitSourceControlUtils::PullOrigin(
+									InCommand.PathToGitBinary,
+									InCommand.PathToRepositoryRoot,
+									FGitSourceControlModule::GetEmptyStringArray(),
+									PulledFiles,
+									InCommand.ResultInfo.InfoMessages,
+									InCommand.ResultInfo.ErrorMessages,
+									[&InCommand]()
+									{
+										return EnsureCommandLockWriteBoundary(
+											InCommand,
+											TEXT("Git pull retry subprocess"),
+											InCommand.ResultInfo.ErrorMessages);
+									},
+									InCommand.bUsingGitLfsLocking
+										? OriginPullBranchName
+										: FString());
+							});
 						if (bPulled)
 						{
-							InCommand.bCommandSuccessful = GitSourceControlUtils::RunCommand(
-								TEXT("push"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, PushParameters,
-								FGitSourceControlModule::GetEmptyStringArray(), InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+							// pull 会改变远端基线；先重算“哪些文件仍是新增”，再刷新双方服务器。
+							// A pull changes the remote baseline. Recompute which files are still newly
+							// added before refreshing both lock servers.
+							TArray<FString> RetryCommittedFiles;
+							TArray<FString> RetryNewlyAddedFiles;
+							const bool bNeedsRetryScope =
+								InCommand.bUsingGitLfsLocking;
+							const bool bRetryScopeReady = !bNeedsRetryScope
+								|| RefreshPushScope(
+									InCommand,
+									BranchName,
+									LocalBranchName,
+									RetryCommittedFiles,
+									RetryNewlyAddedFiles);
+							TArray<FString> RetryValidationFiles;
+							GitSourceControlOperations::BuildPostPullPushValidationScope(
+								bRetryScopeReady,
+								CommittedFiles,
+								RetryCommittedFiles,
+								RetryValidationFiles);
+							const bool bRetryLegacyLfsLocksValid = bRetryScopeReady
+								&& (!InCommand.bUsingGitLfsLocking
+									|| ValidateLegacyLfsLocksBeforePush(
+										InCommand,
+										RetryValidationFiles));
+							const bool bRetryWriteBoundaryValid =
+								bRetryLegacyLfsLocksValid;
+							if (bRetryWriteBoundaryValid)
+							{
+								InCommand.bCommandSuccessful =
+									RunGitCommandMutationAfterLockBoundary(
+										InCommand,
+										TEXT("Git push 重试"),
+										TEXT("push"),
+										PushParameters,
+										FGitSourceControlModule::GetEmptyStringArray(),
+										InCommand.ResultInfo.InfoMessages,
+										InCommand.ResultInfo.ErrorMessages);
+
+							}
 						}
 					}
 
@@ -679,6 +1322,10 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& InCommand)
 				}
 			}
 		}
+		else if (bUnpushedFiles)
+		{
+			InCommand.bCommandSuccessful = false;
+		}
 		else
 		{
 			InCommand.bCommandSuccessful = true;
@@ -701,12 +1348,6 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& InCommand)
 					// locks are gone, so a failed POST no longer strands phantom locks there.
 					RunLFSUnlockIdempotent(InCommand, LockedFiles, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
 				}
-#if 0
-				for (const FString& File : FilesToCheckIn.Array())
-				{
-					FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*File, true);
-				}
-#endif
 			}
 		}
 
@@ -720,8 +1361,11 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& InCommand)
 
 		// now update the status of our files
 		TMap<FString, FGitSourceControlState> UpdatedStates;
-		bool bSuccess = RunUpdateStatusForCommand(InCommand,
-															   FilesToCheckIn.Array(), InCommand.ResultInfo.ErrorMessages, UpdatedStates);
+		bool bSuccess = RunUpdateStatusForCommand(
+			InCommand,
+			FilesToCheckIn.Array(),
+			InCommand.ResultInfo.ErrorMessages,
+			UpdatedStates);
 		if (bSuccess)
 		{
 			GitSourceControlUtils::CollectNewStates(UpdatedStates, States);
@@ -755,16 +1399,31 @@ bool FGitMarkForAddWorker::Execute(FGitSourceControlCommand& InCommand)
 
 	check(InCommand.Operation->GetName() == GetName());
 
-	InCommand.bCommandSuccessful = GitSourceControlUtils::RunCommand(TEXT("add"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, FGitSourceControlModule::GetEmptyStringArray(), InCommand.Files, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+	InCommand.bCommandSuccessful = RunGitCommandMutationAfterLockBoundary(
+		InCommand,
+		TEXT("Git add"),
+		TEXT("add"),
+		FGitSourceControlModule::GetEmptyStringArray(),
+		InCommand.Files,
+		InCommand.ResultInfo.InfoMessages,
+		InCommand.ResultInfo.ErrorMessages);
 
 	if (InCommand.bCommandSuccessful)
 	{
-		GitSourceControlUtils::CollectNewStates(InCommand.Files, States, EFileState::Added, ETreeState::Staged);
+		CollectStatesAfterIndexMutation(
+			InCommand,
+			InCommand.Files,
+			EFileState::Added,
+			States);
 	}
 	else
 	{
 		TMap<FString, FGitSourceControlState> UpdatedStates;
-		bool bSuccess = RunUpdateStatusForCommand(InCommand, InCommand.Files, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
+		bool bSuccess = RunUpdateStatusForCommand(
+			InCommand,
+			InCommand.Files,
+			InCommand.ResultInfo.ErrorMessages,
+			UpdatedStates);
 		if (bSuccess)
 		{
 			GitSourceControlUtils::CollectNewStates(UpdatedStates, States);
@@ -1013,18 +1672,52 @@ FName FGitSyncWorker::GetName() const
 bool FGitSyncWorker::Execute(FGitSourceControlCommand& InCommand)
 {
 	TArray<FString> Results;
-	const bool bFetched = GitSourceControlUtils::FetchRemote(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, false, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+	const bool bFetched = GitSourceControlUtils::FetchRemote(
+		InCommand.PathToGitBinary,
+		InCommand.PathToRepositoryRoot,
+		false,
+		[&InCommand]()
+		{
+			return EnsureCommandLockWriteBoundary(
+				InCommand,
+				TEXT("Git fetch before pull"),
+				InCommand.ResultInfo.ErrorMessages);
+		},
+		InCommand.ResultInfo.InfoMessages,
+		InCommand.ResultInfo.ErrorMessages);
 	if (!bFetched)
 	{
 		return false;
 	}
 
-	InCommand.bCommandSuccessful = GitSourceControlUtils::PullOrigin(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, InCommand.Files, InCommand.Files, Results, InCommand.ResultInfo.ErrorMessages);
+	InCommand.bCommandSuccessful = RunMutationAfterCommandLockBoundary(
+		InCommand,
+		TEXT("Git pull"),
+		[&]()
+		{
+			return GitSourceControlUtils::PullOrigin(
+				InCommand.PathToGitBinary,
+				InCommand.PathToRepositoryRoot,
+				InCommand.Files,
+				InCommand.Files,
+				Results,
+				InCommand.ResultInfo.ErrorMessages,
+				[&InCommand]()
+				{
+					return EnsureCommandLockWriteBoundary(
+						InCommand,
+						TEXT("Git pull subprocess"),
+						InCommand.ResultInfo.ErrorMessages);
+				});
+		});
 
 	// now update the status of our files
 	TMap<FString, FGitSourceControlState> UpdatedStates;
-	const bool bSuccess = RunUpdateStatusForCommand(InCommand,
-																 InCommand.Files, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
+	const bool bSuccess = RunUpdateStatusForCommand(
+		InCommand,
+		InCommand.Files,
+		InCommand.ResultInfo.ErrorMessages,
+		UpdatedStates);
 	if (bSuccess)
 	{
 		GitSourceControlUtils::CollectNewStates(UpdatedStates, States);
@@ -1062,6 +1755,13 @@ bool FGitFetchWorker::Execute(FGitSourceControlCommand& InCommand)
 		InCommand.PathToGitBinary,
 		InCommand.PathToRepositoryRoot,
 		InCommand.bUsingGitLfsLocking,
+		[&InCommand]()
+		{
+			return EnsureCommandLockWriteBoundary(
+				InCommand,
+				TEXT("Git fetch"),
+				InCommand.ResultInfo.ErrorMessages);
+		},
 		InCommand.ResultInfo.InfoMessages,
 		InCommand.ResultInfo.ErrorMessages);
 	if (!InCommand.bCommandSuccessful)
@@ -1196,16 +1896,31 @@ bool FGitCopyWorker::Execute(FGitSourceControlCommand& InCommand)
 	// but after a Move the Editor create a redirector file with the old asset name that points to the new asset.
 	// The redirector needs to be committed with the new asset to perform a real rename.
 	// => the following is to "MarkForAdd" the redirector, but it still need to be committed by selecting the whole directory and "check-in"
-	InCommand.bCommandSuccessful = GitSourceControlUtils::RunCommand(TEXT("add"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, FGitSourceControlModule::GetEmptyStringArray(), InCommand.Files, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+	InCommand.bCommandSuccessful = RunGitCommandMutationAfterLockBoundary(
+		InCommand,
+		TEXT("Git add copied file"),
+		TEXT("add"),
+		FGitSourceControlModule::GetEmptyStringArray(),
+		InCommand.Files,
+		InCommand.ResultInfo.InfoMessages,
+		InCommand.ResultInfo.ErrorMessages);
 
 	if (InCommand.bCommandSuccessful)
 	{
-		GitSourceControlUtils::CollectNewStates(InCommand.Files, States, EFileState::Added, ETreeState::Staged);
+		CollectStatesAfterIndexMutation(
+			InCommand,
+			InCommand.Files,
+			EFileState::Added,
+			States);
 	}
 	else
 	{
 		TMap<FString, FGitSourceControlState> UpdatedStates;
-		const bool bSuccess = RunUpdateStatusForCommand(InCommand, InCommand.Files, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
+		const bool bSuccess = RunUpdateStatusForCommand(
+			InCommand,
+			InCommand.Files,
+			InCommand.ResultInfo.ErrorMessages,
+			UpdatedStates);
 		GitSourceControlUtils::RemoveRedundantErrors(InCommand, TEXT("' is outside repository"));
 		if (bSuccess)
 		{
@@ -1232,11 +1947,22 @@ bool FGitResolveWorker::Execute( class FGitSourceControlCommand& InCommand )
 
 	// mark the conflicting files as resolved:
 	TArray<FString> Results;
-	InCommand.bCommandSuccessful = GitSourceControlUtils::RunCommand(TEXT("add"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, FGitSourceControlModule::GetEmptyStringArray(), InCommand.Files, Results, InCommand.ResultInfo.ErrorMessages);
+	InCommand.bCommandSuccessful = RunGitCommandMutationAfterLockBoundary(
+		InCommand,
+		TEXT("Git add resolved file"),
+		TEXT("add"),
+		FGitSourceControlModule::GetEmptyStringArray(),
+		InCommand.Files,
+		Results,
+		InCommand.ResultInfo.ErrorMessages);
 
 	// now update the status of our files
 	TMap<FString, FGitSourceControlState> UpdatedStates;
-	const bool bSuccess = RunUpdateStatusForCommand(InCommand, InCommand.Files, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
+	const bool bSuccess = RunUpdateStatusForCommand(
+		InCommand,
+		InCommand.Files,
+		InCommand.ResultInfo.ErrorMessages,
+		UpdatedStates);
 	GitSourceControlUtils::RemoveRedundantErrors(InCommand, TEXT("' is outside repository"));
 	if (bSuccess)
 	{
@@ -1270,19 +1996,37 @@ bool FGitMoveToChangelistWorker::Execute(FGitSourceControlCommand& InCommand)
 	bool bResult = false;
 	if(DestChangelist.GetName().Equals(TEXT("Staged")))
 	{
-		bResult = GitSourceControlUtils::RunCommand(TEXT("add"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, FGitSourceControlModule::GetEmptyStringArray(), InCommand.Files, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+		bResult = RunGitCommandMutationAfterLockBoundary(
+			InCommand,
+			TEXT("Git add to staged changelist"),
+			TEXT("add"),
+			FGitSourceControlModule::GetEmptyStringArray(),
+			InCommand.Files,
+			InCommand.ResultInfo.InfoMessages,
+			InCommand.ResultInfo.ErrorMessages);
 	}
 	else if(DestChangelist.GetName().Equals(TEXT("Working")))
 	{
 		TArray<FString> Parameter;
 		Parameter.Add(TEXT("--staged"));
-		bResult = GitSourceControlUtils::RunCommand(TEXT("restore"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, Parameter, InCommand.Files, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+		bResult = RunGitCommandMutationAfterLockBoundary(
+			InCommand,
+			TEXT("Git restore from staged changelist"),
+			TEXT("restore"),
+			Parameter,
+			InCommand.Files,
+			InCommand.ResultInfo.InfoMessages,
+			InCommand.ResultInfo.ErrorMessages);
 	}
-	
+
 	if (bResult)
 	{
 		TMap<FString, FGitSourceControlState> DummyStates;
-		RunUpdateStatusForCommand(InCommand, InCommand.Files, InCommand.ResultInfo.InfoMessages, DummyStates);
+		RunUpdateStatusForCommand(
+			InCommand,
+			InCommand.Files,
+			InCommand.ResultInfo.InfoMessages,
+			DummyStates);
 	}
 	return bResult;
 }

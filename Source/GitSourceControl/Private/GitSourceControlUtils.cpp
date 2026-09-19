@@ -732,25 +732,15 @@ static bool RunCommandInternalWithPreSubprocessBoundary(
 static bool RunCommandInternal(const FString& InCommand, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters,
 							   const TArray<FString>& InFiles, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
 {
-	bool bResult;
-	FString Results;
-	FString Errors;
-
-	constexpr int32 MaxAttempts = 4; // 1 initial + up to 3 index.lock recovery retries
-	for (int32 Attempt = 1;; ++Attempt)
-	{
-		Results.Reset();
-		Errors.Reset();
-		bResult = RunCommandInternalRaw(InCommand, InPathToGitBinary, InRepositoryRoot, InParameters, InFiles, Results, Errors);
-		if (bResult || Attempt >= MaxAttempts || !TryRecoverFromIndexLockFailure(Errors, Attempt))
-		{
-			break;
-		}
-	}
-	Results.ParseIntoArray(OutResults, TEXT("\n"), true);
-	Errors.ParseIntoArray(OutErrorMessages, TEXT("\n"), true);
-
-	return bResult;
+	return RunCommandInternalWithPreSubprocessBoundary(
+		InCommand,
+		InPathToGitBinary,
+		InRepositoryRoot,
+		InParameters,
+		InFiles,
+		[]() { return true; },
+		OutResults,
+		OutErrorMessages);
 }
 
 FString FindGitBinaryPath()
@@ -1507,12 +1497,37 @@ bool RunLFSCommand(const FString& InCommand, const FString& InRepositoryRoot, co
 }
 
 // Run a Git "commit" command by batches
-bool RunCommit(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters, const TArray<FString>& InFiles,
-			   TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
+bool RunCommit(
+	const FString& InPathToGitBinary,
+	const FString& InRepositoryRoot,
+	const TArray<FString>& InParameters,
+	const TArray<FString>& InFiles,
+	TFunctionRef<bool()> InPreWriteBoundary,
+	TArray<FString>& OutResults,
+	TArray<FString>& OutErrorMessages)
 {
-	bool bResult = true;
-
 	TArray<FString> AddParameters{TEXT("-A")};
+	auto RunMutatingSubprocess = [
+		&InPathToGitBinary,
+		&InRepositoryRoot,
+		&InPreWriteBoundary
+	](
+		const FString& InCommand,
+		const TArray<FString>& InCommandParameters,
+		const TArray<FString>& InCommandFiles,
+		TArray<FString>& OutCommandResults,
+		TArray<FString>& OutCommandErrors)
+	{
+		return RunCommandInternalWithPreSubprocessBoundary(
+			InCommand,
+			InPathToGitBinary,
+			InRepositoryRoot,
+			InCommandParameters,
+			InCommandFiles,
+			InPreWriteBoundary,
+			OutCommandResults,
+			OutCommandErrors);
+	};
 
 	if (InFiles.Num() > GitSourceControlConstants::MaxFilesPerBatch)
 	{
@@ -1524,9 +1539,25 @@ bool RunCommit(const FString& InPathToGitBinary, const FString& InRepositoryRoot
 			{
 				FilesInBatch.Add(InFiles[FileCount]);
 			}
-			bResult &= RunCommandInternal(TEXT("add"), InPathToGitBinary, InRepositoryRoot, AddParameters, FilesInBatch, OutResults, OutErrorMessages);
+			if (!RunMutatingSubprocess(
+					TEXT("add"),
+					AddParameters,
+					FilesInBatch,
+					OutResults,
+					OutErrorMessages))
+			{
+				return false;
+			}
 			// First batch is a simple "git commit" command with only the first files
-			bResult &= RunCommandInternal(TEXT("commit"), InPathToGitBinary, InRepositoryRoot, InParameters, FilesInBatch, OutResults, OutErrorMessages);
+			if (!RunMutatingSubprocess(
+					TEXT("commit"),
+					InParameters,
+					FilesInBatch,
+					OutResults,
+					OutErrorMessages))
+			{
+				return false;
+			}
 		}
 
 		TArray<FString> Parameters;
@@ -1546,19 +1577,52 @@ bool RunCommit(const FString& InPathToGitBinary, const FString& InRepositoryRoot
 			// Next batches "amend" the commit with some more files
 			TArray<FString> BatchResults;
 			TArray<FString> BatchErrors;
-			bResult &= RunCommandInternal(TEXT("add"), InPathToGitBinary, InRepositoryRoot, AddParameters, FilesInBatch, OutResults, OutErrorMessages);
-			bResult &= RunCommandInternal(TEXT("commit"), InPathToGitBinary, InRepositoryRoot, Parameters, FilesInBatch, BatchResults, BatchErrors);
+			if (!RunMutatingSubprocess(
+					TEXT("add"),
+					AddParameters,
+					FilesInBatch,
+					OutResults,
+					OutErrorMessages))
+			{
+				return false;
+			}
+			const bool bCommitSucceeded = RunMutatingSubprocess(
+				TEXT("commit"),
+				Parameters,
+				FilesInBatch,
+				BatchResults,
+				BatchErrors);
 			OutResults += BatchResults;
 			OutErrorMessages += BatchErrors;
+			if (!bCommitSucceeded)
+			{
+				return false;
+			}
 		}
 	}
 	else
 	{
-		bResult &= RunCommandInternal(TEXT("add"), InPathToGitBinary, InRepositoryRoot, AddParameters, InFiles, OutResults, OutErrorMessages);
-		bResult = RunCommandInternal(TEXT("commit"), InPathToGitBinary, InRepositoryRoot, InParameters, InFiles, OutResults, OutErrorMessages);
+		if (!RunMutatingSubprocess(
+				TEXT("add"),
+				AddParameters,
+				InFiles,
+				OutResults,
+				OutErrorMessages))
+		{
+			return false;
+		}
+		if (!RunMutatingSubprocess(
+				TEXT("commit"),
+				InParameters,
+				InFiles,
+				OutResults,
+				OutErrorMessages))
+		{
+			return false;
+		}
 	}
 
-	return bResult;
+	return true;
 }
 
 /**
@@ -1610,9 +1674,137 @@ public:
 	FString LockUser;
 };
 
+bool ParseAuthoritativeLfsLockJson(
+	const FString& InRepositoryRoot,
+	const FString& InJson,
+	TMap<FString, FString>& OutLocks,
+	FString& OutError)
+{
+	OutLocks.Reset();
+	OutError.Reset();
+	TArray<TSharedPtr<FJsonValue>> Values;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(InJson);
+	if (!FJsonSerializer::Deserialize(Reader, Values))
+	{
+		OutError = TEXT("Git LFS 权威锁列表不是完整有效的 JSON 数组。");
+		return false;
+	}
 
+	TMap<FString, FString> ParsedLocks;
+	TSet<FString> SeenIds;
+	for (int32 Index = 0; Index < Values.Num(); ++Index)
+	{
+		const TSharedPtr<FJsonObject> Object =
+			Values[Index].IsValid() && Values[Index]->Type == EJson::Object
+				? Values[Index]->AsObject()
+				: nullptr;
+		const TSharedPtr<FJsonObject>* OwnerObject = nullptr;
+		FString Id;
+		FString RelativePath;
+		FString Owner;
+		if (!Object.IsValid()
+			|| !Object->HasTypedField<EJson::String>(TEXT("id"))
+			|| !Object->TryGetStringField(TEXT("id"), Id)
+			|| !Object->HasTypedField<EJson::String>(TEXT("path"))
+			|| !Object->TryGetStringField(TEXT("path"), RelativePath)
+			|| !Object->TryGetObjectField(TEXT("owner"), OwnerObject)
+			|| OwnerObject == nullptr
+			|| !(*OwnerObject).IsValid()
+			|| !(*OwnerObject)->HasTypedField<EJson::String>(TEXT("name"))
+			|| !(*OwnerObject)->TryGetStringField(TEXT("name"), Owner))
+		{
+			OutError = FString::Printf(
+				TEXT("Git LFS 权威锁列表第 %d 项缺少字符串 id/path/owner.name。"),
+				Index);
+			return false;
+		}
 
+		Id.TrimStartAndEndInline();
+		RelativePath.TrimStartAndEndInline();
+		Owner.TrimStartAndEndInline();
+		RelativePath.ReplaceInline(TEXT("\\"), TEXT("/"));
+		FPaths::NormalizeFilename(RelativePath);
+		if (Id.IsEmpty()
+			|| RelativePath.IsEmpty()
+			|| Owner.IsEmpty()
+			|| !FPaths::IsRelative(RelativePath)
+			|| RelativePath == TEXT("..")
+			|| RelativePath.StartsWith(TEXT("../"))
+			|| RelativePath.Contains(TEXT("/../"))
+			|| RelativePath.EndsWith(TEXT("/..")))
+		{
+			OutError = FString::Printf(
+				TEXT("Git LFS 权威锁列表第 %d 项含空字段或不安全仓库相对路径。"),
+				Index);
+			return false;
+		}
 
+		const FString AbsolutePath = FPaths::ConvertRelativePathToFull(
+			InRepositoryRoot,
+			RelativePath);
+		if (!FPaths::IsUnderDirectory(AbsolutePath, InRepositoryRoot))
+		{
+			OutError = FString::Printf(
+				TEXT("Git LFS 权威锁列表第 %d 项越出仓库根目录。"),
+				Index);
+			return false;
+		}
+		bool bDuplicatePath = false;
+		for (const TPair<FString, FString>& Existing : ParsedLocks)
+		{
+			if (FPaths::IsSamePath(Existing.Key, AbsolutePath))
+			{
+				bDuplicatePath = true;
+				break;
+			}
+		}
+		if (SeenIds.Contains(Id) || bDuplicatePath)
+		{
+			OutError = FString::Printf(
+				TEXT("Git LFS 权威锁列表第 %d 项含重复 ID 或路径。"),
+				Index);
+			return false;
+		}
+		SeenIds.Add(Id);
+		ParsedLocks.Add(AbsolutePath, Owner);
+	}
+
+	OutLocks = MoveTemp(ParsedLocks);
+	return true;
+}
+
+bool GetAuthoritativeLfsLocks(
+	const FString& InRepositoryRoot,
+	const FString& InGitBinaryFallback,
+	TMap<FString, FString>& OutLocks,
+	TArray<FString>& OutErrorMessages)
+{
+	OutLocks.Reset();
+	TArray<FString> Results;
+	if (!RunLFSCommand(
+			TEXT("locks"),
+			InRepositoryRoot,
+			InGitBinaryFallback,
+			TArray<FString>{TEXT("--json")},
+			FGitSourceControlModule::GetEmptyStringArray(),
+			Results,
+			OutErrorMessages))
+	{
+		return false;
+	}
+
+	FString ParseError;
+	if (!ParseAuthoritativeLfsLockJson(
+			InRepositoryRoot,
+			FString::Join(Results, TEXT("\n")),
+			OutLocks,
+			ParseError))
+	{
+		OutErrorMessages.Add(MoveTemp(ParseError));
+		return false;
+	}
+	return true;
+}
 
 /**
  * @brief Extract the relative filename from a Git status result.
@@ -3214,10 +3406,17 @@ bool CheckLFSLockable(const FString& InPathToGitBinary, const FString& InReposit
 	return true;
 }
 
-bool FetchRemote(const FString& InPathToGitBinary, const FString& InPathToRepositoryRoot, bool InUsingGitLfsLocking, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
+bool FetchRemote(
+	const FString& InPathToGitBinary,
+	const FString& InPathToRepositoryRoot,
+	bool InUsingGitLfsLocking,
+	TFunctionRef<bool()> InPreFetchBoundary,
+	TArray<FString>& OutResults,
+	TArray<FString>& OutErrorMessages)
 {
 	// Force refresh lock states
-	if (InUsingGitLfsLocking)
+	if (ShouldUseLegacyLfsLockCache(
+			InUsingGitLfsLocking))
 	{
 		TMap<FString, FString> Locks;
 		GetAllLocks(InPathToRepositoryRoot, InPathToGitBinary, OutErrorMessages, Locks, true);
@@ -3227,12 +3426,26 @@ bool FetchRemote(const FString& InPathToGitBinary, const FString& InPathToReposi
 	// TODO specify branches?
 
 	Params.Add(TEXT("--prune"));
-	return RunCommand(TEXT("fetch"), InPathToGitBinary, InPathToRepositoryRoot, Params,
-					  FGitSourceControlModule::GetEmptyStringArray(), OutResults, OutErrorMessages);
+	return RunCommandWithPreWriteBoundary(
+		TEXT("fetch"),
+		InPathToGitBinary,
+		InPathToRepositoryRoot,
+		Params,
+		FGitSourceControlModule::GetEmptyStringArray(),
+		InPreFetchBoundary,
+		OutResults,
+		OutErrorMessages);
 }
 
-bool PullOrigin(const FString& InPathToGitBinary, const FString& InPathToRepositoryRoot, const TArray<FString>& InFiles, TArray<FString>& OutFiles,
-				TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
+bool PullOrigin(
+	const FString& InPathToGitBinary,
+	const FString& InPathToRepositoryRoot,
+	const TArray<FString>& InFiles,
+	TArray<FString>& OutFiles,
+	TArray<FString>& OutResults,
+	TArray<FString>& OutErrorMessages,
+	TFunctionRef<bool()> InPrePullBoundary,
+	const FString& InExplicitOriginBranch)
 {
 	if (FGitSourceControlModule::Get().GetProvider().bPendingRestart)
 	{
@@ -3252,9 +3465,23 @@ bool PullOrigin(const FString& InPathToGitBinary, const FString& InPathToReposit
 
 	const TSet<FString> AlreadyReloaded {InFiles};
 
-	// Get remote branch
+	// 显式分支用于 LFS 提交重试：差异基线和实际 pull 必须指向同一个 origin 分支。
+	// The explicit branch is used by LFS check-in retries so the diff baseline and the
+	// actual pull target the same origin branch.
 	FString RemoteBranch;
-	if (!GetRemoteBranchName(InPathToGitBinary, InPathToRepositoryRoot, RemoteBranch))
+	TArray<FString> PullParameters{TEXT("--rebase"), TEXT("--autostash")};
+	if (!InExplicitOriginBranch.IsEmpty())
+	{
+		RemoteBranch = FString::Printf(
+			TEXT("refs/remotes/origin/%s"),
+			*InExplicitOriginBranch);
+		PullParameters.Add(TEXT("origin"));
+		PullParameters.Add(InExplicitOriginBranch);
+	}
+	else if (!GetRemoteBranchName(
+		InPathToGitBinary,
+		InPathToRepositoryRoot,
+		RemoteBranch))
 	{
 		// No remote to sync from
 		return false;
@@ -3262,7 +3489,7 @@ bool PullOrigin(const FString& InPathToGitBinary, const FString& InPathToReposit
 
 	// Get the list of files which will be updated (either ones we changed locally, which will get potentially rebased or merged, or the remote ones that will update)
 	TArray<FString> DifferentFiles;
-	const bool bResultDiff = RunCommand(TEXT("diff"), InPathToGitBinary, InPathToRepositoryRoot, { TEXT("--name-only"), RemoteBranch }, FGitSourceControlModule::GetEmptyStringArray(), DifferentFiles, OutErrorMessages);
+	const bool bResultDiff = RunCommandWithLiteralPaths(TEXT("diff"), InPathToGitBinary, InPathToRepositoryRoot, { TEXT("--name-only"), RemoteBranch }, FGitSourceControlModule::GetEmptyStringArray(), DifferentFiles, OutErrorMessages);
 	if (!bResultDiff)
 	{
 		return false;
@@ -3313,8 +3540,15 @@ bool PullOrigin(const FString& InPathToGitBinary, const FString& InPathToReposit
 
 	// Reset HEAD and index to remote
 	TArray<FString> InfoMessages;
-	bool bSuccess = RunCommand(TEXT("pull"), InPathToGitBinary, InPathToRepositoryRoot, { "--rebase", "--autostash" }, FGitSourceControlModule::GetEmptyStringArray(),
-										  InfoMessages, OutErrorMessages);
+	bool bSuccess = RunCommandWithPreWriteBoundary(
+		TEXT("pull"),
+		InPathToGitBinary,
+		InPathToRepositoryRoot,
+		PullParameters,
+		FGitSourceControlModule::GetEmptyStringArray(),
+		InPrePullBoundary,
+		InfoMessages,
+		OutErrorMessages);
 
 	if (bShouldReload)
 	{
