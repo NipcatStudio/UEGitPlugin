@@ -293,7 +293,7 @@ namespace GitSourceControlUtils
 
 					break;
 				}
-				
+
 				FString GitTestPath = TestPath + "/.git";
 				if (FPaths::FileExists(GitTestPath) || FPaths::DirectoryExists(GitTestPath))
 				{
@@ -407,7 +407,16 @@ bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitB
 	}
 #endif
 
-	FPlatformProcess::ExecProcess(*PathToGitOrEnvBinary, *FullCommand, &ReturnCode, &OutResults, &OutErrors);
+	const bool bProcessLaunched = FPlatformProcess::ExecProcess(
+		*PathToGitOrEnvBinary,
+		*FullCommand,
+		&ReturnCode,
+		&OutResults,
+		&OutErrors);
+	if (!bProcessLaunched && OutErrors.IsEmpty())
+	{
+		OutErrors = FString::Printf(TEXT("无法启动 Git/LFS 进程：%s"), *PathToGitOrEnvBinary);
+	}
 
 #if UE_BUILD_DEBUG
 	// TODO: add a setting to easily enable Verbose logging
@@ -419,13 +428,13 @@ bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitB
 #endif
 
 	// Move push/pull progress information from the error stream to the info stream
-	if(ReturnCode == ExpectedReturnCode && OutErrors.Len() > 0)
+	if(bProcessLaunched && ReturnCode == ExpectedReturnCode && OutErrors.Len() > 0)
 	{
 		OutResults.Append(OutErrors);
 		OutErrors.Empty();
 	}
 
-	return ReturnCode == ExpectedReturnCode;
+	return bProcessLaunched && ReturnCode == ExpectedReturnCode;
 }
 
 // Basic parsing or results & errors from the Git command line process
@@ -869,18 +878,10 @@ void GetUserConfig(const FString& InPathToGitBinary, const FString& InRepository
 
 bool GetBranchName(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutBranchName)
 {
-	const FGitSourceControlModule* GitSourceControl = FGitSourceControlModule::GetThreadSafe();
-	if (!GitSourceControl)
-	{
-		return false;
-	}
-	const FGitSourceControlProvider& Provider = GitSourceControl->GetProvider();
-	if (!Provider.GetBranchName().IsEmpty())
-	{
-		OutBranchName = Provider.GetBranchName();
-		return true;
-	}
-	
+	// 分支是外部 Git 客户端可随时改变的事实，必须直接读 HEAD；Provider 缓存只用于显示，
+	// 不能成为锁工作流远端写入的权限依据。
+	// Branch is mutable through external Git clients, so read HEAD directly. The provider cache is
+	// display state and must never authorize a remote lock write.
 	bool bResults;
 	TArray<FString> InfoMessages;
 	TArray<FString> ErrorMessages;
@@ -915,18 +916,6 @@ bool GetBranchName(const FString& InPathToGitBinary, const FString& InRepository
 
 bool GetRemoteBranchName(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutBranchName)
 {
-	const FGitSourceControlModule* GitSourceControl = FGitSourceControlModule::GetThreadSafe();
-	if (!GitSourceControl)
-	{
-		return false;
-	}
-	const FGitSourceControlProvider& Provider = GitSourceControl->GetProvider();
-	if (!Provider.GetRemoteBranchName().IsEmpty())
-	{
-		OutBranchName = Provider.GetRemoteBranchName();
-		return true;
-	}
-
 	TArray<FString> InfoMessages;
 	TArray<FString> ErrorMessages;
 	TArray<FString> Parameters;
@@ -941,12 +930,7 @@ bool GetRemoteBranchName(const FString& InPathToGitBinary, const FString& InRepo
 	}
 	if (!bResults)
 	{
-		static bool bRunOnce = true;
-		if (bRunOnce)
-		{
-			UE_LOG(LogSourceControl, Warning, TEXT("Upstream branch not found for the current branch, skipping current branch for remote check. Please push a remote branch."));
-			bRunOnce = false;
-		}
+		UE_LOG(LogSourceControl, Verbose, TEXT("Upstream branch not found for the current branch, skipping current branch for remote check. Please push a remote branch."));
 	}
 	return bResults;
 }
@@ -1057,9 +1041,60 @@ bool RunCommand(const FString& InCommand, const FString& InPathToGitBinary, cons
 
 
 
+bool RunCommandWithLiteralPaths(
+	const FString& InCommand,
+	const FString& InPathToGitBinary,
+	const FString& InRepositoryRoot,
+	const TArray<FString>& InParameters,
+	const TArray<FString>& InFiles,
+	TArray<FString>& OutResults,
+	TArray<FString>& OutErrorMessages)
+{
+	// 任何被代码当作路径再分类、拼接或匹配的输出都必须绕过 Git 的 C/octal quoting。
+	// Every output consumed as a path for classification, joining, or matching bypasses Git's
+	// C/octal quoting at the command boundary.
+	TArray<FString> LiteralPathParameters;
+	LiteralPathParameters.Reserve(InParameters.Num() + 2);
+	LiteralPathParameters.Add(TEXT("core.quotepath=false"));
+	LiteralPathParameters.Add(InCommand);
+	LiteralPathParameters.Append(InParameters);
+	return RunCommand(
+		TEXT("-c"),
+		InPathToGitBinary,
+		InRepositoryRoot,
+		LiteralPathParameters,
+		InFiles,
+		OutResults,
+		OutErrorMessages);
+}
 
-
-
+bool RunStatusWithLiteralPaths(
+	const FString& InPathToGitBinary,
+	const FString& InRepositoryRoot,
+	const TArray<FString>& InParameters,
+	const TArray<FString>& InFiles,
+	TArray<FString>& OutResults,
+	TArray<FString>& OutErrorMessages)
+{
+	// porcelain 的列格式是稳定契约，但路径是否被 C-style/octal 转义仍受 core.quotepath 影响。
+	// 解析器不应依赖每台工作站的 Git 配置，所以把 override 绑定到每条 status 命令。
+	// Porcelain columns are stable, but path quoting still depends on core.quotepath. Bind the
+	// override to every status command instead of relying on workstation Git configuration.
+	TArray<FString> LiteralStatusParameters;
+	LiteralStatusParameters.Reserve(InParameters.Num() + 3);
+	LiteralStatusParameters.Add(TEXT("core.quotepath=false"));
+	LiteralStatusParameters.Add(TEXT("--no-optional-locks"));
+	LiteralStatusParameters.Add(TEXT("status"));
+	LiteralStatusParameters.Append(InParameters);
+	return RunCommand(
+		TEXT("-c"),
+		InPathToGitBinary,
+		InRepositoryRoot,
+		LiteralStatusParameters,
+		InFiles,
+		OutResults,
+		OutErrorMessages);
+}
 
 #ifndef GIT_USE_CUSTOM_LFS
 #define GIT_USE_CUSTOM_LFS 1
@@ -1433,7 +1468,7 @@ static void RunGetConflictStatus(const FString& InPathToGitBinary, const FString
 	Files.Add(InFile);
 	TArray<FString> Parameters;
 	Parameters.Add(TEXT("--unmerged"));
-	bool bResult = RunCommandInternal(TEXT("ls-files"), InPathToGitBinary, InRepositoryRoot, Parameters, Files, Results, ErrorMessages);
+	bool bResult = RunCommandWithLiteralPaths(TEXT("ls-files"), InPathToGitBinary, InRepositoryRoot, Parameters, Files, Results, ErrorMessages);
 	if (bResult && Results.Num() == 3)
 	{
 		// Parse the unmerge status: extract the base revision (or the other branch?)
@@ -1527,7 +1562,7 @@ bool ListFilesInDirectoryRecurse(const FString& InPathToGitBinary, const FString
 	TArray<FString> ErrorMessages;
 	TArray<FString> Directory;
 	Directory.Add(InDirectory);
-	const bool bResult = RunCommandInternal(TEXT("ls-files"), InPathToGitBinary, InRepositoryRoot, FGitSourceControlModule::GetEmptyStringArray(), Directory, OutFiles, ErrorMessages);
+	const bool bResult = RunCommandWithLiteralPaths(TEXT("ls-files"), InPathToGitBinary, InRepositoryRoot, FGitSourceControlModule::GetEmptyStringArray(), Directory, OutFiles, ErrorMessages);
 	AbsoluteFilenames(InRepositoryRoot, OutFiles);
 	return bResult;
 }
@@ -1781,18 +1816,12 @@ void CheckRemote(const FString& InPathToGitBinary, const FString& InRepositoryRo
 	const FString AbsoluteBinariesDirPath = FPaths::Combine(AbsoluteProjectDirPath, "Binaries/");
 	const FString AbsoluteChecksumFilePath = FPaths::Combine(AbsoluteProjectDirPath, ".checksum");
 
-	//const TArray<FString>& RelativeFiles = RelativeFilenames(Files, InRepositoryRoot);
-	// Get the full remote status of the Content and Plugins folder, since it's the only lockable folder we track in editor. 
-	// This shows any new files as well.
-	// Also update the status of `.checksum`.
-	const TArray<FString> FilesToDiff
-	{
-		FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir()),
-		AbsoluteChecksumFilePath,
-		AbsoluteBinariesDirPath,
-		AbsolutePluginsDirPath,
-	};
-	
+	// 状态结果只覆盖调用者请求的文件；后台全量刷新自行传入完整范围。
+	// 子模块不能混入主工程路径，否则进程路由会切回主仓并套用错误的分支。
+	// Scope history checks to the requested files; full background refresh supplies its own scope.
+	// Parent-project paths would reroute a submodule command to the wrong repository and branch.
+	const TArray<FString>& FilesToDiff = Files;
+
 	TArray<FString> ParametersLog{TEXT("--pretty="), TEXT("--name-only"), TEXT(""), TEXT("--")};
 	for (auto& Branch : BranchesToDiff)
 	{
@@ -1809,7 +1838,7 @@ void CheckRemote(const FString& InPathToGitBinary, const FString& InRepositoryRo
 		// .. means commits in the right that are not in the left
 		ParametersLog[2] = FString::Printf(TEXT("..%s"), *Branch);
 
-		const bool bResultLog = RunCommand(TEXT("log"), InPathToGitBinary, InRepositoryRoot, ParametersLog, FilesToDiff, LogResults, ErrorMessages);
+		const bool bResultLog = RunCommandWithLiteralPaths(TEXT("log"), InPathToGitBinary, InRepositoryRoot, ParametersLog, FilesToDiff, LogResults, ErrorMessages);
 		if (bResultLog)
 		{
 			// Status Branches may not be initialized because they're not in use by the project. They can also be not initilaized in some other quirky circumstances
@@ -1820,7 +1849,7 @@ void CheckRemote(const FString& InPathToGitBinary, const FString& InRepositoryRo
 				// Check if the files state in the branch in which is changed is actually different from compared branch
 				// This opens files for edit if they were modified in another branch but have since been reverted back to state in status.
 				TArray<FString> DiffParametersLog{ TEXT("--pretty="), TEXT("--name-only"), FString::Printf(TEXT("...%s"), *Branch), TEXT(""), TEXT("--") };
-				const bool bResultDiff = RunCommand(TEXT("diff"), InPathToGitBinary, InRepositoryRoot, DiffParametersLog, FilesToDiff, DiffResults, ErrorMessages);
+				const bool bResultDiff = RunCommandWithLiteralPaths(TEXT("diff"), InPathToGitBinary, InRepositoryRoot, DiffParametersLog, FilesToDiff, DiffResults, ErrorMessages);
 				// Get the intersection of the 2 containers
 				Intersection = DiffResults.FilterByPredicate([&LogResults](const FString& ChangedFile) { return LogResults.Contains(ChangedFile); });
 			}
@@ -1873,7 +1902,7 @@ void CheckRemote(const FString& InPathToGitBinary, const FString& InRepositoryRo
 	{
 		TArray<FString> UnpushedResults;
 		TArray<FString> UnpushedParams{ TEXT("--pretty="), TEXT("--name-only"), FString::Printf(TEXT("%s.."), *CurrentBranchName), TEXT("--") };
-		if (RunCommand(TEXT("log"), InPathToGitBinary, InRepositoryRoot, UnpushedParams, FilesToDiff, UnpushedResults, ErrorMessages))
+		if (RunCommandWithLiteralPaths(TEXT("log"), InPathToGitBinary, InRepositoryRoot, UnpushedParams, FilesToDiff, UnpushedResults, ErrorMessages))
 		{
 			for (const FString& UnpushedFileName : UnpushedResults)
 			{
@@ -2081,7 +2110,7 @@ bool UpdateChangelistStateByCommand()
 	Parameters.Add(TEXT("--porcelain"));
 	TArray<FString> Results;
 	TArray<FString> ErrorMsg;
-	const bool bResult = RunCommand(TEXT("status"),
+	const bool bResult = RunStatusWithLiteralPaths(
 		Provider.GetGitBinaryPath(),
 		Provider.GetPathToRepositoryRoot(),
 		Parameters,
@@ -2521,7 +2550,7 @@ bool RunGetHistory(const FString& InPathToGitBinary, const FString& InRepository
 		}
 		TArray<FString> Files;
 		Files.Add(*InFile);
-		bResults = RunCommand(TEXT("log"), InPathToGitBinary, InRepositoryRoot, Parameters, Files, Results, OutErrorMessages);
+		bResults = RunCommandWithLiteralPaths(TEXT("log"), InPathToGitBinary, InRepositoryRoot, Parameters, Files, Results, OutErrorMessages);
 		if (bResults)
 		{
 			ParseLogResults(Results, OutHistory);
@@ -2536,7 +2565,7 @@ bool RunGetHistory(const FString& InPathToGitBinary, const FString& InRepository
 		Parameters.Add(Revision->GetRevision());
 		TArray<FString> Files;
 		Files.Add(*Revision->GetFilename());
-		bResults &= RunCommand(TEXT("ls-tree"), InPathToGitBinary, InRepositoryRoot, Parameters, Files, Results, OutErrorMessages);
+		bResults &= RunCommandWithLiteralPaths(TEXT("ls-tree"), InPathToGitBinary, InRepositoryRoot, Parameters, Files, Results, OutErrorMessages);
 		if (bResults && Results.Num())
 		{
 			FGitLsTreeParser LsTree(Results);
@@ -2756,6 +2785,7 @@ static FCriticalSection LockableTypesMutex;
 
 bool IsFileLFSLockable(const FString& InFile)
 {
+	FScopeLock Lock(&LockableTypesMutex);
 	for (const auto& Type : LockableTypes)
 	{
 		if (InFile.EndsWith(Type))
@@ -2770,12 +2800,14 @@ bool CheckLFSLockable(const FString& InPathToGitBinary, const FString& InReposit
 {
 	TArray<FString> Results;
 	TArray<FString> Parameters;
-	LockableTypes.Empty(); // clear previous results
+	TArray<FString> NewLockableTypes;
 	Parameters.Add(TEXT("lockable")); // follow file renames
 
 	const bool bResults = RunCommand(TEXT("check-attr"), InPathToGitBinary, InRepositoryRoot, Parameters, InFiles, Results, OutErrorMessages);
 	if (!bResults)
 	{
+		FScopeLock Lock(&LockableTypesMutex);
+		LockableTypes.Empty();
 		return false;
 	}
 
@@ -2785,8 +2817,12 @@ bool CheckLFSLockable(const FString& InPathToGitBinary, const FString& InReposit
 		if (Result.EndsWith("set") && !Result.EndsWith("unset"))
 		{
 			const FString FileExt = InFiles[i].RightChop(1); // Remove wildcard (*)
-			LockableTypes.Add(FileExt);
+			NewLockableTypes.Add(FileExt);
 		}
+	}
+	{
+		FScopeLock Lock(&LockableTypesMutex);
+		LockableTypes = MoveTemp(NewLockableTypes);
 	}
 
 	return true;

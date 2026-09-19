@@ -52,7 +52,23 @@
 
 
 
-
+bool GitSourceControlOperations::RunLiteralPathListCommand(
+	const FString& InSubCommand,
+	const FString& InPathToGitBinary,
+	const FString& InRepositoryRoot,
+	const TArray<FString>& InParameters,
+	TArray<FString>& OutResults,
+	TArray<FString>& OutErrorMessages)
+{
+	return GitSourceControlUtils::RunCommandWithLiteralPaths(
+		InSubCommand,
+		InPathToGitBinary,
+		InRepositoryRoot,
+		InParameters,
+		FGitSourceControlModule::GetEmptyStringArray(),
+		OutResults,
+		OutErrorMessages);
+}
 
 
 

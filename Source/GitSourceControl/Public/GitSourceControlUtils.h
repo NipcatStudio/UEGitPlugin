@@ -239,11 +239,36 @@ GITSOURCECONTROL_API  bool RunCommand( const FString & InCommand, const FString 
 
 bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters, const TArray<FString>& InFiles, FString& OutResults, FString& OutErrors, const int32 ExpectedReturnCode = 0);
 
+/**
+ * 运行会返回机器解析路径的 Git 命令，并逐次强制 core.quotepath=false。
+ * Runs a Git command whose output paths are machine-parsed, forcing core.quotepath=false for every
+ * invocation instead of relying on repository or workstation configuration.
+ */
+GITSOURCECONTROL_API bool RunCommandWithLiteralPaths(
+	const FString& InCommand,
+	const FString& InPathToGitBinary,
+	const FString& InRepositoryRoot,
+	const TArray<FString>& InParameters,
+	const TArray<FString>& InFiles,
+	TArray<FString>& OutResults,
+	TArray<FString>& OutErrorMessages);
 
+/**
+ * 运行 porcelain status 并强制返回未经 C-style/octal 转义的字面路径。
+ * Runs porcelain status with literal, non-C-style/octal-escaped path output.
+ */
+bool RunStatusWithLiteralPaths(
+	const FString& InPathToGitBinary,
+	const FString& InRepositoryRoot,
+	const TArray<FString>& InParameters,
+	const TArray<FString>& InFiles,
+	TArray<FString>& OutResults,
+	TArray<FString>& OutErrorMessages);
 
-
-
-
+/** 从一行 literal porcelain status 中取得仓库内绝对路径。 */
+FString GetFullPathFromGitStatus(
+	const FString& InResult,
+	const FString& InRepositoryRoot);
 
 /**
  * Unloads packages of specified named files
