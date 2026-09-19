@@ -117,6 +117,373 @@ FString GetAutomationTestGitBinary()
 }
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FGitSourceControlStateContractMatrixTest,
+	"GitSourceControl.State.ContractMatrix",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitSourceControlStateContractMatrixTest::RunTest(const FString& Parameters)
+{
+	const TArray<FGitStateContractCase> Cases = {
+		{ TEXT("OrdinaryGitTrackedClean"), EFileState::Unknown, ETreeState::Unmodified, ELockState::Unlockable, ERemoteState::UpToDate, true, false, true, false, false, false, true },
+		{ TEXT("LfsCleanNotLocked"), EFileState::Unknown, ETreeState::Unmodified, ELockState::NotLocked, ERemoteState::UpToDate, false, false, false, true, false, false, false },
+		{ TEXT("OfflineModifiedNotLocked"), EFileState::Modified, ETreeState::Working, ELockState::NotLocked, ERemoteState::UpToDate, false, false, true, true, true, true, false },
+		{ TEXT("OwnLockClean"), EFileState::Unknown, ETreeState::Unmodified, ELockState::Locked, ERemoteState::UpToDate, true, false, true, false, true, true, true },
+		{ TEXT("OwnLockModified"), EFileState::Modified, ETreeState::Working, ELockState::Locked, ERemoteState::UpToDate, true, false, true, false, true, true, true },
+		{ TEXT("OtherLockClean"), EFileState::Unknown, ETreeState::Unmodified, ELockState::LockedOther, ERemoteState::UpToDate, false, true, false, false, false, false, false },
+		{ TEXT("OtherLockModified"), EFileState::Modified, ETreeState::Working, ELockState::LockedOther, ERemoteState::UpToDate, false, true, false, false, false, true, false },
+		{ TEXT("AddedNotLocked"), EFileState::Added, ETreeState::Staged, ELockState::NotLocked, ERemoteState::UpToDate, false, false, true, true, true, true, true },
+		{ TEXT("AddedUnlockable"), EFileState::Added, ETreeState::Staged, ELockState::Unlockable, ERemoteState::UpToDate, false, false, true, false, true, true, true },
+		{ TEXT("AddedLockedOther"), EFileState::Added, ETreeState::Staged, ELockState::LockedOther, ERemoteState::UpToDate, false, true, false, false, false, true, true },
+		{ TEXT("AddedUnknownLock"), EFileState::Added, ETreeState::Staged, ELockState::Unknown, ERemoteState::UpToDate, false, false, false, false, false, true, true },
+		{ TEXT("UnknownOutsideRepo"), EFileState::Unknown, ETreeState::NotInRepo, ELockState::Unknown, ERemoteState::UpToDate, false, false, false, false, false, false, false },
+		{ TEXT("Untracked"), EFileState::Unknown, ETreeState::Untracked, ELockState::Unknown, ERemoteState::UpToDate, false, false, false, false, false, false, false },
+		{ TEXT("Ignored"), EFileState::Unknown, ETreeState::Ignored, ELockState::Unknown, ERemoteState::UpToDate, false, false, false, false, false, false, false },
+		{ TEXT("NotCurrentClean"), EFileState::Unknown, ETreeState::Unmodified, ELockState::NotLocked, ERemoteState::NotAtHead, false, false, false, false, false, false, false },
+		{ TEXT("NotCurrentModified"), EFileState::Modified, ETreeState::Working, ELockState::NotLocked, ERemoteState::NotAtHead, false, false, true, false, false, true, false },
+		{ TEXT("ConflictedModified"), EFileState::Unmerged, ETreeState::Working, ELockState::NotLocked, ERemoteState::UpToDate, false, false, true, true, false, true, false },
+		{ TEXT("CommittedUnpushedOwnLock"), EFileState::Unknown, ETreeState::Unmodified, ELockState::Locked, ERemoteState::AheadUnpushed, true, false, true, false, false, false, true },
+		{ TEXT("TrackedUnknownLock"), EFileState::Unknown, ETreeState::Unmodified, ELockState::Unknown, ERemoteState::UpToDate, false, false, false, false, false, false, false },
+		{ TEXT("ModifiedUnknownLock"), EFileState::Modified, ETreeState::Working, ELockState::Unknown, ERemoteState::UpToDate, false, false, false, false, false, true, false },
+	};
+
+	for (const FGitStateContractCase& Case : Cases)
+	{
+		const FGitSourceControlState State = MakeState(
+			Case.FileState,
+			Case.TreeState,
+			Case.LockState,
+			Case.RemoteState);
+		const FString Prefix = FString::Printf(TEXT("%s: "), Case.Label);
+		TestEqual(*(Prefix + TEXT("IsCheckedOut")), State.IsCheckedOut(), Case.bCheckedOut);
+		TestEqual(
+			*(Prefix + TEXT("verified remote ownership")),
+			State.HasVerifiedOwnLock(),
+			Case.LockState == ELockState::Locked);
+		TestEqual(*(Prefix + TEXT("IsCheckedOutOther")), State.IsCheckedOutOther(), Case.bCheckedOutOther);
+		TestEqual(*(Prefix + TEXT("CanEdit")), State.CanEdit(), Case.bCanEdit);
+		TestEqual(*(Prefix + TEXT("CanCheckout")), State.CanCheckout(), Case.bCanCheckout);
+		TestEqual(*(Prefix + TEXT("CanCheckIn")), State.CanCheckIn(), Case.bCanCheckIn);
+		TestEqual(*(Prefix + TEXT("CanRevert")), State.CanRevert(), Case.bCanRevert);
+		TestEqual(
+			*(Prefix + TEXT("Checked Out Filter projection")),
+			State.IsCheckedOut() || State.IsAdded(),
+			Case.bPassesCheckedOutFilter);
+	}
+
+	// Count 哨兵让新增锁状态自动进入三组矩阵；若没有明确加入白名单，新状态会按失败关闭断言。
+	// The Count sentinel puts every future lock state into all three matrices automatically. A new
+	// state fails closed unless its capability is deliberately added to the allowlist.
+	for (int32 LockValue = static_cast<int32>(ELockState::Unset);
+		LockValue < static_cast<int32>(ELockState::Count);
+		++LockValue)
+	{
+		const ELockState::Type LockState = static_cast<ELockState::Type>(LockValue);
+		const bool bExpectedOwnLock = LockState == ELockState::Locked;
+		const bool bExpectedNoCheckoutAdapter = LockState == ELockState::Unlockable;
+		const bool bExpectedCheckedOutProjection = bExpectedOwnLock
+			|| bExpectedNoCheckoutAdapter;
+		const bool bExpectedOtherLock = LockState == ELockState::LockedOther;
+		const bool bExpectedLocalCapability = bExpectedOwnLock
+			|| LockState == ELockState::NotLocked
+			|| LockState == ELockState::Unlockable;
+		const FString Prefix = FString::Printf(TEXT("Lock enum %d: "), LockValue);
+
+		FGitSourceControlState ModifiedState = MakeState(
+			EFileState::Modified,
+			ETreeState::Working,
+			LockState);
+		const bool bExpectedModifiedCheckout = LockState == ELockState::NotLocked;
+		TestEqual(
+			*(Prefix + TEXT("modified UE checkout projection")),
+			ModifiedState.IsCheckedOut(),
+			bExpectedCheckedOutProjection);
+		TestEqual(*(Prefix + TEXT("modified verified ownership")), ModifiedState.HasVerifiedOwnLock(), bExpectedOwnLock);
+		TestEqual(*(Prefix + TEXT("modified strict other ownership")), ModifiedState.IsCheckedOutOther(), bExpectedOtherLock);
+		TestEqual(*(Prefix + TEXT("modified edit allowlist")), ModifiedState.CanEdit(), bExpectedLocalCapability);
+		TestEqual(*(Prefix + TEXT("modified submit allowlist")), ModifiedState.CanCheckIn(), bExpectedLocalCapability);
+		TestEqual(*(Prefix + TEXT("modified delete uses original cached eligibility")), ModifiedState.CanDelete(), !bExpectedOtherLock);
+		TestEqual(*(Prefix + TEXT("modified checkout allowlist")), ModifiedState.CanCheckout(), bExpectedModifiedCheckout);
+		TestEqual(*(Prefix + TEXT("modified Checked Out filter")), ModifiedState.IsCheckedOut() || ModifiedState.IsAdded(), bExpectedCheckedOutProjection);
+		TestEqual(
+			*(Prefix + TEXT("modified generic CheckIn worker gate")),
+			GitSourceControlOperations::IsStateEligibleForCheckInBoundary(
+				ModifiedState),
+			ModifiedState.CanCheckIn());
+
+		FGitSourceControlState AddedState = MakeState(
+			EFileState::Added,
+			ETreeState::Staged,
+			LockState);
+		const bool bExpectedAddedCheckout = LockState == ELockState::NotLocked;
+		TestEqual(*(Prefix + TEXT("added strict checkout ownership")), AddedState.IsCheckedOut(), bExpectedOwnLock);
+		TestEqual(*(Prefix + TEXT("added verified ownership")), AddedState.HasVerifiedOwnLock(), bExpectedOwnLock);
+		TestEqual(*(Prefix + TEXT("added strict other ownership")), AddedState.IsCheckedOutOther(), bExpectedOtherLock);
+		TestEqual(*(Prefix + TEXT("added edit allowlist")), AddedState.CanEdit(), bExpectedLocalCapability);
+		TestEqual(*(Prefix + TEXT("added submit allowlist")), AddedState.CanCheckIn(), bExpectedLocalCapability);
+		TestEqual(*(Prefix + TEXT("added delete uses original cached eligibility")), AddedState.CanDelete(), !bExpectedOtherLock);
+		TestEqual(*(Prefix + TEXT("added checkout allowlist")), AddedState.CanCheckout(), bExpectedAddedCheckout);
+		TestTrue(*(Prefix + TEXT("added Checked Out filter is UE pending-add behavior")), AddedState.IsCheckedOut() || AddedState.IsAdded());
+
+		FGitSourceControlState CleanState = MakeState(
+			EFileState::Unknown,
+			ETreeState::Unmodified,
+			LockState);
+		const bool bExpectedCleanEdit = bExpectedOwnLock
+			|| LockState == ELockState::Unlockable;
+		TestEqual(*(Prefix + TEXT("clean UE checkout projection")), CleanState.IsCheckedOut(), bExpectedCheckedOutProjection);
+		TestEqual(*(Prefix + TEXT("clean verified ownership")), CleanState.HasVerifiedOwnLock(), bExpectedOwnLock);
+		TestEqual(*(Prefix + TEXT("clean edit allowlist")), CleanState.CanEdit(), bExpectedCleanEdit);
+		TestEqual(*(Prefix + TEXT("clean submit allowlist")), CleanState.CanCheckIn(), bExpectedOwnLock);
+		TestEqual(*(Prefix + TEXT("clean delete uses original cached eligibility")), CleanState.CanDelete(), !bExpectedOtherLock);
+		TestEqual(*(Prefix + TEXT("clean checkout allowlist")), CleanState.CanCheckout(), LockState == ELockState::NotLocked);
+
+		FGitSourceControlState DeletedState = MakeState(
+			EFileState::Deleted,
+			ETreeState::Staged,
+			LockState);
+		TestEqual(*(Prefix + TEXT("deleted uses original cached eligibility")), DeletedState.CanDelete(), !bExpectedOtherLock);
+
+		TestEqual(
+			*(Prefix + TEXT("deleted generic CheckIn worker gate")),
+			GitSourceControlOperations::IsStateEligibleForCheckInBoundary(
+				DeletedState),
+			DeletedState.CanCheckIn());
+
+		FGitSourceControlState NotCurrentCleanState = CleanState;
+		NotCurrentCleanState.State.RemoteState = ERemoteState::NotAtHead;
+		TestFalse(
+			*(Prefix + TEXT("恢复原有过期文件不可删除判断")),
+			NotCurrentCleanState.CanDelete());
+
+	}
+
+	FGitSourceControlProvider ProviderContract;
+	TestFalse(
+		TEXT("ordinary Git must not pollute Uncontrolled Changelists with every writable file"),
+		ProviderContract.UsesLocalReadOnlyState());
+	FGitSourceControlSettings LfsSettings;
+	ProviderContract.ApplyLockingSettingsForTests(
+		LfsSettings.GetLockSettingsSnapshot(),
+		true);
+	TestTrue(
+		TEXT("LFS mode must expose provider-managed local read-only state"),
+		ProviderContract.UsesLocalReadOnlyState());
+
+	const TArray<FString> PrePullScope{TEXT("Content/BeforePull.uasset")};
+	const TArray<FString> RefreshedScope{TEXT("Content/AfterPull.uasset")};
+	TArray<FString> SelectedScope;
+	GitSourceControlOperations::BuildPostPullPushValidationScope(
+		true,
+		PrePullScope,
+		RefreshedScope,
+		SelectedScope);
+	TestTrue(
+		TEXT("post-pull push gate must use the recomputed scope"),
+		SelectedScope == RefreshedScope);
+	GitSourceControlOperations::BuildPostPullPushValidationScope(
+		false,
+		PrePullScope,
+		RefreshedScope,
+		SelectedScope);
+	TestTrue(
+		TEXT("failed post-pull scope refresh must not reuse the pre-pull scope"),
+		SelectedScope.IsEmpty());
+
+	TestTrue(
+		TEXT("identical lock settings snapshots remain current"),
+		GitSourceControlOperations::DoLockSettingsSnapshotsMatch(
+			7,
+			false,
+			TEXT("artist"),
+			7,
+			false,
+			TEXT("artist")));
+	TestFalse(
+		TEXT("ordinary-to-LFS toggle invalidates the command snapshot"),
+		GitSourceControlOperations::DoLockSettingsSnapshotsMatch(
+			7,
+			false,
+			TEXT("artist"),
+			8,
+			true,
+			TEXT("artist")));
+	TestFalse(
+		TEXT("LFS identity change invalidates the command snapshot"),
+		GitSourceControlOperations::DoLockSettingsSnapshotsMatch(
+			7,
+			true,
+			TEXT("artist"),
+			8,
+			true,
+			TEXT("other")));
+	TestTrue(
+		TEXT("inactive lock setting generation changes do not block ordinary Git"),
+		GitSourceControlOperations::DoLockSettingsSnapshotsMatch(
+			7,
+			false,
+			TEXT("artist"),
+			8,
+			false,
+			TEXT("other")));
+
+	bool bWriteCalled = false;
+	TestFalse(
+		TEXT("settings or branch boundary failure must suppress commit/push"),
+		GitSourceControlOperations::RunAfterLockWriteBoundary(
+			[]()
+			{
+				return false;
+			},
+			[&bWriteCalled]()
+			{
+				bWriteCalled = true;
+				return true;
+			}));
+	TestFalse(
+		TEXT("failed branch boundary must not invoke the write lambda"),
+		bWriteCalled);
+	bool bLockWriteCalled = false;
+	bool bUnlockWriteCalled = false;
+	const bool bChangedLfsSettingsMatch =
+		GitSourceControlOperations::DoLockSettingsSnapshotsMatch(
+			7,
+			true,
+			TEXT("artist"),
+			8,
+			true,
+			TEXT("other"));
+	TestFalse(
+		TEXT("changed LFS settings suppress the remote lock write"),
+		GitSourceControlOperations::RunAfterLockWriteBoundary(
+			[&bChangedLfsSettingsMatch]()
+			{
+				return bChangedLfsSettingsMatch;
+			},
+			[&bLockWriteCalled]()
+			{
+				bLockWriteCalled = true;
+				return true;
+			}));
+	TestFalse(TEXT("stale LFS lock command never reaches its write lambda"), bLockWriteCalled);
+	TestFalse(
+		TEXT("changed LFS settings suppress the remote unlock write"),
+		GitSourceControlOperations::RunAfterLockWriteBoundary(
+			[&bChangedLfsSettingsMatch]()
+			{
+				return bChangedLfsSettingsMatch;
+			},
+			[&bUnlockWriteCalled]()
+			{
+				bUnlockWriteCalled = true;
+				return true;
+			}));
+	TestFalse(TEXT("stale LFS unlock command never reaches its write lambda"), bUnlockWriteCalled);
+
+	FString LocalRef;
+	FString RemoteRef;
+	FString PushRefSpec;
+	bool bHasRemoteBaseline = true;
+	TestTrue(
+		TEXT("single LFS first push builds an explicit same-name destination"),
+		GitSourceControlOperations::BuildLfsPushRefs(
+			TEXT("feature/art"),
+			FString(),
+			LocalRef,
+			RemoteRef,
+			PushRefSpec,
+			bHasRemoteBaseline));
+	TestEqual(TEXT("first push local source is frozen"), LocalRef, FString(TEXT("refs/heads/feature/art")));
+	TestEqual(TEXT("first push expected tracking ref"), RemoteRef, FString(TEXT("refs/remotes/origin/feature/art")));
+	TestEqual(TEXT("first push explicit refspec"), PushRefSpec, FString(TEXT("refs/heads/feature/art:refs/heads/feature/art")));
+	TestFalse(TEXT("first push has no remote baseline"), bHasRemoteBaseline);
+
+	TestTrue(
+		TEXT("single LFS supports a non-same-name origin upstream"),
+		GitSourceControlOperations::BuildLfsPushRefs(
+			TEXT("feature/art"),
+			TEXT("origin/review/art"),
+			LocalRef,
+			RemoteRef,
+			PushRefSpec,
+			bHasRemoteBaseline));
+	TestEqual(TEXT("mapped upstream tracking ref"), RemoteRef, FString(TEXT("refs/remotes/origin/review/art")));
+	TestEqual(TEXT("mapped upstream push refspec"), PushRefSpec, FString(TEXT("refs/heads/feature/art:refs/heads/review/art")));
+	TestTrue(TEXT("mapped upstream provides a baseline"), bHasRemoteBaseline);
+
+	TestFalse(
+		TEXT("single LFS rejects unsupported non-origin upstreams"),
+		GitSourceControlOperations::BuildLfsPushRefs(
+			TEXT("main"),
+			TEXT("upstream/main"),
+			LocalRef,
+			RemoteRef,
+			PushRefSpec,
+			bHasRemoteBaseline));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlSoftRevertSafetyTest,
+	"GitSourceControl.State.SoftRevertSafety",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitSourceControlSoftRevertSafetyTest::RunTest(const FString& Parameters)
+{
+	const FString GitBinary = GetAutomationTestGitBinary();
+	if (!TestFalse(TEXT("仅解锁安全测试需要 Git"), GitBinary.IsEmpty())) { return false; }
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	const FString Root = FPaths::ConvertRelativePathToFull(FPaths::Combine(FPaths::ProjectSavedDir(),
+		TEXT("Automation"), TEXT("UEGitSoftRevertSafety-") + FGuid::NewGuid().ToString(EGuidFormats::Digits)));
+	if (!TestTrue(TEXT("创建独立仅解锁测试仓库"), PlatformFile.CreateDirectoryTree(*Root))) { return false; }
+	ON_SCOPE_EXIT { PlatformFile.DeleteDirectoryRecursively(*Root); };
+	TArray<FString> Output;
+	auto Git = [&](const TArray<FString>& Args)
+	{
+		TArray<FString> Errors;
+		Output.Reset();
+		return TestTrue(TEXT("夹具 Git 命令成功"), GitSourceControlUtils::RunCommand(Args[0], GitBinary, Root,
+			TArray<FString>(Args.GetData() + 1, Args.Num() - 1), {}, Output, Errors));
+	};
+	auto Write = [&](const TCHAR* Name, const TCHAR* Text)
+	{
+		return TestTrue(TEXT("写入临时夹具"), FFileHelper::SaveStringToFile(Text, *FPaths::Combine(Root, Name)));
+	};
+	if (!Git({TEXT("init"), TEXT("-b"), TEXT("test")})
+		|| !Git({TEXT("config"), TEXT("user.name"), TEXT("UEGitAutomation")})
+		|| !Git({TEXT("config"), TEXT("user.email"), TEXT("uegit@example.invalid")})
+		|| !Git({TEXT("config"), TEXT("core.hooksPath"), TEXT("no-hooks")})
+		|| !Git({TEXT("config"), TEXT("commit.gpgsign"), TEXT("false")})
+		|| !Write(TEXT("[1].txt"), TEXT("baseline")) || !Write(TEXT("1.txt"), TEXT("neighbor"))
+		|| !Git({TEXT("add"), TEXT("--"), TEXT(".")}) || !Git({TEXT("commit"), TEXT("-m"), TEXT("baseline")})
+		|| !Write(TEXT("[1].txt"), TEXT("staged edit")) || !Git({TEXT("add"), TEXT("--"), TEXT("[1].txt")})
+		|| !Write(TEXT("[1].txt"), TEXT("working edit")) || !Write(TEXT("1.txt"), TEXT("keep this edit"))) { return false; }
+
+	const FString Selected = FPaths::Combine(Root, TEXT("[1].txt"));
+	// 错误的仅解锁请求必须失败，不能落入普通 Revert 或空范围整仓还原。
+	// Invalid unlock-only requests must fail without falling through to ordinary or repository-wide Revert.
+	const auto SoftRevert = ISourceControlOperation::Create<FRevert>();
+	SoftRevert->SetSoftRevert(true);
+	const auto RevertWorker = MakeShared<FGitRevertWorker, ESPMode::ThreadSafe>();
+	FGitSourceControlCommand RevertCommand(SoftRevert, RevertWorker);
+	RevertCommand.PathToGitBinary = GitBinary;
+	RevertCommand.PathToGitRoot = Root;
+	RevertCommand.PathToRepositoryRoot = Root;
+	RevertCommand.bUsingGitLfsLocking = false;
+	RevertCommand.Files = {Selected};
+	TestFalse(TEXT("未启用 LFS 时仅解锁不会转成还原"), RevertWorker->Execute(RevertCommand));
+	RevertCommand.bUsingGitLfsLocking = true;
+	RevertCommand.Files.Reset();
+	TestFalse(TEXT("空范围仅解锁不会转成整仓还原"), RevertWorker->Execute(RevertCommand));
+	FString LocalEdit;
+	TestTrue(TEXT("仅解锁失败后文件仍存在"), FFileHelper::LoadFileToString(LocalEdit, *Selected));
+	TestEqual(TEXT("仅解锁失败保留工作区修改"), LocalEdit, FString(TEXT("working edit")));
+	Git({TEXT("show"), TEXT(":[1].txt")});
+	TestEqual(TEXT("仅解锁失败保留暂存内容"), FString::Join(Output, TEXT("\n")), FString(TEXT("staged edit")));
+
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlWritableRevertTest,
 	"GitSourceControl.State.RevertWritable",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -706,6 +1073,491 @@ bool FGitSourceControlAuthoritativeLfsJsonTest::RunTest(const FString& Parameter
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FGitSourceControlLocalReadOnlyPolicyTest,
+	"GitSourceControl.State.LocalReadOnlyPolicy",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitSourceControlLocalReadOnlyPolicyTest::RunTest(const FString& Parameters)
+{
+	for (int32 bCommandUsingLfs = 0; bCommandUsingLfs <= 1; ++bCommandUsingLfs)
+	{
+		for (int32 bSettingsSuperseded = 0; bSettingsSuperseded <= 1; ++bSettingsSuperseded)
+		{
+			for (int32 bCurrentSettingsUsingLfs = 0; bCurrentSettingsUsingLfs <= 1; ++bCurrentSettingsUsingLfs)
+			{
+				const bool bExpected = bCommandUsingLfs != 0
+					|| (bSettingsSuperseded != 0 && bCurrentSettingsUsingLfs != 0);
+				const FString Label = FString::Printf(
+					TEXT("Effective LFS mode command=%d superseded=%d current=%d"),
+					bCommandUsingLfs,
+					bSettingsSuperseded,
+					bCurrentSettingsUsingLfs);
+				TestEqual(
+					*Label,
+					GitSourceControlUtils::IsLfsReadOnlyPolicyActive(
+						bCommandUsingLfs != 0,
+						bSettingsSuperseded != 0,
+						bCurrentSettingsUsingLfs != 0),
+					bExpected);
+			}
+		}
+	}
+
+	const TArray<FGitLocalReadOnlyPolicyCase> Cases = {
+		{ TEXT("NoLfsTracked"), EFileState::Unknown, ETreeState::Unmodified, ELockState::NotLocked, false, EGitLocalReadOnlyPolicy::Preserve },
+		{ TEXT("NoLfsOwnLock"), EFileState::Unknown, ETreeState::Unmodified, ELockState::Locked, false, EGitLocalReadOnlyPolicy::Preserve },
+		{ TEXT("LfsAdded"), EFileState::Added, ETreeState::Staged, ELockState::NotLocked, true, EGitLocalReadOnlyPolicy::Writable },
+		{ TEXT("LfsAddedUnlockable"), EFileState::Added, ETreeState::Staged, ELockState::Unlockable, true, EGitLocalReadOnlyPolicy::Writable },
+		{ TEXT("LfsAddedOtherLock"), EFileState::Added, ETreeState::Staged, ELockState::LockedOther, true, EGitLocalReadOnlyPolicy::ReadOnly },
+		{ TEXT("LfsAddedUnknownLock"), EFileState::Added, ETreeState::Staged, ELockState::Unknown, true, EGitLocalReadOnlyPolicy::ReadOnly },
+		{ TEXT("LfsAddedUnsetLock"), EFileState::Added, ETreeState::Staged, ELockState::Unset, true, EGitLocalReadOnlyPolicy::ReadOnly },
+		{ TEXT("LfsOwnLock"), EFileState::Unknown, ETreeState::Unmodified, ELockState::Locked, true, EGitLocalReadOnlyPolicy::Writable },
+		{ TEXT("LfsOtherLock"), EFileState::Unknown, ETreeState::Unmodified, ELockState::LockedOther, true, EGitLocalReadOnlyPolicy::ReadOnly },
+		{ TEXT("LfsOfflineModified"), EFileState::Modified, ETreeState::Working, ELockState::NotLocked, true, EGitLocalReadOnlyPolicy::Writable },
+		{ TEXT("LfsCleanNotLocked"), EFileState::Unknown, ETreeState::Unmodified, ELockState::NotLocked, true, EGitLocalReadOnlyPolicy::Preserve },
+		{ TEXT("LfsModifiedUnknownLock"), EFileState::Modified, ETreeState::Working, ELockState::Unknown, true, EGitLocalReadOnlyPolicy::ReadOnly },
+		{ TEXT("LfsCleanUnknownLock"), EFileState::Unknown, ETreeState::Unmodified, ELockState::Unknown, true, EGitLocalReadOnlyPolicy::ReadOnly },
+		{ TEXT("LfsCleanUnsetLock"), EFileState::Unknown, ETreeState::Unmodified, ELockState::Unset, true, EGitLocalReadOnlyPolicy::ReadOnly },
+		{ TEXT("LfsUntracked"), EFileState::Unknown, ETreeState::Untracked, ELockState::NotLocked, true, EGitLocalReadOnlyPolicy::Preserve },
+	};
+
+	for (const FGitLocalReadOnlyPolicyCase& Case : Cases)
+	{
+		const FGitSourceControlState State = MakeState(Case.FileState, Case.TreeState, Case.LockState);
+		const EGitLocalReadOnlyPolicy ActualPolicy = GitSourceControlUtils::GetLocalReadOnlyPolicy(
+			State,
+			Case.bUsingLfsLocking);
+		TestEqual(
+			Case.Label,
+			static_cast<uint8>(ActualPolicy),
+			static_cast<uint8>(Case.ExpectedPolicy));
+	}
+
+	// 遍历普通 Git 与 LFS 的全部锁状态，固定 Added、Modified、Clean 的权限优先级。
+	// Cover every ordinary-Git/LFS lock state and the permission precedence of Added, Modified and Clean.
+	for (int32 LockValue = static_cast<int32>(ELockState::Unset);
+		LockValue < static_cast<int32>(ELockState::Count);
+		++LockValue)
+	{
+		const ELockState::Type LockState = static_cast<ELockState::Type>(LockValue);
+		const bool bOwnLock = LockState == ELockState::Locked;
+		const bool bForeignOrInvalidLock = LockState == ELockState::LockedOther
+			|| LockState == ELockState::Unknown
+			|| LockState == ELockState::Unset;
+		const bool bAddedWorkable = bOwnLock
+			|| LockState == ELockState::NotLocked
+			|| LockState == ELockState::Unlockable;
+
+		const FGitSourceControlState AddedState = MakeState(
+			EFileState::Added,
+			ETreeState::Staged,
+			LockState);
+		const FGitSourceControlState ModifiedState = MakeState(
+			EFileState::Modified,
+			ETreeState::Working,
+			LockState);
+		const FGitSourceControlState CleanState = MakeState(
+			EFileState::Unknown,
+			ETreeState::Unmodified,
+			LockState);
+		const EGitLocalReadOnlyPolicy ExpectedAddedLfs = bAddedWorkable
+			? EGitLocalReadOnlyPolicy::Writable
+			: EGitLocalReadOnlyPolicy::ReadOnly;
+		const EGitLocalReadOnlyPolicy ExpectedModifiedLfs =
+			bOwnLock || LockState == ELockState::NotLocked
+				? EGitLocalReadOnlyPolicy::Writable
+				: bForeignOrInvalidLock
+					? EGitLocalReadOnlyPolicy::ReadOnly
+					: EGitLocalReadOnlyPolicy::Preserve;
+		const EGitLocalReadOnlyPolicy ExpectedCleanLfs = bOwnLock
+			? EGitLocalReadOnlyPolicy::Writable
+			: bForeignOrInvalidLock
+				? EGitLocalReadOnlyPolicy::ReadOnly
+				: EGitLocalReadOnlyPolicy::Preserve;
+		const FString Prefix = FString::Printf(TEXT("Permission lock enum %d: "), LockValue);
+
+		TestEqual(
+			*(Prefix + TEXT("ordinary Git preserves Added")),
+			static_cast<uint8>(GitSourceControlUtils::GetLocalReadOnlyPolicy(AddedState, false)),
+			static_cast<uint8>(EGitLocalReadOnlyPolicy::Preserve));
+		TestEqual(
+			*(Prefix + TEXT("ordinary Git preserves Modified")),
+			static_cast<uint8>(GitSourceControlUtils::GetLocalReadOnlyPolicy(ModifiedState, false)),
+			static_cast<uint8>(EGitLocalReadOnlyPolicy::Preserve));
+		TestEqual(
+			*(Prefix + TEXT("ordinary Git preserves Clean")),
+			static_cast<uint8>(GitSourceControlUtils::GetLocalReadOnlyPolicy(CleanState, false)),
+			static_cast<uint8>(EGitLocalReadOnlyPolicy::Preserve));
+		TestEqual(
+			*(Prefix + TEXT("single LFS Added")),
+			static_cast<uint8>(GitSourceControlUtils::GetLocalReadOnlyPolicy(AddedState, true)),
+			static_cast<uint8>(ExpectedAddedLfs));
+
+		TestEqual(
+			*(Prefix + TEXT("single LFS Modified")),
+			static_cast<uint8>(GitSourceControlUtils::GetLocalReadOnlyPolicy(ModifiedState, true)),
+			static_cast<uint8>(ExpectedModifiedLfs));
+
+		TestEqual(
+			*(Prefix + TEXT("single LFS Clean")),
+			static_cast<uint8>(GitSourceControlUtils::GetLocalReadOnlyPolicy(CleanState, true)),
+			static_cast<uint8>(ExpectedCleanLfs));
+
+	}
+
+	for (int32 bModified = 0; bModified <= 1; ++bModified)
+	{
+		const EFileState::Type FileState = bModified
+			? EFileState::Modified
+			: EFileState::Unknown;
+		const ETreeState::Type TreeState = bModified
+			? ETreeState::Working
+			: ETreeState::Unmodified;
+		const EGitLocalReadOnlyPolicy ExpectedUnlockPolicy = bModified
+			? EGitLocalReadOnlyPolicy::Writable
+			: EGitLocalReadOnlyPolicy::ReadOnly;
+		const FString Prefix = FString::Printf(
+			TEXT("Legacy transition modified=%d: "),
+			bModified);
+
+		FGitSourceControlState OwnAdd = MakeState(
+			FileState,
+			TreeState,
+			ELockState::NotLocked);
+		TestEqual(
+			*(Prefix + TEXT("own add makes writable")),
+			static_cast<uint8>(GitSourceControlUtils::ApplyLegacyLfsLockStateTransition(
+				OwnAdd,
+				TEXT("me"),
+				true,
+				true)),
+			static_cast<uint8>(EGitLocalReadOnlyPolicy::Writable));
+		TestEqual(*(Prefix + TEXT("own add projects Locked")), OwnAdd.State.LockState, ELockState::Locked);
+		TestEqual(
+			*(Prefix + TEXT("own remove transition policy")),
+			static_cast<uint8>(GitSourceControlUtils::ApplyLegacyLfsLockStateTransition(
+				OwnAdd,
+				TEXT("me"),
+				false,
+				false)),
+			static_cast<uint8>(ExpectedUnlockPolicy));
+		TestEqual(*(Prefix + TEXT("own remove projects NotLocked")), OwnAdd.State.LockState, ELockState::NotLocked);
+
+		FGitSourceControlState OtherAdd = MakeState(
+			FileState,
+			TreeState,
+			ELockState::NotLocked);
+		TestEqual(
+			*(Prefix + TEXT("other add makes read-only")),
+			static_cast<uint8>(GitSourceControlUtils::ApplyLegacyLfsLockStateTransition(
+				OtherAdd,
+				TEXT("me"),
+				true,
+				false)),
+			static_cast<uint8>(EGitLocalReadOnlyPolicy::ReadOnly));
+		TestEqual(*(Prefix + TEXT("other add projects LockedOther")), OtherAdd.State.LockState, ELockState::LockedOther);
+		TestEqual(
+			*(Prefix + TEXT("other remove transition policy")),
+			static_cast<uint8>(GitSourceControlUtils::ApplyLegacyLfsLockStateTransition(
+				OtherAdd,
+				TEXT("me"),
+				false,
+				false)),
+			static_cast<uint8>(ExpectedUnlockPolicy));
+	}
+
+	FGitSourceControlState CachedCleanAfterWorker = MakeState(
+		EFileState::Modified,
+		ETreeState::Working,
+		ELockState::Locked);
+	const FGitSourceControlState FreshCleanAfterRevert = MakeState(
+		EFileState::Unknown,
+		ETreeState::Unmodified,
+		ELockState::NotLocked);
+	TArray<FString> TransitionOrder;
+	EGitLocalReadOnlyPolicy CleanUnlockPolicy = EGitLocalReadOnlyPolicy::Writable;
+	TestTrue(
+		TEXT("same-tick Revert commits fresh clean state before unlock transition"),
+		GitSourceControlOperations::RunFreshStateCommitBeforeLockTransitions(
+			[&]()
+			{
+				TransitionOrder.Add(TEXT("fresh"));
+				CachedCleanAfterWorker = FreshCleanAfterRevert;
+				return true;
+			},
+			true,
+			[&]()
+			{
+				TransitionOrder.Add(TEXT("unlock"));
+				CleanUnlockPolicy =
+					GitSourceControlUtils::ApplyLegacyLfsLockStateTransition(
+						CachedCleanAfterWorker,
+						TEXT("me"),
+						false,
+						false);
+				return true;
+			}));
+	TestTrue(
+		TEXT("fresh-state and unlock phases execute in owning order"),
+		TransitionOrder == TArray<FString>{TEXT("fresh"), TEXT("unlock")});
+	TestEqual(
+		TEXT("clean file becomes read-only after Revert/check-in unlock"),
+		static_cast<uint8>(CleanUnlockPolicy),
+		static_cast<uint8>(EGitLocalReadOnlyPolicy::ReadOnly));
+
+	FGitSourceControlState CachedModifiedAfterWorker = MakeState(
+		EFileState::Unknown,
+		ETreeState::Unmodified,
+		ELockState::Locked);
+	const FGitSourceControlState FreshModifiedAfterRemoteLoss = MakeState(
+		EFileState::Modified,
+		ETreeState::Working,
+		ELockState::NotLocked);
+	EGitLocalReadOnlyPolicy ModifiedUnlockPolicy = EGitLocalReadOnlyPolicy::ReadOnly;
+	GitSourceControlOperations::RunFreshStateCommitBeforeLockTransitions(
+		[&]()
+		{
+			CachedModifiedAfterWorker = FreshModifiedAfterRemoteLoss;
+			return true;
+		},
+		true,
+		[&]()
+		{
+			ModifiedUnlockPolicy =
+				GitSourceControlUtils::ApplyLegacyLfsLockStateTransition(
+					CachedModifiedAfterWorker,
+					TEXT("me"),
+					false,
+					false);
+			return true;
+		});
+	TestEqual(
+		TEXT("remote lock loss preserves a still-modified offline file as writable"),
+		static_cast<uint8>(ModifiedUnlockPolicy),
+		static_cast<uint8>(EGitLocalReadOnlyPolicy::Writable));
+
+	TArray<FString> InterleavedCommandOrder;
+	int32 InterleavedTransitionCalls = 0;
+	TestTrue(
+		TEXT("first completed command still commits its fresh state while another command is pending"),
+		GitSourceControlOperations::RunFreshStateCommitBeforeLockTransitions(
+			[&]()
+			{
+				InterleavedCommandOrder.Add(TEXT("first-fresh"));
+				return true;
+			},
+			false,
+			[&]()
+			{
+				++InterleavedTransitionCalls;
+				InterleavedCommandOrder.Add(TEXT("transition"));
+				return true;
+			}));
+	TestEqual(
+		TEXT("first completed command must not consume another worker's global lock fixup"),
+		InterleavedTransitionCalls,
+		0);
+	TestTrue(
+		TEXT("last completed command drains fixups after its own fresh state"),
+		GitSourceControlOperations::RunFreshStateCommitBeforeLockTransitions(
+			[&]()
+			{
+				InterleavedCommandOrder.Add(TEXT("last-fresh"));
+				return true;
+			},
+			true,
+			[&]()
+			{
+				++InterleavedTransitionCalls;
+				InterleavedCommandOrder.Add(TEXT("transition"));
+				return true;
+			}));
+	TestEqual(
+		TEXT("quiescent queue drains each deferred transition once"),
+		InterleavedTransitionCalls,
+		1);
+	TestEqual(
+		TEXT("interleaved command ordering"),
+		FString::Join(InterleavedCommandOrder, TEXT(",")),
+		FString(TEXT("first-fresh,last-fresh,transition")));
+
+	const FString GitBinary = GetAutomationTestGitBinary();
+	const FString RepositoryRoot = FPaths::ConvertRelativePathToFull(
+		FPaths::ProjectDir());
+	TArray<FString> LockableAttributeErrors;
+	TestTrue(
+		TEXT("索引失败回退测试应先从当前仓库初始化 LFS lockable 规则"),
+		GitSourceControlUtils::CheckLFSLockable(
+			GitBinary,
+			RepositoryRoot,
+			{TEXT("*.uasset"), TEXT("*.umap")},
+			LockableAttributeErrors));
+	TestTrue(
+		TEXT("当前仓库应把 .uasset 声明为 LFS lockable"),
+		GitSourceControlUtils::IsFileLFSLockable(
+			TEXT("Content/Fallback.uasset")));
+
+	TestEqual(
+		TEXT("LFS lockable index fallback fails closed"),
+		GitSourceControlOperations::GetIndexMutationFallbackLockState(
+			true,
+			TEXT("Content/Fallback.uasset")),
+		ELockState::LockedOther);
+	TestEqual(
+		TEXT("non-lockable index fallback remains ordinary Git"),
+		GitSourceControlOperations::GetIndexMutationFallbackLockState(
+			true,
+			TEXT("Config/Fallback.ini")),
+		ELockState::Unlockable);
+	TestEqual(
+		TEXT("no-LFS index fallback remains ordinary Git"),
+		GitSourceControlOperations::GetIndexMutationFallbackLockState(
+			false,
+			TEXT("Content/Fallback.uasset")),
+		ELockState::Unlockable);
+
+	const FString TempFile = FPaths::CreateTempFilename(
+		*FPaths::ProjectSavedDir(),
+		TEXT("UEGitReadOnlyPolicy-"),
+		TEXT(".tmp"));
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	ON_SCOPE_EXIT
+	{
+		if (PlatformFile.FileExists(*TempFile))
+		{
+			PlatformFile.SetReadOnly(*TempFile, false);
+			PlatformFile.DeleteFile(*TempFile);
+		}
+	};
+
+	TestTrue(
+		TEXT("应创建本地权限集成测试临时文件"),
+		FFileHelper::SaveStringToFile(TEXT("UEGit local permission contract"), *TempFile));
+	if (!PlatformFile.FileExists(*TempFile))
+	{
+		return false;
+	}
+
+	FString FailureReason(TEXT("stale"));
+	TestTrue(
+		TEXT("ReadOnly 策略应成功应用"),
+		GitSourceControlUtils::ApplyLocalReadOnlyPolicy(
+			TempFile,
+			EGitLocalReadOnlyPolicy::ReadOnly,
+			&FailureReason));
+	TestTrue(TEXT("成功应用权限时应清空旧失败原因"), FailureReason.IsEmpty());
+	TestTrue(TEXT("ReadOnly 策略应设置磁盘只读位"), PlatformFile.IsReadOnly(*TempFile));
+	TestTrue(
+		TEXT("Preserve 策略应成功且不改动只读文件"),
+		GitSourceControlUtils::ApplyLocalReadOnlyPolicy(
+			TempFile,
+			EGitLocalReadOnlyPolicy::Preserve));
+	TestTrue(TEXT("Preserve 后只读位应保持"), PlatformFile.IsReadOnly(*TempFile));
+	TestTrue(
+		TEXT("Writable 策略应成功应用"),
+		GitSourceControlUtils::ApplyLocalReadOnlyPolicy(
+			TempFile,
+			EGitLocalReadOnlyPolicy::Writable));
+	TestFalse(TEXT("Writable 策略应清除磁盘只读位"), PlatformFile.IsReadOnly(*TempFile));
+	TestTrue(
+		TEXT("Preserve 策略应成功且不改动可写文件"),
+		GitSourceControlUtils::ApplyLocalReadOnlyPolicy(
+			TempFile,
+			EGitLocalReadOnlyPolicy::Preserve));
+	TestFalse(TEXT("Preserve 后可写位应保持"), PlatformFile.IsReadOnly(*TempFile));
+
+	FGitSourceControlState FailedAddedState = MakeState(
+		EFileState::Added,
+		ETreeState::Staged,
+		GitSourceControlOperations::GetIndexMutationFallbackLockState(
+			true,
+			TempFile + TEXT(".uasset")));
+	const EGitLocalReadOnlyPolicy FailedAddedPolicy =
+		GitSourceControlUtils::GetLocalReadOnlyPolicy(
+			FailedAddedState,
+			true);
+	TestEqual(
+		TEXT("failed lockable add status requires read-only convergence"),
+		static_cast<uint8>(FailedAddedPolicy),
+		static_cast<uint8>(EGitLocalReadOnlyPolicy::ReadOnly));
+	TestTrue(
+		TEXT("failed lockable add status applies the physical read-only bit"),
+		GitSourceControlUtils::ApplyLocalReadOnlyPolicy(
+			TempFile,
+			FailedAddedPolicy));
+	TestTrue(
+		TEXT("failed lockable add no longer appears in Writable filter"),
+		PlatformFile.IsReadOnly(*TempFile));
+
+	TestTrue(
+		TEXT("unknown-lock save-routing setup makes the file writable first"),
+		GitSourceControlUtils::ApplyLocalReadOnlyPolicy(
+			TempFile,
+			EGitLocalReadOnlyPolicy::Writable));
+	FGitSourceControlState UnknownTrackedState = MakeState(
+		EFileState::Modified,
+		ETreeState::Working,
+		ELockState::Unknown);
+	TestFalse(
+		TEXT("unknown tracked LFS state does not grant semantic edit capability"),
+		UnknownTrackedState.CanEdit());
+	const EGitLocalReadOnlyPolicy UnknownTrackedPolicy =
+		GitSourceControlUtils::GetLocalReadOnlyPolicy(
+			UnknownTrackedState,
+			true);
+	TestEqual(
+		TEXT("unknown tracked LFS state fails closed at UE physical save routing"),
+		static_cast<uint8>(UnknownTrackedPolicy),
+		static_cast<uint8>(EGitLocalReadOnlyPolicy::ReadOnly));
+	TestTrue(
+		TEXT("unknown tracked LFS state replaces a stale writable bit with read-only"),
+		GitSourceControlUtils::ApplyLocalReadOnlyPolicy(
+			TempFile,
+			UnknownTrackedPolicy));
+	TestTrue(
+		TEXT("unknown tracked LFS asset cannot remain visible to Writable filter/save bypass"),
+		PlatformFile.IsReadOnly(*TempFile));
+
+	FailureReason.Reset();
+	AddExpectedError(
+		TEXT("目标=未知策略"),
+		EAutomationExpectedErrorFlags::Contains,
+		2);
+	TestFalse(
+		TEXT("unknown permission policy must fail without changing disk"),
+		GitSourceControlUtils::ApplyLocalReadOnlyPolicy(
+			TempFile,
+			static_cast<EGitLocalReadOnlyPolicy>(255),
+			&FailureReason));
+	TestTrue(
+		TEXT("unknown permission policy preserves the prior read-only bit"),
+		PlatformFile.IsReadOnly(*TempFile));
+	TestTrue(
+		TEXT("unknown permission policy is diagnosable"),
+		FailureReason.Contains(TEXT("未知策略"))
+			&& FailureReason.Contains(TempFile));
+
+	FailureReason.Reset();
+	AddExpectedError(
+		TEXT("文件不存在"),
+		EAutomationExpectedErrorFlags::Contains,
+		2);
+	TestFalse(
+		TEXT("不存在文件的权限应用应显式失败"),
+		GitSourceControlUtils::ApplyLocalReadOnlyPolicy(
+			TempFile + TEXT(".missing"),
+			EGitLocalReadOnlyPolicy::ReadOnly,
+			&FailureReason));
+	TestTrue(
+		TEXT("权限应用失败原因应包含文件、目标权限和可诊断说明"),
+		FailureReason.Contains(TEXT("文件不存在"))
+			&& FailureReason.Contains(TEXT("目标=只读"))
+			&& FailureReason.Contains(TempFile + TEXT(".missing")));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FGitSourceControlModifiedPresentationTest,
 	"GitSourceControl.State.ModifiedPresentation",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -1075,6 +1927,223 @@ bool FGitSourceControlMutationBatchBoundaryTest::RunTest(const FString& Paramete
 			PlatformFile.FileExists(
 				*FPaths::Combine(CommitRepository, TEXT(".git"), HeadRef)));
 	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FGitSourceControlMutationBoundaryWiringTest,
+	"GitSourceControl.State.MutationBoundaryWiring",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitSourceControlMutationBoundaryWiringTest::RunTest(const FString& Parameters)
+{
+	const TSharedPtr<IPlugin> Plugin =
+		IPluginManager::Get().FindPlugin(TEXT("GitSourceControl"));
+	TestTrue(TEXT("GitSourceControl plugin must be discoverable"), Plugin.IsValid());
+	if (!Plugin.IsValid())
+	{
+		return false;
+	}
+
+	FString OperationsSource;
+	FString ProviderSource;
+	FString UtilsSource;
+	const FString PrivateSourceDir = FPaths::Combine(
+		Plugin->GetBaseDir(),
+		TEXT("Source/GitSourceControl/Private"));
+	TestTrue(
+		TEXT("load production operations source"),
+		FFileHelper::LoadFileToString(
+			OperationsSource,
+			*FPaths::Combine(
+				PrivateSourceDir,
+				TEXT("GitSourceControlOperations.cpp"))));
+	TestTrue(
+		TEXT("load production provider source"),
+		FFileHelper::LoadFileToString(
+			ProviderSource,
+			*FPaths::Combine(
+				PrivateSourceDir,
+				TEXT("GitSourceControlProvider.cpp"))));
+	TestTrue(
+		TEXT("load production utils source"),
+		FFileHelper::LoadFileToString(
+			UtilsSource,
+			*FPaths::Combine(
+				PrivateSourceDir,
+				TEXT("GitSourceControlUtils.cpp"))));
+
+	// 规范化空白后检查生产接线，避免格式换行让直接 mutation 绕过测试。
+	// Normalize whitespace before inspecting production wiring so formatting cannot hide a direct
+	// mutation bypass from the contract test.
+	auto CompactSource = [](FString Source)
+	{
+		Source.ReplaceInline(TEXT("\r"), TEXT(""));
+		Source.ReplaceInline(TEXT("\n"), TEXT(""));
+		Source.ReplaceInline(TEXT("\t"), TEXT(""));
+		Source.ReplaceInline(TEXT(" "), TEXT(""));
+		return Source;
+	};
+	const FString CompactOperations = CompactSource(MoveTemp(OperationsSource));
+	const int32 DeleteStart = CompactOperations.Find(TEXT("boolFGitDeleteWorker::Execute("));
+	const int32 DeleteEnd = CompactOperations.Find(TEXT("boolFGitDeleteWorker::UpdateStates("));
+	if (!TestTrue(TEXT("找到原版删除实现的独立边界"), DeleteStart != INDEX_NONE && DeleteEnd > DeleteStart)) { return false; }
+	const FString DeleteBody = CompactOperations.Mid(DeleteStart, DeleteEnd - DeleteStart);
+	const FString GuardedOperations = CompactOperations.Left(DeleteStart) + CompactOperations.Mid(DeleteEnd);
+	TestTrue(TEXT("删除恢复普通 git rm"), DeleteBody.Contains(TEXT("GitSourceControlUtils::RunCommand(TEXT(\"rm\")")));
+	TestTrue(TEXT("删除成功后仅更新本地缓存"), DeleteBody.Contains(TEXT("CollectNewStates(InCommand.Files,States,EFileState::Deleted,ETreeState::Staged)")));
+	TestFalse(TEXT("删除不使用新增的前置校验"), DeleteBody.Contains(TEXT("ValidateLocalStatesBeforeDelete")));
+	TestFalse(TEXT("删除不强制覆盖本地修改"), DeleteBody.Contains(TEXT("--force")));
+	TestFalse(TEXT("删除不使用新增的成功后完整刷新"), DeleteBody.Contains(TEXT("CollectStatesAfterIndexMutation")));
+
+	const FString CompactProvider = CompactSource(MoveTemp(ProviderSource));
+	const FString CompactUtils = CompactSource(MoveTemp(UtilsSource));
+
+	const TArray<FString> ForbiddenDirectWorkerMutations{
+		TEXT("GitSourceControlUtils::RunCommand(TEXT(\"add\")"),
+		TEXT("GitSourceControlUtils::RunCommand(TEXT(\"rm\")"),
+		TEXT("GitSourceControlUtils::RunCommand(TEXT(\"reset\")"),
+		TEXT("GitSourceControlUtils::RunCommand(TEXT(\"clean\")"),
+		TEXT("GitSourceControlUtils::RunCommand(TEXT(\"checkout\")"),
+		TEXT("GitSourceControlUtils::RunCommand(TEXT(\"restore\")"),
+		TEXT("GitSourceControlUtils::RunCommand(TEXT(\"push\")")};
+	for (const FString& Forbidden : ForbiddenDirectWorkerMutations)
+	{
+		TestFalse(
+			*(TEXT("production worker has no raw mutation bypass: ") + Forbidden),
+			GuardedOperations.Contains(Forbidden));
+	}
+
+	const TArray<FString> RequiredGuardedMutations{
+		TEXT("RunMutationAfterCommandLockBoundary(InCommand,TEXT(\"Gitcommit\")"),
+		TEXT("RunGitCommandMutationAfterLockBoundary(InCommand,TEXT(\"Gitpush\"),TEXT(\"push\")"),
+		TEXT("RunMutationAfterCommandLockBoundary(InCommand,TEXT(\"Gitpull重试\")"),
+		TEXT("RunGitCommandMutationAfterLockBoundary(InCommand,TEXT(\"Gitpush重试\"),TEXT(\"push\")"),
+		TEXT("RunGitCommandMutationAfterLockBoundary(InCommand,TEXT(\"Gitadd\"),TEXT(\"add\")"),
+
+		TEXT("RunGitCommandMutationAfterLockBoundary(InCommand,TEXT(\"Gitreset--hard\"),TEXT(\"reset\")"),
+		TEXT("RunGitCommandMutationAfterLockBoundary(InCommand,TEXT(\"Gitclean-fd\"),TEXT(\"clean\")"),
+		TEXT("RunGitCommandMutationAfterLockBoundary(InCommand,TEXT(\"Gitrmduringrevert\"),TEXT(\"rm\")"),
+		TEXT("RunGitCommandMutationAfterLockBoundary(InCommand,TEXT(\"Gitresetduringrevert\"),TEXT(\"reset\")"),
+		TEXT("RunGitCommandMutationAfterLockBoundary(InCommand,TEXT(\"Gitcheckoutduringrevert\"),TEXT(\"checkout\")"),
+		TEXT("RunGitCommandMutationAfterLockBoundary(InCommand,TEXT(\"Gitcheckoutretryduringrevert\"),TEXT(\"checkout\")"),
+		TEXT("RunMutationAfterCommandLockBoundary(InCommand,TEXT(\"Gitpull\")"),
+		TEXT("RunGitCommandMutationAfterLockBoundary(InCommand,TEXT(\"Gitaddcopiedfile\"),TEXT(\"add\")"),
+		TEXT("RunGitCommandMutationAfterLockBoundary(InCommand,TEXT(\"Gitaddresolvedfile\"),TEXT(\"add\")"),
+		TEXT("RunGitCommandMutationAfterLockBoundary(InCommand,TEXT(\"Gitaddtostagedchangelist\"),TEXT(\"add\")"),
+		TEXT("RunGitCommandMutationAfterLockBoundary(InCommand,TEXT(\"Gitrestorefromstagedchangelist\"),TEXT(\"restore\")"),
+		TEXT("RunLFSCommandWithPreWriteBoundary(TEXT(\"lock\")"),
+		TEXT("RunLFSCommandWithPreWriteBoundary(TEXT(\"unlock\")"),
+		TEXT("TEXT(\"Gitcommit子进程\")"),
+		TEXT("TEXT(\"Gitfetchbeforepushretry\")"),
+		TEXT("TEXT(\"Gitfetchbeforepull\")"),
+		TEXT("TEXT(\"Gitfetch\")"),
+		TEXT("TEXT(\"Gitpullretrysubprocess\")"),
+		TEXT("TEXT(\"Gitpullsubprocess\")")};
+	for (const FString& Required : RequiredGuardedMutations)
+	{
+		TestTrue(
+			*(TEXT("production mutation uses the guarded boundary: ") + Required),
+			CompactOperations.Contains(Required));
+	}
+
+	TestTrue(
+		TEXT("provider computes queue quiescence before draining global lock fixups"),
+		CompactProvider.Contains(
+			TEXT("constboolbCommandQueueQuiescent=CommandQueue.IsEmpty();"))
+			&& CompactProvider.Contains(
+				TEXT("bCommandQueueQuiescent,ApplyPendingLegacyLfsLockStateFixups")));
+	TestTrue(
+		TEXT("provider also drains deferred fixups when a tick observes an already-empty queue"),
+		CompactProvider.Contains(
+			TEXT("if(!bLockTransitionsApplied&&CommandQueue.IsEmpty())")));
+
+	TestFalse(
+		TEXT("changelist status scanning must never restage a porcelain status line"),
+		CompactUtils.Contains(TEXT("UpdateFileStagingOnSavedInternal(Result)")));
+	TestFalse(
+		TEXT("save callback must not invoke raw Git add"),
+		CompactUtils.Contains(TEXT("RunCommand(TEXT(\"add\")")));
+	TestTrue(
+		TEXT("save callback restaging enters the guarded MoveToChangelist worker asynchronously"),
+		CompactUtils.Contains(
+			TEXT("ISourceControlOperation::Create<FMoveToChangelist>()"))
+			&& CompactUtils.Contains(TEXT("EConcurrency::Asynchronous")));
+
+	TestTrue(
+		TEXT("generic mutating Git runner guards every real batch subprocess"),
+		CompactOperations.Contains(
+			TEXT("GitSourceControlUtils::RunCommandWithPreWriteBoundary(")));
+	TestTrue(
+		TEXT("LFS writes enter the per-subprocess boundary runner"),
+		CompactUtils.Contains(
+			TEXT("returnGitSourceControlUtils::RunCommandWithPreWriteBoundary(Command,LFSLockBinary,InRepositoryRoot,InParameters,InFiles,InPreWriteBoundary"))
+			&& CompactOperations.Contains(
+				TEXT("RunLFSCommandWithPreWriteBoundary(")));
+	TestTrue(
+		TEXT("RunCommit routes every owned subprocess and retry through the boundary-aware internal runner"),
+		CompactUtils.Contains(
+			TEXT("returnRunCommandInternalWithPreSubprocessBoundary(InCommand,InPathToGitBinary,InRepositoryRoot,InCommandParameters,InCommandFiles,InPreWriteBoundary")));
+	const int32 RetryBoundaryGate = CompactUtils.Find(
+		TEXT("if(!InPreSubprocessBoundary())"));
+	const int32 RawGitSubprocess = CompactUtils.Find(
+		TEXT("bResult=RunCommandInternalRaw("),
+		ESearchCase::CaseSensitive,
+		ESearchDir::FromStart,
+		RetryBoundaryGate);
+	TestTrue(
+		TEXT("index.lock retries recheck immediately before every raw Git subprocess"),
+		RetryBoundaryGate != INDEX_NONE
+			&& RawGitSubprocess > RetryBoundaryGate);
+	TestTrue(
+		TEXT("CheckIn must propagate a rejected commit subprocess boundary as failure"),
+		CompactOperations.Contains(
+			TEXT("bCommitBoundaryRejected|=!bBoundaryPassed;"))
+			&& CompactOperations.Contains(
+				TEXT("if(bCommitBoundaryRejected){"))
+			&& CompactOperations.Contains(
+				TEXT("InCommand.bCommandSuccessful=false;returnfalse;")));
+	TestTrue(
+		TEXT("Pull rechecks after package unlink and immediately before the real pull subprocess"),
+		CompactUtils.Contains(
+			TEXT("boolbSuccess=RunCommandWithPreWriteBoundary(TEXT(\"pull\")")));
+	TestTrue(
+		TEXT("Fetch rechecks after lock refresh and immediately before the real fetch subprocess"),
+		CompactUtils.Contains(
+			TEXT("returnRunCommandWithPreWriteBoundary(TEXT(\"fetch\")")));
+	const int32 PullFunctionStart = CompactUtils.Find(TEXT("boolPullOrigin("));
+	const int32 PullPackageUnlinkComplete = CompactUtils.Find(
+		TEXT("PackagesToReload=PackagesToReloadResult.Get();"),
+		ESearchCase::CaseSensitive,
+		ESearchDir::FromStart,
+		PullFunctionStart);
+	const int32 GuardedPullSubprocess = CompactUtils.Find(
+		TEXT("boolbSuccess=RunCommandWithPreWriteBoundary(TEXT(\"pull\")"),
+		ESearchCase::CaseSensitive,
+		ESearchDir::FromStart,
+		PullFunctionStart);
+	TestTrue(
+		TEXT("Pull write gate must remain below the package-unlink wait"),
+		PullFunctionStart != INDEX_NONE
+			&& PullPackageUnlinkComplete > PullFunctionStart
+			&& GuardedPullSubprocess > PullPackageUnlinkComplete);
+	const int32 FetchFunctionStart = CompactUtils.Find(TEXT("boolFetchRemote("));
+	const int32 FetchLockRefresh = CompactUtils.Find(
+		TEXT("GetAllLocks("),
+		ESearchCase::CaseSensitive,
+		ESearchDir::FromStart,
+		FetchFunctionStart);
+	const int32 GuardedFetchSubprocess = CompactUtils.Find(
+		TEXT("returnRunCommandWithPreWriteBoundary(TEXT(\"fetch\")"),
+		ESearchCase::CaseSensitive,
+		ESearchDir::FromStart,
+		FetchFunctionStart);
+	TestTrue(
+		TEXT("Fetch write gate must remain below the optional lock refresh"),
+		FetchFunctionStart != INDEX_NONE
+			&& FetchLockRefresh > FetchFunctionStart
+			&& GuardedFetchSubprocess > FetchLockRefresh);
 
 	return true;
 }

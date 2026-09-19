@@ -457,13 +457,9 @@ bool FGitSourceControlState::CanEdit() const
 
 bool FGitSourceControlState::CanDelete() const
 {
-	// Perforce enforces that a deleted file must be current.
-	if (!IsCurrent())
-	{
-		return false;
-	}
-	// If someone else hasn't checked it out, we can delete revision controlled files.
-	return !IsCheckedOutOther() && IsSourceControlled();
+	// 恢复原有缓存状态判断，不在这里额外刷新状态或联网校验。
+	// Restore the original cached-state predicate without an extra refresh or network validation here.
+	return IsCurrent() && !IsCheckedOutOther() && IsSourceControlled();
 }
 
 bool FGitSourceControlState::IsUnknown() const
@@ -476,7 +472,6 @@ bool FGitSourceControlState::IsModified() const
 	return State.TreeState == ETreeState::Working ||
 		State.TreeState == ETreeState::Staged;
 }
-
 
 bool FGitSourceControlState::CanAdd() const
 {

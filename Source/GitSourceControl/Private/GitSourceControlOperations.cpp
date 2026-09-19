@@ -114,7 +114,6 @@ static bool EnsureCommandLockWriteBoundary(
 	return EnsureLockCommandWriteBoundary(InCommand, InAction, OutErrorMessages);
 }
 
-
 /**
  * 所有会改动 Git 索引、工作区或引用的 worker 都从此处紧邻写入复核命令快照。
  * Every worker mutation of the Git index, working tree, or refs revalidates the command snapshot
@@ -204,8 +203,6 @@ bool GitSourceControlOperations::RunFreshStateCommitBeforeLockTransitions(
 	return bFreshStateUpdated || bLockTransitionUpdated;
 }
 
-
-
 bool GitSourceControlOperations::IsStateEligibleForCheckInBoundary(
 	const FGitSourceControlState& InState)
 {
@@ -215,8 +212,6 @@ bool GitSourceControlOperations::IsStateEligibleForCheckInBoundary(
 	}
 	return true;
 }
-
-
 
 ELockState::Type GitSourceControlOperations::GetIndexMutationFallbackLockState(
 	bool bUsingGitLfsLocking,
@@ -524,8 +519,6 @@ static bool ValidateStatesBeforeCheckIn(FGitSourceControlCommand& InCommand)
 	}
 	return true;
 }
-
-
 
 /**
  * 单端 LFS 允许断网 local commit，但 push 前必须用 raw 新鲜列表拒绝其他用户的锁。
@@ -1121,7 +1114,6 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& InCommand)
 				CommittedFiles,
 				InCommand.ResultInfo.ErrorMessages);
 
-
 		}
 		else if (bLfsPushRefsReady)
 		{
@@ -1478,7 +1470,6 @@ bool FGitDeleteWorker::UpdateStates() const
 {
 	return GitSourceControlUtils::UpdateCachedStates(States);
 }
-
 
 // Get lists of Missing files (ie "deleted"), Modified files, and "other than Added" Existing files
 void GetMissingVsExistingFiles(const TArray<FString>& InFiles, TArray<FString>& OutMissingFiles, TArray<FString>& OutAllExistingFiles, TArray<FString>& OutOtherThanAddedExistingFiles)

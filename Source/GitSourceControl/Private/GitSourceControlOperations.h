@@ -17,9 +17,6 @@ namespace GitSourceControlOperations
 	bool IsStateEligibleForCheckInBoundary(
 		const FGitSourceControlState& InState);
 
-	/** 已明确请求删除时允许丢弃本地修改，仍拒绝过期版本、冲突或不允许的锁状态。 */
-	bool IsStateEligibleForDeleteBoundary(const FGitSourceControlState& InState);
-
 	/** index mutation 的状态刷新失败时：仅 lockable LFS 文件失败关闭，普通文件保持 Unlockable。 */
 	ELockState::Type GetIndexMutationFallbackLockState(
 		bool bUsingGitLfsLocking,
@@ -88,12 +85,6 @@ namespace GitSourceControlOperations
 	bool RunAfterLockWriteBoundary(
 		TFunctionRef<bool()> InBoundaryCheck,
 		TFunctionRef<bool()> InWrite);
-
-	/** Delete 必须先通过新鲜本地状态门；失败时不得修改索引。 */
-	bool RunDeleteAfterLockBoundary(
-		TFunctionRef<bool()> InLocalStateGate,
-		TFunctionRef<bool()> InIndexMutation);
-
 
 }
 
