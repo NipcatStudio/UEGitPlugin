@@ -1,0 +1,96 @@
+Git LFS 显式空代理修复 / Honor explicitly empty Git proxy settings
+
+基线保留插件自带的并发锁优化，不替换为未经验证的普通发行版。
+Preserves the bundled concurrent-lock fork rather than replacing it with a stock release.
+Source: https://github.com/git-lfs/git-lfs.git
+Base: 35ec69f0e544a91a266ebe92ac4cf2198f61cbcd
+Toolchain: Go 1.19.13, CGO_ENABLED=0
+Windows binary version suffix: 35ec69f0+explicit-proxy1
+
+在独立源码 checkout 内应用并构建；不经过 Unreal 项目构建入口。
+Apply and build in an isolated source checkout; this is not an Unreal target build.
+  git checkout --detach 35ec69f0e544a91a266ebe92ac4cf2198f61cbcd
+  git apply --unidiff-zero <this-patch>
+  go test ./lfshttp -run Proxy -count=1
+  go build -trimpath -ldflags="-s -w -X github.com/git-lfs/git-lfs/v3/config.GitCommit=35ec69f0+explicit-proxy1" -o git-lfs.exe .
+
+本次仅重建 Windows AMD64 可执行文件；其它平台二进制未更改。
+Only the Windows AMD64 executable is rebuilt here; other platform binaries are unchanged.
+
+diff --git a/lfshttp/proxy.go b/lfshttp/proxy.go
+index af189e6..939cd74 100644
+--- a/lfshttp/proxy.go
++++ b/lfshttp/proxy.go
+@@ -77 +77,3 @@ func getProxyServers(u *url.URL, urlCfg *config.URLConfig, osEnv config.Environm
+-		if len(gitProxy) > 0 && ok {
++		// 显式空值表示直连；只有未配置时才继承环境代理。
++		// An explicit empty value means direct; inherit environment proxies only when unset.
++		if ok {
+diff --git a/lfshttp/proxy_explicit_empty_test.go b/lfshttp/proxy_explicit_empty_test.go
+new file mode 100644
+index 0000000..0d2b4c7
+--- /dev/null
++++ b/lfshttp/proxy_explicit_empty_test.go
+@@ -0,0 +1,62 @@
++package lfshttp
++
++import (
++	"net/http"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// 显式空代理必须覆盖环境变量；URL 例外不能影响其它仓库或主机。
++// An explicitly empty proxy overrides the environment without affecting other URL scopes.
++func TestExplicitEmptyGitProxy(t *testing.T) {
++	for _, scheme := range []string{"http", "https"} {
++		t.Run(scheme+" global", func(t *testing.T) {
++			c, err := NewClient(NewContext(nil, map[string]string{
++				"HTTP_PROXY":  "http://environment-proxy:8080",
++				"HTTPS_PROXY": "http://environment-proxy:8080",
++			}, map[string]string{"http.proxy": ""}))
++			require.NoError(t, err)
++			req, err := http.NewRequest("GET", scheme+"://example.com/repo/info/lfs/locks", nil)
++			require.NoError(t, err)
++			proxy, err := proxyFromClient(c)(req)
++			require.NoError(t, err)
++			assert.Nil(t, proxy)
++		})
++	}
++
++	for _, fallback := range []string{"environment", "git"} {
++		t.Run("URL scope with "+fallback+" fallback", func(t *testing.T) {
++			gitConfig := map[string]string{"http.https://example.com/one.git/info/lfs.proxy": ""}
++			if fallback == "git" {
++				gitConfig["http.proxy"] = "http://git-proxy:8080"
++			}
++			c, err := NewClient(NewContext(nil, map[string]string{
++				"HTTP_PROXY":  "http://environment-proxy:8080",
++				"HTTPS_PROXY": "http://environment-proxy:8080",
++			}, gitConfig))
++			require.NoError(t, err)
++			for _, target := range []struct {
++				url    string
++				direct bool
++			}{
++				{"https://example.com/one.git/info/lfs", true},
++				{"https://example.com/one.git/info/lfs/locks/verify", true},
++				{"https://example.com/two.git/info/lfs/locks", false},
++				{"https://other.example.com/one.git/info/lfs/locks", false},
++			} {
++				req, err := http.NewRequest("POST", target.url, nil)
++				require.NoError(t, err)
++				proxy, err := proxyFromClient(c)(req)
++				require.NoError(t, err)
++				if target.direct {
++					assert.Nil(t, proxy, target.url)
++				} else {
++					require.NotNil(t, proxy, target.url)
++					assert.Equal(t, fallback+"-proxy:8080", proxy.Host)
++				}
++			}
++		})
++	}
++}
