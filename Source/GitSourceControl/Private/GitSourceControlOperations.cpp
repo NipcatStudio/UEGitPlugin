@@ -124,6 +124,19 @@ bool GitSourceControlOperations::RunAfterLockWriteBoundary(
 	return InWrite();
 }
 
+bool GitSourceControlOperations::RunFreshStateCommitBeforeLockTransitions(
+	TFunctionRef<bool()> InFreshStateCommit,
+	bool bInCommandQueueQuiescent,
+	TFunctionRef<bool()> InLockTransitionCommit)
+{
+	const bool bFreshStateUpdated = InFreshStateCommit();
+	if (!bInCommandQueueQuiescent)
+	{
+		return bFreshStateUpdated;
+	}
+	const bool bLockTransitionUpdated = InLockTransitionCommit();
+	return bFreshStateUpdated || bLockTransitionUpdated;
+}
 
 
 
@@ -131,8 +144,15 @@ bool GitSourceControlOperations::RunAfterLockWriteBoundary(
 
 
 
-
-
+ELockState::Type GitSourceControlOperations::GetIndexMutationFallbackLockState(
+	bool bUsingGitLfsLocking,
+	const FString& InFilename)
+{
+	return bUsingGitLfsLocking
+		&& GitSourceControlUtils::IsFileLFSLockable(InFilename)
+			? ELockState::LockedOther
+			: ELockState::Unlockable;
+}
 
 
 
@@ -158,15 +178,27 @@ bool GitSourceControlOperations::RunLiteralPathListCommand(
 
 
 
+/**
+ * 用命令的同代锁快照运行状态计算，并把过期结果请求传回 Provider。
+ * Runs status calculation with the command's coherent lock snapshot and propagates a superseded
+ * result back to the provider.
+ */
 static bool RunUpdateStatusForCommand(
 	FGitSourceControlCommand& InCommand,
 	const TArray<FString>& InFiles,
 	TArray<FString>& OutErrorMessages,
 	TMap<FString, FGitSourceControlState>& OutStates)
 {
-	return GitSourceControlUtils::RunUpdateStatus(InCommand.PathToGitBinary,
-		InCommand.PathToRepositoryRoot, InCommand.bUsingGitLfsLocking,
-		InFiles, OutErrorMessages, OutStates);
+	return GitSourceControlUtils::RunUpdateStatus(
+		InCommand.PathToGitBinary,
+		InCommand.PathToRepositoryRoot,
+		InCommand.bUsingGitLfsLocking,
+		InCommand.bSettingsUsingGitLfsLocking,
+		InCommand.LockSettingsGeneration,
+		InFiles,
+		OutErrorMessages,
+		OutStates,
+		InCommand.bStatusSettingsSuperseded);
 }
 
 
@@ -688,7 +720,7 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& InCommand)
 
 		// now update the status of our files
 		TMap<FString, FGitSourceControlState> UpdatedStates;
-		bool bSuccess = GitSourceControlUtils::RunUpdateStatus(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, InCommand.bUsingGitLfsLocking,
+		bool bSuccess = RunUpdateStatusForCommand(InCommand,
 															   FilesToCheckIn.Array(), InCommand.ResultInfo.ErrorMessages, UpdatedStates);
 		if (bSuccess)
 		{
@@ -732,7 +764,7 @@ bool FGitMarkForAddWorker::Execute(FGitSourceControlCommand& InCommand)
 	else
 	{
 		TMap<FString, FGitSourceControlState> UpdatedStates;
-		bool bSuccess = GitSourceControlUtils::RunUpdateStatus(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, InCommand.bUsingGitLfsLocking, InCommand.Files, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
+		bool bSuccess = RunUpdateStatusForCommand(InCommand, InCommand.Files, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
 		if (bSuccess)
 		{
 			GitSourceControlUtils::CollectNewStates(UpdatedStates, States);
@@ -772,7 +804,7 @@ bool FGitDeleteWorker::Execute(FGitSourceControlCommand& InCommand)
 	else
 	{
 		TMap<FString, FGitSourceControlState> UpdatedStates;
-		bool bSuccess = GitSourceControlUtils::RunUpdateStatus(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, InCommand.bUsingGitLfsLocking, InCommand.Files, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
+		bool bSuccess = RunUpdateStatusForCommand(InCommand, InCommand.Files, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
 		if (bSuccess)
 		{
 			GitSourceControlUtils::CollectNewStates(UpdatedStates, States);
@@ -958,7 +990,7 @@ bool FGitRevertWorker::Execute(FGitSourceControlCommand& InCommand)
 
 	// now update the status of our files
 	TMap<FString, FGitSourceControlState> UpdatedStates;
-	bool bSuccess = GitSourceControlUtils::RunUpdateStatus(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, InCommand.bUsingGitLfsLocking, FilesToUpdate, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
+	bool bSuccess = RunUpdateStatusForCommand(InCommand, FilesToUpdate, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
 	if (bSuccess)
 	{
 		GitSourceControlUtils::CollectNewStates(UpdatedStates, States);
@@ -991,7 +1023,7 @@ bool FGitSyncWorker::Execute(FGitSourceControlCommand& InCommand)
 
 	// now update the status of our files
 	TMap<FString, FGitSourceControlState> UpdatedStates;
-	const bool bSuccess = GitSourceControlUtils::RunUpdateStatus(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, InCommand.bUsingGitLfsLocking,
+	const bool bSuccess = RunUpdateStatusForCommand(InCommand,
 																 InCommand.Files, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
 	if (bSuccess)
 	{
@@ -1081,7 +1113,7 @@ bool FGitUpdateStatusWorker::Execute(FGitSourceControlCommand& InCommand)
 	if(InCommand.Files.Num() > 0)
 	{
 		TMap<FString, FGitSourceControlState> UpdatedStates;
-		InCommand.bCommandSuccessful = GitSourceControlUtils::RunUpdateStatus(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, InCommand.bUsingGitLfsLocking, InCommand.Files, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
+		InCommand.bCommandSuccessful = RunUpdateStatusForCommand(InCommand, InCommand.Files, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
 		GitSourceControlUtils::RemoveRedundantErrors(InCommand, TEXT("' is outside repository"));
 		if (InCommand.bCommandSuccessful)
 		{
@@ -1113,7 +1145,7 @@ bool FGitUpdateStatusWorker::Execute(FGitSourceControlCommand& InCommand)
 		const TArray<FString> ProjectDirs = GitSourceControlUtils::GetSourceControlledAssetPaths();
 		
 		TMap<FString, FGitSourceControlState> UpdatedStates;
-		InCommand.bCommandSuccessful = GitSourceControlUtils::RunUpdateStatus(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, InCommand.bUsingGitLfsLocking, ProjectDirs, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
+		InCommand.bCommandSuccessful = RunUpdateStatusForCommand(InCommand, ProjectDirs, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
 		GitSourceControlUtils::RemoveRedundantErrors(InCommand, TEXT("' is outside repository"));
 		if (InCommand.bCommandSuccessful)
 		{
@@ -1173,7 +1205,7 @@ bool FGitCopyWorker::Execute(FGitSourceControlCommand& InCommand)
 	else
 	{
 		TMap<FString, FGitSourceControlState> UpdatedStates;
-		const bool bSuccess = GitSourceControlUtils::RunUpdateStatus(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, InCommand.bUsingGitLfsLocking, InCommand.Files, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
+		const bool bSuccess = RunUpdateStatusForCommand(InCommand, InCommand.Files, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
 		GitSourceControlUtils::RemoveRedundantErrors(InCommand, TEXT("' is outside repository"));
 		if (bSuccess)
 		{
@@ -1204,7 +1236,7 @@ bool FGitResolveWorker::Execute( class FGitSourceControlCommand& InCommand )
 
 	// now update the status of our files
 	TMap<FString, FGitSourceControlState> UpdatedStates;
-	const bool bSuccess = GitSourceControlUtils::RunUpdateStatus(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, InCommand.bUsingGitLfsLocking, InCommand.Files, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
+	const bool bSuccess = RunUpdateStatusForCommand(InCommand, InCommand.Files, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
 	GitSourceControlUtils::RemoveRedundantErrors(InCommand, TEXT("' is outside repository"));
 	if (bSuccess)
 	{
@@ -1250,7 +1282,7 @@ bool FGitMoveToChangelistWorker::Execute(FGitSourceControlCommand& InCommand)
 	if (bResult)
 	{
 		TMap<FString, FGitSourceControlState> DummyStates;
-		GitSourceControlUtils::RunUpdateStatus(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, InCommand.bUsingGitLfsLocking, InCommand.Files, InCommand.ResultInfo.InfoMessages, DummyStates);
+		RunUpdateStatusForCommand(InCommand, InCommand.Files, InCommand.ResultInfo.InfoMessages, DummyStates);
 	}
 	return bResult;
 }

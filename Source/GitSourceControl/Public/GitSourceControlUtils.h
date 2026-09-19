@@ -106,15 +106,45 @@ private:
 
 namespace GitSourceControlUtils
 {
+	/**
+	 * 解析状态命令应采用的 LFS 权限模式；设置代次变化时，只要旧命令或新设置任一启用
+	 * LFS，就保持权限收敛，避免旧命令在新锁模式下放开文件。
+	 */
+	bool IsLfsReadOnlyPolicyActive(
+		bool bInCommandUsingGitLfsLocking,
+		bool bInSettingsSuperseded,
+		bool bInCurrentSettingsUsingGitLfsLocking);
 
+	/** 根据锁模式和类型化状态决定是否保持、设置或清除本地只读位。 */
+	EGitLocalReadOnlyPolicy GetLocalReadOnlyPolicy(
+		const FGitSourceControlState& InState,
+		bool bInUsingGitLfsLocking);
 
+	/**
+	 * 把单端 LFS 的增删事实与认证所有权投影到完整状态；显示用户名不参与权限判断。
+	 * 解锁干净既有文件会显式恢复只读；普通 status 的 Clean+NotLocked 仍可 Preserve 手工 writable 窗口。
+	 * Projects one single-endpoint LFS listing transition into a complete cached state. The resulting
+	 * complete state plus transition provenance owns the permission decision.
+	 */
+	EGitLocalReadOnlyPolicy ApplyLegacyLfsLockStateTransition(
+		FGitSourceControlState& InOutState,
+		const FString& InLockUser,
+		bool bInLocked,
+		bool bInOwnedByCurrentCredential);
 
+	/**
+	 * 把只读策略应用到磁盘文件；未知策略、文件不存在或属性修改失败时，不改盘、返回 false，
+	 * 并始终写入 Output Log 与 Source Control Message Log。
+	 * @param OutFailureReason 失败时接收含文件路径与目标权限的中文原因；成功时清空；可为 nullptr。
+	 */
+	bool ApplyLocalReadOnlyPolicy(
+		const FString& InFilename,
+		EGitLocalReadOnlyPolicy InPolicy,
+		FString* OutFailureReason = nullptr);
 
-
-
-
-
-
+	/** 只有启用 LFS 锁工作流时才消费锁缓存及其状态转换。 */
+	bool ShouldUseLegacyLfsLockCache(
+		bool bInUsingGitLfsLocking);
 
 	/**
 		*  Returns an updated repo root if all selected files are in a plugin subfolder, and the plugin subfolder is a git repo
@@ -328,11 +358,23 @@ bool RunCommit(const FString& InPathToGitBinary, const FString& InRepositoryRoot
  * @param[in]	InPathToGitBinary	The path to the Git binary
  * @param[in]	InRepositoryRoot	The Git repository from where to run the command - usually the Game directory (can be empty)
  * @param[in]	InUsingLfsLocking	Tells if using the Git LFS file Locking workflow
+ * @param[in]	InSettingsUsingLfsLocking	执行时设置是否仍启用 LFS 锁 / Whether current settings still enable LFS locking
+ * @param[in]	InSettingsGeneration	命令捕获的一致设置代次 / Coherent settings generation captured by this command
  * @param[in]	InFiles				List of files in a directory, or the path to the directory itself (never empty).
  * @param[out]	InResults			Results from the "status" command
  * @param[out]	OutStates			States of files for witch the status has been gathered (distinct than InFiles in case of a "directory status")
+ * @param[out]	InOutSettingsSuperseded	旧命令快照生成 fail-closed 状态时置位 / Set when an obsolete command snapshot produced fail-closed states
  */
-GITSOURCECONTROL_API void ParseStatusResults( const FString & InPathToGitBinary, const FString & InRepositoryRoot, const bool InUsingLfsLocking, const TArray< FString > & InFiles, const TMap< FString, FString > & InResults, TMap< FString, FGitSourceControlState > & OutStates );
+GITSOURCECONTROL_API void ParseStatusResults(
+	const FString& InPathToGitBinary,
+	const FString& InRepositoryRoot,
+	bool InUsingLfsLocking,
+	bool InSettingsUsingLfsLocking,
+	uint64 InSettingsGeneration,
+	const TArray<FString>& InFiles,
+	const TMap<FString, FString>& InResults,
+	TMap<FString, FGitSourceControlState>& OutStates,
+	bool& InOutSettingsSuperseded);
 
 /**
  * Checks remote branches to see file differences.
@@ -357,8 +399,16 @@ void CheckRemote(const FString& InPathToGitBinary, const FString& InRepositoryRo
  * @param   OutStates           The resultant states
  * @returns true if the command succeeded and returned no errors
  */
-bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool InUsingLfsLocking, const TArray<FString>& InFiles,
-					 TArray<FString>& OutErrorMessages, TMap<FString, FGitSourceControlState>& OutStates);
+bool RunUpdateStatus(
+	const FString& InPathToGitBinary,
+	const FString& InRepositoryRoot,
+	bool InUsingLfsLocking,
+	bool InSettingsUsingLfsLocking,
+	uint64 InSettingsGeneration,
+	const TArray<FString>& InFiles,
+	TArray<FString>& OutErrorMessages,
+	TMap<FString, FGitSourceControlState>& OutStates,
+	bool& InOutSettingsSuperseded);
 
 #if ENGINE_MAJOR_VERSION == 5
 /**

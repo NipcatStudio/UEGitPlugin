@@ -941,7 +941,13 @@ void FGitSourceControlProvider::CancelOperation( const FSourceControlOperationRe
 
 bool FGitSourceControlProvider::UsesLocalReadOnlyState() const
 {
-	return bUsingGitLfsLocking; // Git LFS Lock uses read-only state
+	// 只有 LFS 模式把磁盘只读位作为 Provider 受控状态。ordinary Git 由 Unlockable 的
+	// IsCheckedOut 兼容投影满足 UE 保存/SettingsHelpers；若这里也返回 true，UE 会把仓库中
+	// 所有默认可写文件误收进 Uncontrolled Changelists。
+	// Only LFS mode makes the disk bit provider-managed state. Ordinary Git uses the Unlockable
+	// IsCheckedOut adapter for UE save/SettingsHelpers consumers. Returning true here as well would
+	// put every normally writable repository file into Uncontrolled Changelists.
+	return bUsingGitLfsLocking;
 }
 
 bool FGitSourceControlProvider::UsesChangelists() const
@@ -1135,8 +1141,13 @@ void FGitSourceControlProvider::OnBackgroundRefreshComplete(
 
 void FGitSourceControlProvider::Tick()
 {
+	// 初始化结果和周期刷新都只在 Provider Tick 消费/提交，因此 Close 能完整等待同一
+	// FAsyncTask/CommandQueue 所有权链，不存在游离 GT continuation。
+	// Initialization results and periodic refreshes are consumed/submitted only from provider Tick,
+	// so Close can drain the same FAsyncTask/CommandQueue ownership chain with no detached GT task.
 	FinalizeRepositoryInitialization(false, true);
 	StartBackgroundRefreshIfDue();
+
 #if ENGINE_MAJOR_VERSION < 5
 	bool bStatesUpdated = false;
 #else
@@ -1147,31 +1158,40 @@ void FGitSourceControlProvider::Tick()
 	}
 #endif
 
-	// Apply lock transitions observed by the lock cache (background listings, our own
-	// lock/unlock) to the per-file state cache. A state computed while the lock cache was
-	// momentarily wrong - eventually-consistent listings around editor startup - would
-	// otherwise keep showing a checkout badge for a lock released long ago, until something
-	// happened to re-query that specific file.
-	TArray<FGitLockedFilesCache::FLockStateFixup> LockStateFixups = FGitLockedFilesCache::TakePendingStateFixups();
-	if (LockStateFixups.Num() > 0)
+	// 锁转换必须等所有已排队 worker 提交新鲜 Git 状态；全局 fixup 可能由另一个并发 command
+	// 先产生，若由首个完成 command 提前消费，仍会在旧 Modified+Locked 上错误计算 Writable。
+	// Lock transitions must wait until every queued worker has committed fresh Git state. A global
+	// fixup may have been produced early by another concurrent command; letting the first completed
+	// command drain it would still compute Writable from stale Modified+Locked state.
+	auto ApplyPendingLegacyLfsLockStateFixups = [this]() -> bool
 	{
-		const FString& MyLockUser = GetLockUser();
+		TArray<FGitLockedFilesCache::FLockStateFixup> LockStateFixups =
+			FGitLockedFilesCache::TakePendingStateFixups();
+		if (!GitSourceControlUtils::ShouldUseLegacyLfsLockCache(
+				bUsingGitLfsLocking)
+			|| LockStateFixups.IsEmpty())
+		{
+			return false;
+		}
 		for (const FGitLockedFilesCache::FLockStateFixup& Fixup : LockStateFixups)
 		{
 			TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> State = GetStateInternal(Fixup.FilePath);
-			if (Fixup.bLocked)
+			const EGitLocalReadOnlyPolicy PermissionPolicy =
+				GitSourceControlUtils::ApplyLegacyLfsLockStateTransition(
+					*State,
+					Fixup.LockUser,
+					Fixup.bLocked,
+					FGitLockedFilesCache::IsOwnedByCurrentCredential(Fixup.FilePath));
+			if (FPaths::FileExists(Fixup.FilePath))
 			{
-				State->State.LockState = (Fixup.LockUser == MyLockUser) ? ELockState::Locked : ELockState::LockedOther;
-				State->State.LockUser = Fixup.LockUser;
-			}
-			else
-			{
-				State->State.LockState = ELockState::NotLocked;
-				State->State.LockUser.Empty();
+				GitSourceControlUtils::ApplyLocalReadOnlyPolicy(
+					Fixup.FilePath,
+					PermissionPolicy);
 			}
 		}
-		bStatesUpdated = true;
-	}
+		return true;
+	};
+	bool bLockTransitionsApplied = false;
 
 	for (int32 CommandIndex = 0; CommandIndex < CommandQueue.Num(); ++CommandIndex)
 	{
@@ -1188,8 +1208,20 @@ void FGitSourceControlProvider::Tick()
 				UpdateRepositoryStatus(Command);
 			}
 
-			// let command update the states of any files
-			bStatesUpdated |= Command.Worker->UpdateStates();
+			// 先落当前 worker 的 clean/modified；只有其余 command 也已排空，才消费可能由任一
+			// worker 产生的全局 lock/unlock fixup。
+			// Commit the current worker's clean/modified facts first. Drain global lock/unlock fixups,
+			// which may come from any worker, only after every other command has also left the queue.
+			const bool bCommandQueueQuiescent = CommandQueue.IsEmpty();
+			bStatesUpdated |=
+				GitSourceControlOperations::RunFreshStateCommitBeforeLockTransitions(
+					[&Command]()
+					{
+						return Command.Worker->UpdateStates();
+					},
+					bCommandQueueQuiescent,
+					ApplyPendingLegacyLfsLockStateFixups);
+			bLockTransitionsApplied = bCommandQueueQuiescent;
 
 			// dump any messages to output log
 			OutputCommandMessages(Command);
@@ -1220,6 +1252,11 @@ void FGitSourceControlProvider::Tick()
 			Command.ReturnResults();
 			break;
 		}
+	}
+
+	if (!bLockTransitionsApplied && CommandQueue.IsEmpty())
+	{
+		bStatesUpdated |= ApplyPendingLegacyLfsLockStateFixups();
 	}
 
 	if (bStatesUpdated)

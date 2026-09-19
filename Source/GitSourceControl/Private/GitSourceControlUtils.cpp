@@ -257,14 +257,15 @@ TMap<FString, FString> FGitLockedFilesCache::UpdateFromServerListing(const FStri
 
 void FGitLockedFilesCache::OnFileLockChanged(const FString& filePath, const FString& lockUser, bool locked)
 {
-	const FString& LfsUserName = FGitSourceControlModule::Get().GetProvider().GetLockUser();
-	if (LfsUserName == lockUser)
+	FGitSourceControlModule* Module = FGitSourceControlModule::GetThreadSafe();
+	if (!Module)
 	{
-		FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*filePath, !locked);
+		return;
 	}
 	// Propagate the transition to the per-file state cache (applied on the game thread by
-	// the provider's Tick). FCriticalSection is recursive, so taking the mutex here is safe
-	// whether or not the caller already holds it.
+	// the provider's Tick). Only that complete cached state knows whether an unlock should preserve
+	// a clean file or keep an offline-modified file writable. FCriticalSection is recursive, so
+	// taking the mutex here is safe whether or not the caller already holds it.
 	{
 		FScopeLock Lock(&LockedFilesMutex);
 		PendingStateFixups.Add({ filePath, lockUser, locked });
@@ -279,15 +280,174 @@ TArray<FGitLockedFilesCache::FLockStateFixup> FGitLockedFilesCache::TakePendingS
 
 namespace GitSourceControlUtils
 {
+bool IsLfsReadOnlyPolicyActive(
+	bool bInCommandUsingGitLfsLocking,
+	bool bInSettingsSuperseded,
+	bool bInCurrentSettingsUsingGitLfsLocking)
+{
+	return bInCommandUsingGitLfsLocking
+		|| (bInSettingsSuperseded
+			&& bInCurrentSettingsUsingGitLfsLocking);
+}
 
+EGitLocalReadOnlyPolicy GetLocalReadOnlyPolicy(
+	const FGitSourceControlState& InState,
+	bool bInUsingGitLfsLocking)
+{
+	if (!bInUsingGitLfsLocking)
+	{
+		return EGitLocalReadOnlyPolicy::Preserve;
+	}
 
+	if (InState.State.LockState == ELockState::LockedOther)
+	{
+		return EGitLocalReadOnlyPolicy::ReadOnly;
+	}
 
+	if (InState.State.LockState == ELockState::Locked)
+	{
+		return EGitLocalReadOnlyPolicy::Writable;
+	}
 
+	if (InState.IsAdded())
+	{
+		const bool bHasWorkableLockState = InState.State.LockState == ELockState::NotLocked
+			|| InState.State.LockState == ELockState::Unlockable;
+		return bHasWorkableLockState
+			? EGitLocalReadOnlyPolicy::Writable
+			: EGitLocalReadOnlyPolicy::ReadOnly;
+	}
 
+	if (InState.IsSourceControlled()
+		&& (InState.State.LockState == ELockState::Unknown
+			|| InState.State.LockState == ELockState::Unset))
+	{
+		// 单端 LFS 的未知/未初始化锁状态不能保留历史 writable 位；UE 在
+		// UsesLocalReadOnlyState 模式按物理位直接放行保存，会绕过 CanEdit。
+		// Unknown/unset single-endpoint LFS state cannot preserve a stale writable bit. In
+		// UsesLocalReadOnlyState mode UE authorizes Save from the physical bit and bypasses CanEdit.
+		return EGitLocalReadOnlyPolicy::ReadOnly;
+	}
 
+	if (InState.State.LockState == ELockState::NotLocked
+		&& InState.IsModified()
+		&& InState.IsSourceControlled())
+	{
+		return EGitLocalReadOnlyPolicy::Writable;
+	}
 
+	return EGitLocalReadOnlyPolicy::Preserve;
+}
 
+EGitLocalReadOnlyPolicy ApplyLegacyLfsLockStateTransition(
+	FGitSourceControlState& InOutState,
+	const FString& InLockUser,
+	bool bInLocked,
+	bool bInOwnedByCurrentCredential)
+{
+	if (bInLocked)
+	{
+		InOutState.State.LockState = bInOwnedByCurrentCredential
+			? ELockState::Locked
+			: ELockState::LockedOther;
+		InOutState.State.LockUser = InLockUser;
+	}
+	else
+	{
+		InOutState.State.LockState = ELockState::NotLocked;
+		InOutState.State.LockUser.Reset();
+	}
 
+	const EGitLocalReadOnlyPolicy StatePolicy = GetLocalReadOnlyPolicy(
+		InOutState,
+		true);
+	if (!bInLocked
+		&& StatePolicy == EGitLocalReadOnlyPolicy::Preserve
+		&& InOutState.IsSourceControlled()
+		&& !InOutState.IsAdded())
+	{
+		// 锁移除是确定的生命周期边界：干净既有文件必须恢复只读。普通 status 的
+		// Clean+NotLocked 不走这里，仍可 Preserve “Make Writable 后尚未产生 diff”的窗口。
+		// Lock removal is a definite lifecycle boundary, so a clean existing file returns to read-only.
+		// Ordinary Clean+NotLocked status bypasses this block and preserves the pre-diff writable window.
+		return EGitLocalReadOnlyPolicy::ReadOnly;
+	}
+	return StatePolicy;
+}
+
+bool ApplyLocalReadOnlyPolicy(
+	const FString& InFilename,
+	EGitLocalReadOnlyPolicy InPolicy,
+	FString* OutFailureReason)
+{
+	if (OutFailureReason)
+	{
+		OutFailureReason->Reset();
+	}
+
+	auto ReportFailure = [OutFailureReason](const FString& InReason)
+	{
+		if (OutFailureReason)
+		{
+			*OutFailureReason = InReason;
+		}
+		UE_LOG(LogSourceControl, Warning, TEXT("%s"), *InReason);
+		FTSMessageLog PermissionLog("SourceControl");
+		PermissionLog.Warning(FText::FromString(InReason));
+		return false;
+	};
+
+	const TCHAR* TargetPermission = nullptr;
+	bool bShouldBeReadOnly = false;
+	switch (InPolicy)
+	{
+	case EGitLocalReadOnlyPolicy::Preserve:
+		return true;
+	case EGitLocalReadOnlyPolicy::ReadOnly:
+		TargetPermission = TEXT("只读");
+		bShouldBeReadOnly = true;
+		break;
+	case EGitLocalReadOnlyPolicy::Writable:
+		TargetPermission = TEXT("可写");
+		bShouldBeReadOnly = false;
+		break;
+	default:
+		return ReportFailure(FString::Printf(
+			TEXT("本地文件权限收敛失败：目标=未知策略(%d)，未修改文件：%s"),
+			static_cast<int32>(InPolicy),
+			*InFilename));
+	}
+
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	if (!PlatformFile.FileExists(*InFilename))
+	{
+		return ReportFailure(FString::Printf(
+			TEXT("本地文件权限收敛失败：目标=%s；文件不存在：%s"),
+			TargetPermission,
+			*InFilename));
+	}
+
+	if (PlatformFile.IsReadOnly(*InFilename) == bShouldBeReadOnly)
+	{
+		return true;
+	}
+
+	if (PlatformFile.SetReadOnly(*InFilename, bShouldBeReadOnly))
+	{
+		return true;
+	}
+
+	return ReportFailure(FString::Printf(
+		TEXT("本地文件权限收敛失败：目标=%s；无法修改文件属性：%s"),
+		TargetPermission,
+		*InFilename));
+}
+
+bool ShouldUseLegacyLfsLockCache(
+	bool bInUsingGitLfsLocking)
+{
+	return bInUsingGitLfsLocking;
+}
 
 	FString ChangeRepositoryRootIfSubmodule(TArray<FString>& AbsoluteFilePaths, const FString& PathToRepositoryRoot)
 	{
@@ -1774,20 +1934,51 @@ R  Content/Textures/T_Perlin_Noise_M.uasset -> Content/Textures/T_Perlin_Noise_M
 ?? Content/Materials/M_Basic_Wall.uasset
 !! BasicCode.sln
 */
-static void ParseFileStatusResult(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool InUsingLfsLocking, const TSet<FString>& InFiles,
-								  const TMap<FString, FString>& InResults, TMap<FString, FGitSourceControlState>& OutStates)
+static void ParseFileStatusResult(
+	const FString& InPathToGitBinary,
+	const FString& InRepositoryRoot,
+	bool InUsingLfsLocking,
+	bool InSettingsUsingLfsLocking,
+	uint64 InSettingsGeneration,
+	const TSet<FString>& InFiles,
+	const TMap<FString, FString>& InResults,
+	TMap<FString, FGitSourceControlState>& OutStates,
+	bool& InOutSettingsSuperseded)
 {
 	FGitSourceControlModule* GitSourceControl = FGitSourceControlModule::GetThreadSafe();
 	if (!GitSourceControl)
 	{
 		return;
 	}
-	FGitSourceControlProvider& Provider = GitSourceControl->GetProvider();
-	const FString& LfsUserName = Provider.GetLockUser();
+	const FGitLockSettingsSnapshot SettingsSnapshot =
+		GitSourceControl->AccessSettings().GetLockSettingsSnapshot();
+	const bool bSettingsSuperseded =
+		SettingsSnapshot.Generation != InSettingsGeneration
+		|| SettingsSnapshot.bUsingGitLfsLocking
+			!= InSettingsUsingLfsLocking;
+	InOutSettingsSuperseded |= bSettingsSuperseded;
+	const bool bTreatAsLfsLocking = IsLfsReadOnlyPolicyActive(
+		InUsingLfsLocking,
+		bSettingsSuperseded,
+		SettingsSnapshot.bUsingGitLfsLocking);
+	auto IsSettingsSnapshotCurrent = [
+		GitSourceControl,
+		InSettingsGeneration,
+		InSettingsUsingLfsLocking
+	]()
+	{
+		const FGitLockSettingsSnapshot Current =
+			GitSourceControl->AccessSettings()
+				.GetLockSettingsSnapshot();
+		return Current.Generation == InSettingsGeneration
+			&& Current.bUsingGitLfsLocking
+				== InSettingsUsingLfsLocking;
+	};
 
 	TMap<FString, FString> LockedFiles;
 	TMap<FString, FString> Results = InResults;
 	bool bCheckedLockedFiles = false;
+	bool bProjectionSettingsSuperseded = false;
 
 	FString Result;
 
@@ -1837,7 +2028,7 @@ static void ParseFileStatusResult(const FString& InPathToGitBinary, const FStrin
 #endif
 			}
 		}
-		if (!InUsingLfsLocking)
+		if (!bTreatAsLfsLocking)
 		{
 			FileState.State.LockState = ELockState::Unlockable;
 		}
@@ -1845,21 +2036,70 @@ static void ParseFileStatusResult(const FString& InPathToGitBinary, const FStrin
 		{
 			if (IsFileLFSLockable(File))
 			{
-				if (!bCheckedLockedFiles)
+				bool bFileSettingsSuperseded =
+					bSettingsSuperseded;
+				if (bFileSettingsSuperseded)
+				{
+					// 过期命令绝不能在新配置下投影旧 owner/列表结果。所有 lockable 状态先
+					// 失败关闭，下一次 Provider Tick 会提交同代刷新。
+					// A superseded command must never project an old owner or listing under new
+					// settings. Fail every lockable state closed until the provider submits a
+					// same-generation refresh on its next tick.
+					FileState.State.LockUser =
+						TEXT("锁配置已变化，等待刷新");
+					FileState.State.LockState = ELockState::LockedOther;
+				}
+				else if (!bCheckedLockedFiles)
 				{
 					bCheckedLockedFiles = true;
 					TArray<FString> ErrorMessages;
-					GetAllLocks(InRepositoryRoot, InPathToGitBinary, ErrorMessages, LockedFiles);
+					{
+						GetAllLocks(
+							InRepositoryRoot,
+							InPathToGitBinary,
+							ErrorMessages,
+							LockedFiles);
+					}
+					// 一次远端合并只核对一次投影边界。逐文件启动 symbolic-ref 会让全项目
+					// 刷新产生数千进程，却不能消除检查后的理论切分支窗口。
+					// Evaluate one projection boundary per remote merge. Spawning symbolic-ref per
+					// file creates thousands of processes during a project-wide refresh without
+					// eliminating the theoretical post-check branch-switch window.
+					bProjectionSettingsSuperseded =
+						!IsSettingsSnapshotCurrent();
+					if (bProjectionSettingsSuperseded)
+					{
+						InOutSettingsSuperseded = true;
+					}
+
 					FTSMessageLog SourceControlLog("SourceControl");
 					for (int32 ErrorIndex = 0; ErrorIndex < ErrorMessages.Num(); ++ErrorIndex)
 					{
 						SourceControlLog.Error(FText::FromString(ErrorMessages[ErrorIndex]));
 					}
 				}
-				if (LockedFiles.Contains(File))
+				if (!bFileSettingsSuperseded
+					&& bProjectionSettingsSuperseded)
+				{
+					// 网络列表返回后再次核对代次，防止设置在等待期间变化后仍把旧结果放开。
+					// Recheck the generation after network listing so a settings change while waiting
+					// cannot make an obsolete result writable.
+					bFileSettingsSuperseded = true;
+					InOutSettingsSuperseded = true;
+					FileState.State.LockUser =
+						TEXT("锁配置已变化，等待刷新");
+					FileState.State.LockState =
+						ELockState::LockedOther;
+				}
+				if (bFileSettingsSuperseded)
+				{
+					// 已在上方失败关闭，不接受旧设置的锁状态。
+					// Already failed closed; reject lock state from the old settings.
+				}
+				else if (LockedFiles.Contains(File))
 				{
 					FileState.State.LockUser = LockedFiles[File];
-					if (LfsUserName == FileState.State.LockUser)
+					if (FGitLockedFilesCache::IsOwnedByCurrentCredential(File))
 					{
 						FileState.State.LockState = ELockState::Locked;
 					}
@@ -1875,33 +2115,27 @@ static void ParseFileStatusResult(const FString& InPathToGitBinary, const FStrin
 					UE_LOG(LogSourceControl, Log, TEXT("Status(%s) Not Locked"), *File);
 #endif
 				}
-				// The editor fully trusts UsesLocalReadOnlyState(): for any state it considers
-				// checked out it skips both the checkout and the "Make Writable" prompts and writes
-				// straight to disk, so a stale read-only bit turns Save into a hard "file is
-				// read-only" failure. IsCheckedOut() covers more than our own locks: it is also
-				// true for locally modified files nobody has locked. The bit goes stale behind our
-				// back - git-lfs re-applies read-only to every 'lockable' file it has no local lock
-				// record for on any hook that touches the tree state (post-checkout, post-merge,
-				// and notably post-commit: ANY commit in the repo re-flags them). Staged new files
-				// (Added) are hit hardest - they never had a lock, so every commit makes them
-				// read-only again. Both checked-out and added files are ours to edit (CanEdit), so
-				// re-assert the invariant each time we recompute a state; files locked by someone
-				// else are never touched (LockedOther is not considered checked out).
-				if (FileState.IsCheckedOut() || FileState.IsAdded())
+
+				// git-lfs hook 可在 checkout/merge/commit 后重写 lockable 文件的只读位。状态刷新
+				// 必须按独立策略恢复磁盘不变量，不能再把 IsCheckedOut 当作本地权限代理。
+				// git-lfs hooks may rewrite lockable file attributes after checkout, merge, or commit.
+				// Status refresh restores the disk invariant through an independent policy instead of
+				// treating IsCheckedOut as a proxy for local permissions.
+				const EGitLocalReadOnlyPolicy LocalReadOnlyPolicy =
+					GetLocalReadOnlyPolicy(
+						FileState,
+						bTreatAsLfsLocking);
+				if (FPaths::FileExists(File))
 				{
-					IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
-					if (PlatformFile.FileExists(*File) && PlatformFile.IsReadOnly(*File))
-					{
-						PlatformFile.SetReadOnly(*File, false);
-					}
+					ApplyLocalReadOnlyPolicy(File, LocalReadOnlyPolicy);
 				}
 			}
 			else
 			{
 				FileState.State.LockState = ELockState::Unlockable;
 			}
-			
-			
+
+
 #if UE_BUILD_DEBUG && GIT_DEBUG_STATUS
 			UE_LOG(LogSourceControl, Log, TEXT("Status(%s) Locked by '%s'"), *File, *FileState.State.LockUser);
 #endif
@@ -1914,8 +2148,16 @@ static void ParseFileStatusResult(const FString& InPathToGitBinary, const FStrin
 	ParseDirectoryStatusResult(InUsingLfsLocking, Results, OutStates);
 }
 
-void ParseStatusResults(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool InUsingLfsLocking, const TArray<FString>& InFiles,
-							   const TMap<FString, FString>& InResults, TMap<FString, FGitSourceControlState>& OutStates)
+void ParseStatusResults(
+	const FString& InPathToGitBinary,
+	const FString& InRepositoryRoot,
+	bool InUsingLfsLocking,
+	bool InSettingsUsingLfsLocking,
+	uint64 InSettingsGeneration,
+	const TArray<FString>& InFiles,
+	const TMap<FString, FString>& InResults,
+	TMap<FString, FGitSourceControlState>& OutStates,
+	bool& InOutSettingsSuperseded)
 {
 	TSet<FString> Files;
 	for (const auto& File : InFiles)
@@ -1937,7 +2179,16 @@ void ParseStatusResults(const FString& InPathToGitBinary, const FString& InRepos
 			Files.Add(File);
 		}
 	}
-	ParseFileStatusResult(InPathToGitBinary, InRepositoryRoot, InUsingLfsLocking, Files, InResults, OutStates);
+	ParseFileStatusResult(
+		InPathToGitBinary,
+		InRepositoryRoot,
+		InUsingLfsLocking,
+		InSettingsUsingLfsLocking,
+		InSettingsGeneration,
+		Files,
+		InResults,
+		OutStates,
+		InOutSettingsSuperseded);
 }
 
 void CheckRemote(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& Files,
@@ -2107,13 +2358,20 @@ static void EnsureOwnLocksWritable(const TMap<FString, FString>& InLocks)
 	{
 		return;
 	}
-	const FString& LockUser = GitSourceControl->GetProvider().GetLockUser();
-	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	const FGitLockSettingsSnapshot Settings =
+		GitSourceControl->AccessSettings().GetLockSettingsSnapshot();
+	if (!GitSourceControlUtils::ShouldUseLegacyLfsLockCache(
+			Settings.bUsingGitLfsLocking))
+	{
+		return;
+	}
 	for (const auto& Lock : InLocks)
 	{
-		if (Lock.Value == LockUser && PlatformFile.FileExists(*Lock.Key) && PlatformFile.IsReadOnly(*Lock.Key))
+		if (FGitLockedFilesCache::IsOwnedByCurrentCredential(Lock.Key) && FPaths::FileExists(Lock.Key))
 		{
-			PlatformFile.SetReadOnly(*Lock.Key, false);
+			GitSourceControlUtils::ApplyLocalReadOnlyPolicy(
+				Lock.Key,
+				EGitLocalReadOnlyPolicy::Writable);
 		}
 	}
 }
@@ -2247,8 +2505,16 @@ bool UpdateChangelistStateByCommand()
 #endif
 
 // Run a batch of Git "status" command to update status of given files and/or directories.
-bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool InUsingLfsLocking, const TArray<FString>& InFiles,
-					 TArray<FString>& OutErrorMessages, TMap<FString, FGitSourceControlState>& OutStates)
+bool RunUpdateStatus(
+	const FString& InPathToGitBinary,
+	const FString& InRepositoryRoot,
+	bool InUsingLfsLocking,
+	bool InSettingsUsingLfsLocking,
+	uint64 InSettingsGeneration,
+	const TArray<FString>& InFiles,
+	TArray<FString>& OutErrorMessages,
+	TMap<FString, FGitSourceControlState>& OutStates,
+	bool& InOutSettingsSuperseded)
 {
 	// Remove files that aren't in the repository
 	const TArray<FString>& RepoFiles = InFiles.FilterByPredicate([InRepositoryRoot](const FString& File) { return File.StartsWith(InRepositoryRoot); });
@@ -2264,7 +2530,13 @@ bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InReposito
 	// We skip checking ignored since no one ignores files that Unreal would read in as revision controlled (Content/{*.uasset,*.umap},Config/*.ini).
 	TArray<FString> Results;
 	// avoid locking the index when not needed (useful for status updates)
-	const bool bResult = RunCommand(TEXT("--no-optional-locks status"), InPathToGitBinary, InRepositoryRoot, Parameters, RepoFiles, Results, OutErrorMessages);
+	const bool bResult = RunStatusWithLiteralPaths(
+		InPathToGitBinary,
+		InRepositoryRoot,
+		Parameters,
+		RepoFiles,
+		Results,
+		OutErrorMessages);
 	TMap<FString, FString> ResultsMap;
 	for (const auto& Result : Results)
 	{
@@ -2274,7 +2546,16 @@ bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InReposito
 	}
 	if (bResult)
 	{
-		ParseStatusResults(InPathToGitBinary, InRepositoryRoot, InUsingLfsLocking, RepoFiles, ResultsMap, OutStates);
+		ParseStatusResults(
+			InPathToGitBinary,
+			InRepositoryRoot,
+			InUsingLfsLocking,
+			InSettingsUsingLfsLocking,
+			InSettingsGeneration,
+			RepoFiles,
+			ResultsMap,
+			OutStates,
+			InOutSettingsSuperseded);
 	}
 
 #if ENGINE_MAJOR_VERSION == 5
@@ -2723,7 +3004,7 @@ bool UpdateCachedStates(const TMap<const FString, FGitState>& InResults)
 	{
 		return false;
 	}
-	
+
 	FGitSourceControlModule* GitSourceControl = FGitSourceControlModule::GetThreadSafe();
 	if (!GitSourceControl)
 	{
@@ -2790,7 +3071,7 @@ bool CollectNewStates(const TMap<FString, FGitSourceControlState>& InStates, TMa
 	{
 		return false;
 	}
-	
+
 	for (const auto& InState : InStates)
 	{
 		// These states come from parsing real 'git status' output: mark them as ground truth so

@@ -174,4 +174,322 @@ bool FGitSourceControlRemoteScopeTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FGitSourceControlLiteralPathScopeTest,
+	"GitSourceControl.State.LiteralPathScope",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitSourceControlLiteralPathScopeTest::RunTest(const FString& Parameters)
+{
+	const FString GitBinary = GetAutomationTestGitBinary();
+	TestTrue(TEXT("路径范围集成测试需要可用 Git"), !GitBinary.IsEmpty());
+	if (GitBinary.IsEmpty())
+	{
+		return false;
+	}
+
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	const FString TempRepository = FPaths::ConvertRelativePathToFull(
+		FPaths::Combine(
+			FPaths::ProjectSavedDir(),
+			TEXT("Automation"),
+			FString::Printf(
+				TEXT("UEGitLiteralPath-%s"),
+				*FGuid::NewGuid().ToString(EGuidFormats::Digits))));
+	TestTrue(
+		TEXT("应创建路径范围集成测试仓库"),
+		PlatformFile.CreateDirectoryTree(*TempRepository));
+	ON_SCOPE_EXIT
+	{
+		if (PlatformFile.DirectoryExists(*TempRepository))
+		{
+			PlatformFile.DeleteDirectoryRecursively(*TempRepository);
+		}
+	};
+	if (!PlatformFile.DirectoryExists(*TempRepository))
+	{
+		return false;
+	}
+
+	TArray<FString> Results;
+	TArray<FString> Errors;
+	TestTrue(
+		TEXT("应初始化路径范围集成测试仓库"),
+		GitSourceControlUtils::RunCommand(
+			TEXT("init"),
+			GitBinary,
+			TempRepository,
+			FGitSourceControlModule::GetEmptyStringArray(),
+			FGitSourceControlModule::GetEmptyStringArray(),
+			Results,
+			Errors));
+	Results.Reset();
+	Errors.Reset();
+	TestTrue(
+		TEXT("测试仓库应显式模拟 Git 默认路径转义"),
+		GitSourceControlUtils::RunCommand(
+			TEXT("config"),
+			GitBinary,
+			TempRepository,
+			TArray<FString>{TEXT("core.quotepath"), TEXT("true")},
+			FGitSourceControlModule::GetEmptyStringArray(),
+			Results,
+			Errors));
+	Results.Reset();
+	Errors.Reset();
+	TestTrue(
+		TEXT("测试仓库应设置本地提交身份"),
+		GitSourceControlUtils::RunCommand(
+			TEXT("config"),
+			GitBinary,
+			TempRepository,
+			TArray<FString>{TEXT("user.name"), TEXT("UEGit Automation")},
+			FGitSourceControlModule::GetEmptyStringArray(),
+			Results,
+			Errors));
+	Results.Reset();
+	Errors.Reset();
+	TestTrue(
+		TEXT("测试仓库应设置本地提交邮箱"),
+		GitSourceControlUtils::RunCommand(
+			TEXT("config"),
+			GitBinary,
+			TempRepository,
+			TArray<FString>{TEXT("user.email"), TEXT("uegit-automation@example.invalid")},
+			FGitSourceControlModule::GetEmptyStringArray(),
+			Results,
+			Errors));
+	TestTrue(
+		TEXT("测试仓库应显式声明 .uasset 为 lockable"),
+		FFileHelper::SaveStringToFile(
+			TEXT("*.uasset lockable\n*.umap lockable\n"),
+			*FPaths::Combine(TempRepository, TEXT(".gitattributes"))));
+	Errors.Reset();
+	TestTrue(
+		TEXT("Unicode 路径测试应初始化自己的 LFS lockable 规则"),
+		GitSourceControlUtils::CheckLFSLockable(
+			GitBinary,
+			TempRepository,
+			{TEXT("*.uasset"), TEXT("*.umap")},
+			Errors));
+
+	const FString RelativeTrackedPath = TEXT("Content/中文 已跟踪.uasset");
+	const FString AbsoluteTrackedPath = FPaths::Combine(
+		TempRepository,
+		RelativeTrackedPath);
+	TestTrue(
+		TEXT("应创建中文已跟踪资产目录"),
+		PlatformFile.CreateDirectoryTree(*FPaths::GetPath(AbsoluteTrackedPath)));
+	TestTrue(
+		TEXT("应创建中文已跟踪资产基线"),
+		FFileHelper::SaveStringToFile(
+			TEXT("tracked baseline"),
+			*AbsoluteTrackedPath));
+	Results.Reset();
+	Errors.Reset();
+	TestTrue(
+		TEXT("应把中文已跟踪资产加入基线 index"),
+		GitSourceControlUtils::RunCommand(
+			TEXT("add"),
+			GitBinary,
+			TempRepository,
+			FGitSourceControlModule::GetEmptyStringArray(),
+			TArray<FString>{RelativeTrackedPath},
+			Results,
+			Errors));
+	Results.Reset();
+	Errors.Reset();
+	TestTrue(
+		TEXT("应提交中文已跟踪资产基线"),
+		GitSourceControlUtils::RunCommand(
+			TEXT("commit"),
+			GitBinary,
+			TempRepository,
+			TArray<FString>{TEXT("-m"), TEXT("literal-path-baseline")},
+			FGitSourceControlModule::GetEmptyStringArray(),
+			Results,
+			Errors));
+	TestTrue(
+		TEXT("应修改中文已跟踪资产"),
+		FFileHelper::SaveStringToFile(
+			TEXT("tracked modified"),
+			*AbsoluteTrackedPath));
+
+	const FString RelativeAssetPath = TEXT("Content/中文 资产.uasset");
+	const FString AbsoluteAssetPath = FPaths::Combine(
+		TempRepository,
+		RelativeAssetPath);
+	TestTrue(
+		TEXT("应创建中文和空格路径目录"),
+		PlatformFile.CreateDirectoryTree(*FPaths::GetPath(AbsoluteAssetPath)));
+	TestTrue(
+		TEXT("应创建中文和空格路径资产"),
+		FFileHelper::SaveStringToFile(
+			TEXT("literal path contract"),
+			*AbsoluteAssetPath));
+	Results.Reset();
+	Errors.Reset();
+	TestTrue(
+		TEXT("应把中文路径资产加入临时 index"),
+		GitSourceControlUtils::RunCommand(
+			TEXT("add"),
+			GitBinary,
+			TempRepository,
+			FGitSourceControlModule::GetEmptyStringArray(),
+			TArray<FString>{RelativeAssetPath},
+			Results,
+			Errors));
+
+	const FString ContentDirectory = FPaths::Combine(
+		TempRepository,
+		TEXT("Content"));
+	TArray<FString> DirectoryFiles;
+	TestTrue(
+		TEXT("production directory expansion 应返回字面中文路径"),
+		GitSourceControlUtils::ListFilesInDirectoryRecurse(
+			GitBinary,
+			TempRepository,
+			ContentDirectory,
+			DirectoryFiles));
+	TestTrue(
+		TEXT("directory expansion 应包含中文 Added 资产"),
+		DirectoryFiles.ContainsByPredicate(
+			[&AbsoluteAssetPath](const FString& File)
+			{
+				return FPaths::IsSamePath(File, AbsoluteAssetPath);
+			}));
+	TestTrue(
+		TEXT("directory expansion 应包含中文 Modified 资产"),
+		DirectoryFiles.ContainsByPredicate(
+			[&AbsoluteTrackedPath](const FString& File)
+			{
+				return FPaths::IsSamePath(File, AbsoluteTrackedPath);
+			}));
+
+	Results.Reset();
+	Errors.Reset();
+	TestTrue(
+		TEXT("逐行路径查询应覆盖仓库的 core.quotepath=true"),
+		GitSourceControlOperations::RunLiteralPathListCommand(
+			TEXT("diff"),
+			GitBinary,
+			TempRepository,
+			TArray<FString>{TEXT("--cached"), TEXT("--name-only"), TEXT("--")},
+			Results,
+			Errors));
+	TestEqual(TEXT("中文路径查询应只返回一个文件"), Results.Num(), 1);
+	if (Results.Num() == 1)
+	{
+		TestEqual(
+			TEXT("中文和空格路径必须按字面值返回"),
+			Results[0],
+			RelativeAssetPath);
+		TestTrue(
+			TEXT("字面路径必须继续被识别为 lockable 资产"),
+			GitSourceControlUtils::IsFileLFSLockable(Results[0]));
+	}
+
+	Results.Reset();
+	Errors.Reset();
+	TestTrue(
+		TEXT("production porcelain status 应返回字面中文路径"),
+		GitSourceControlUtils::RunStatusWithLiteralPaths(
+			GitBinary,
+			TempRepository,
+			TArray<FString>{TEXT("--porcelain"), TEXT("-uall")},
+			TArray<FString>{ContentDirectory},
+			Results,
+			Errors));
+	TestEqual(TEXT("directory production status 应返回 Added 和 Modified"), Results.Num(), 2);
+	if (Results.Num() == 2)
+	{
+		const FGitLockSettingsSnapshot CurrentSettings =
+			FGitSourceControlModule::Get()
+				.AccessSettings()
+				.GetLockSettingsSnapshot();
+		TMap<FString, FString> StatusResults;
+		for (const FString& StatusLine : Results)
+		{
+			const FString ParsedAbsolutePath =
+				GitSourceControlUtils::GetFullPathFromGitStatus(
+					StatusLine,
+					TempRepository);
+			TestTrue(
+				TEXT("production status parser 应恢复目录中的中文绝对路径"),
+				FPaths::IsSamePath(ParsedAbsolutePath, AbsoluteAssetPath)
+					|| FPaths::IsSamePath(ParsedAbsolutePath, AbsoluteTrackedPath));
+			StatusResults.Add(ParsedAbsolutePath, StatusLine);
+		}
+		TMap<FString, FGitSourceControlState> ParsedStates;
+		bool bSettingsSuperseded = false;
+		GitSourceControlUtils::ParseStatusResults(
+			GitBinary,
+			TempRepository,
+			false,
+			CurrentSettings.bUsingGitLfsLocking,
+			CurrentSettings.Generation,
+			TArray<FString>{ContentDirectory},
+			StatusResults,
+			ParsedStates,
+			bSettingsSuperseded);
+		const FGitSourceControlState* ParsedAddedState = ParsedStates.Find(AbsoluteAssetPath);
+		TestNotNull(
+			TEXT("directory status parser 应返回中文 Added 资产状态"),
+			ParsedAddedState);
+		if (ParsedAddedState)
+		{
+			TestTrue(
+				TEXT("中文暂存资产必须保持 Added 分类"),
+				ParsedAddedState->IsAdded());
+		}
+		const FGitSourceControlState* ParsedModifiedState = ParsedStates.Find(AbsoluteTrackedPath);
+		TestNotNull(
+			TEXT("directory status parser 应返回中文 Modified 资产状态"),
+			ParsedModifiedState);
+		if (ParsedModifiedState)
+		{
+			TestTrue(
+				TEXT("中文已跟踪资产必须保持 Modified 分类"),
+				ParsedModifiedState->IsModified());
+		}
+	}
+
+	Results.Reset();
+	Errors.Reset();
+	TestTrue(
+		TEXT("Pull 预检 diff 应返回未经转义的中文路径"),
+		GitSourceControlUtils::RunCommandWithLiteralPaths(
+			TEXT("diff"),
+			GitBinary,
+			TempRepository,
+			TArray<FString>{TEXT("--name-only"), TEXT("HEAD"), TEXT("--")},
+			FGitSourceControlModule::GetEmptyStringArray(),
+			Results,
+			Errors));
+	TestTrue(
+		TEXT("Pull 预检路径集应包含中文 Added 资产"),
+		Results.Contains(RelativeAssetPath));
+	TestTrue(
+		TEXT("Pull 预检路径集应包含中文 Modified 资产"),
+		Results.Contains(RelativeTrackedPath));
+
+	Results.Reset();
+	Errors.Reset();
+	TestTrue(
+		TEXT("remote-state log 应返回未经转义的中文路径"),
+		GitSourceControlUtils::RunCommandWithLiteralPaths(
+			TEXT("log"),
+			GitBinary,
+			TempRepository,
+			TArray<FString>{TEXT("--pretty="), TEXT("--name-only"), TEXT("HEAD"), TEXT("--")},
+			FGitSourceControlModule::GetEmptyStringArray(),
+			Results,
+			Errors));
+	TestTrue(
+		TEXT("remote-state 路径集应包含中文已跟踪资产"),
+		Results.Contains(RelativeTrackedPath));
+
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS
