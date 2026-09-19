@@ -10,6 +10,7 @@
 #include "GitSourceControlModule.h"
 #include "GitSourceControlProvider.h"
 #include "GitSourceControlSettings.h"
+#include "GitLfsUnlock.h"
 #include "HAL/PlatformProcess.h"
 #include "SourceControlOperations.h"
 
@@ -87,6 +88,7 @@ const FString& FGitScopedTempFile::GetFilename() const
 
 FDateTime FGitLockedFilesCache::LastUpdated = FDateTime::MinValue();
 TMap<FString, FString> FGitLockedFilesCache::LockedFiles = TMap<FString, FString>();
+TSet<FString> FGitLockedFilesCache::AuthenticatedOwnFiles;
 FCriticalSection FGitLockedFilesCache::LockedFilesMutex;
 TMap<FString, int32> FGitLockedFilesCache::MissingStreak;
 TMap<FString, int32> FGitLockedFilesCache::AppearStreak;
@@ -98,7 +100,11 @@ TMap<FString, FString> FGitLockedFilesCache::GetLockedFiles()
 	return LockedFiles;
 }
 
-
+bool FGitLockedFilesCache::IsOwnedByCurrentCredential(const FString& FilePath)
+{
+	FScopeLock Lock(&LockedFilesMutex);
+	return LockedFiles.Contains(FilePath) && AuthenticatedOwnFiles.Contains(FilePath);
+}
 
 void FGitLockedFilesCache::SetLockedFiles(const TMap<FString, FString>& newLocks)
 {
@@ -112,13 +118,14 @@ void FGitLockedFilesCache::SetLockedFilesInternal(const TMap<FString, FString>& 
 	{
 		if (!newLocks.Contains(lock.Key))
 		{
+			AuthenticatedOwnFiles.Remove(lock.Key);
 			OnFileLockChanged(lock.Key, lock.Value, false);
 		}
 	}
 
 	for (auto lock : newLocks)
 	{
-		if (!LockedFiles.Contains(lock.Key))
+		if (!LockedFiles.Contains(lock.Key) || LockedFiles[lock.Key] != lock.Value)
 		{
 			OnFileLockChanged(lock.Key, lock.Value, true);
 		}
@@ -131,6 +138,7 @@ void FGitLockedFilesCache::AddLockedFile(const FString& filePath, const FString&
 {
 	FScopeLock Lock(&LockedFilesMutex);
 	LockedFiles.Add(filePath, lockUser);
+	AuthenticatedOwnFiles.Add(filePath);
 	// a lock we just took (or released) ourselves is authoritative - reset any damping state
 	MissingStreak.Remove(filePath);
 	AppearStreak.Remove(filePath);
@@ -142,12 +150,13 @@ void FGitLockedFilesCache::RemoveLockedFile(const FString& filePath)
 	FScopeLock Lock(&LockedFilesMutex);
 	FString user;
 	LockedFiles.RemoveAndCopyValue(filePath, user);
+	AuthenticatedOwnFiles.Remove(filePath);
 	MissingStreak.Remove(filePath);
 	AppearStreak.Remove(filePath);
 	OnFileLockChanged(filePath, user, false);
 }
 
-TMap<FString, FString> FGitLockedFilesCache::UpdateFromServerListing(const FString& InRepositoryRoot, const TMap<FString, FString>& FreshLocks)
+TMap<FString, FString> FGitLockedFilesCache::UpdateFromServerListing(const FString& InRepositoryRoot, const TMap<FString, FString>& FreshLocks, const TSet<FString>& InAuthenticatedOwnFiles)
 {
 	// The LFS lock API of some hosts (observed on git.code.tencent.com) is eventually
 	// consistent: for minutes after any lock/unlock, individual listings randomly omit
@@ -175,6 +184,17 @@ TMap<FString, FString> FGitLockedFilesCache::UpdateFromServerListing(const FStri
 	};
 
 	FScopeLock Lock(&LockedFilesMutex);
+	for (const auto& Fresh : FreshLocks)
+	{
+		const bool bWasOurs = AuthenticatedOwnFiles.Contains(Fresh.Key);
+		const bool bIsOurs = InAuthenticatedOwnFiles.Contains(Fresh.Key);
+		if (bIsOurs) { AuthenticatedOwnFiles.Add(Fresh.Key); }
+		else { AuthenticatedOwnFiles.Remove(Fresh.Key); }
+		if (LockedFiles.Contains(Fresh.Key) && bWasOurs != bIsOurs)
+		{
+			OnFileLockChanged(Fresh.Key, Fresh.Value, true);
+		}
+	}
 	TMap<FString, FString> Smoothed = FreshLocks;
 	for (const auto& Known : LockedFiles)
 	{
@@ -500,7 +520,54 @@ static bool TryRecoverFromIndexLockFailure(const FString& InErrors, const int32 
 	return true;
 }
 
+/**
+ * index.lock 恢复会重新启动真实 Git 进程，因此每一次尝试都必须重新通过同一个写边界。
+ * Index-lock recovery starts another real Git process, so every attempt must pass the same write
+ * boundary again.
+ */
+static bool RunCommandInternalWithPreSubprocessBoundary(
+	const FString& InCommand,
+	const FString& InPathToGitBinary,
+	const FString& InRepositoryRoot,
+	const TArray<FString>& InParameters,
+	const TArray<FString>& InFiles,
+	TFunctionRef<bool()> InPreSubprocessBoundary,
+	TArray<FString>& OutResults,
+	TArray<FString>& OutErrorMessages,
+	bool* bOutBoundaryRejected = nullptr)
+{
+	if (bOutBoundaryRejected != nullptr)
+	{
+		*bOutBoundaryRejected = false;
+	}
+	bool bResult = false;
+	FString Results;
+	FString Errors;
 
+	constexpr int32 MaxAttempts = 4; // 1 initial + up to 3 index.lock recovery retries
+	for (int32 Attempt = 1;; ++Attempt)
+	{
+		Results.Reset();
+		Errors.Reset();
+		if (!InPreSubprocessBoundary())
+		{
+			if (bOutBoundaryRejected != nullptr)
+			{
+				*bOutBoundaryRejected = true;
+			}
+			break;
+		}
+		bResult = RunCommandInternalRaw(InCommand, InPathToGitBinary, InRepositoryRoot, InParameters, InFiles, Results, Errors);
+		if (bResult || Attempt >= MaxAttempts || !TryRecoverFromIndexLockFailure(Errors, Attempt))
+		{
+			break;
+		}
+	}
+	Results.ParseIntoArray(OutResults, TEXT("\n"), true);
+	Errors.ParseIntoArray(OutErrorMessages, TEXT("\n"), true);
+
+	return bResult;
+}
 
 static bool RunCommandInternal(const FString& InCommand, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters,
 							   const TArray<FString>& InFiles, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
@@ -1005,10 +1072,20 @@ TArray<FString> GetSourceControlledAssetPaths()
 	};
 }
 
-
-
-bool RunCommand(const FString& InCommand, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters,
-				const TArray<FString>& InFiles, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
+/**
+ * 命令拆批与真实子进程的共同入口；写调用方把权限复核放在这里，避免只保护第一批。
+ * Shared batching/subprocess entry. Mutating callers place authorization here so the guard cannot
+ * cover only the first batch.
+ */
+static bool RunCommandWithPreSubprocessBoundary(
+	const FString& InCommand,
+	const FString& InPathToGitBinary,
+	const FString& InRepositoryRoot,
+	const TArray<FString>& InParameters,
+	const TArray<FString>& InFiles,
+	TFunctionRef<bool()> InPreSubprocessBoundary,
+	TArray<FString>& OutResults,
+	TArray<FString>& OutErrorMessages)
 {
 	bool bResult = true;
 
@@ -1026,20 +1103,76 @@ bool RunCommand(const FString& InCommand, const FString& InPathToGitBinary, cons
 
 			TArray<FString> BatchResults;
 			TArray<FString> BatchErrors;
-			bResult &= RunCommandInternal(InCommand, InPathToGitBinary, InRepositoryRoot, InParameters, FilesInBatch, BatchResults, BatchErrors);
+			bool bBatchBoundaryRejected = false;
+			const bool bBatchResult = RunCommandInternalWithPreSubprocessBoundary(
+				InCommand,
+				InPathToGitBinary,
+				InRepositoryRoot,
+				InParameters,
+				FilesInBatch,
+				InPreSubprocessBoundary,
+				BatchResults,
+				BatchErrors,
+				&bBatchBoundaryRejected);
+			bResult &= bBatchResult;
 			OutResults += BatchResults;
 			OutErrorMessages += BatchErrors;
+			if (bBatchBoundaryRejected)
+			{
+				return false;
+			}
 		}
 	}
 	else
 	{
-		bResult = RunCommandInternal(InCommand, InPathToGitBinary, InRepositoryRoot, InParameters, InFiles, OutResults, OutErrorMessages);
+		bResult = RunCommandInternalWithPreSubprocessBoundary(
+			InCommand,
+			InPathToGitBinary,
+			InRepositoryRoot,
+			InParameters,
+			InFiles,
+			InPreSubprocessBoundary,
+			OutResults,
+			OutErrorMessages);
 	}
 
 	return bResult;
 }
 
+bool RunCommand(const FString& InCommand, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters,
+				const TArray<FString>& InFiles, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
+{
+	return RunCommandWithPreSubprocessBoundary(
+		InCommand,
+		InPathToGitBinary,
+		InRepositoryRoot,
+		InParameters,
+		InFiles,
+		[]() { return true; },
+		OutResults,
+		OutErrorMessages);
+}
 
+bool RunCommandWithPreWriteBoundary(
+	const FString& InCommand,
+	const FString& InPathToGitBinary,
+	const FString& InRepositoryRoot,
+	const TArray<FString>& InParameters,
+	const TArray<FString>& InFiles,
+	TFunctionRef<bool()> InPreWriteBoundary,
+	TArray<FString>& OutResults,
+	TArray<FString>& OutErrorMessages)
+{
+	return RunCommandWithPreSubprocessBoundary(
+		InCommand,
+		InPathToGitBinary,
+		InRepositoryRoot,
+		InParameters,
+		InFiles,
+		InPreWriteBoundary,
+		OutResults,
+		OutErrorMessages);
+}
 
 bool RunCommandWithLiteralPaths(
 	const FString& InCommand,
@@ -1142,12 +1275,22 @@ static void EnsureGitLfsToolsInPath(const FString& InPathToGitBinary)
 }
 #endif
 
+bool SupportsBatchedLFSUnlock()
+{
+	// 只有随插件一起更新的工具才接受重复 --id；系统 LFS 保留单 ID 协议。
+	// Only the coordinated bundled tools accept repeated --id; system LFS retains its single-ID protocol.
+	return GIT_USE_CUSTOM_LFS && (PLATFORM_WINDOWS || PLATFORM_MAC || PLATFORM_LINUX);
+}
 
-
-
-
-bool RunLFSCommand(const FString& InCommand, const FString& InRepositoryRoot, const FString& GitBinaryFallback, const TArray<FString>& InParameters, const TArray<FString>& InFiles,
-				   TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
+bool RunLFSCommandWithPreWriteBoundary(
+	const FString& InCommand,
+	const FString& InRepositoryRoot,
+	const FString& GitBinaryFallback,
+	const TArray<FString>& InParameters,
+	const TArray<FString>& InFiles,
+	TFunctionRef<bool()> InPreWriteBoundary,
+	TArray<FString>& OutResults,
+	TArray<FString>& OutErrorMessages)
 {
 	FString Command = InCommand;
 #if GIT_USE_CUSTOM_LFS
@@ -1178,7 +1321,29 @@ bool RunLFSCommand(const FString& InCommand, const FString& InRepositoryRoot, co
 	Command = TEXT("lfs ") + Command;
 #endif
 
-	return GitSourceControlUtils::RunCommand(Command, LFSLockBinary, InRepositoryRoot, InParameters, InFiles, OutResults, OutErrorMessages);
+	return GitSourceControlUtils::RunCommandWithPreWriteBoundary(
+		Command,
+		LFSLockBinary,
+		InRepositoryRoot,
+		InParameters,
+		InFiles,
+		InPreWriteBoundary,
+		OutResults,
+		OutErrorMessages);
+}
+
+bool RunLFSCommand(const FString& InCommand, const FString& InRepositoryRoot, const FString& GitBinaryFallback, const TArray<FString>& InParameters, const TArray<FString>& InFiles,
+				   TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
+{
+	return RunLFSCommandWithPreWriteBoundary(
+		InCommand,
+		InRepositoryRoot,
+		GitBinaryFallback,
+		InParameters,
+		InFiles,
+		[]() { return true; },
+		OutResults,
+		OutErrorMessages);
 }
 
 // Run a Git "commit" command by batches
@@ -1251,7 +1416,7 @@ public:
 	{
 		TArray<FString> Informations;
 		InStatus.ParseIntoArray(Informations, TEXT("\t"), true);
-		
+
 		if (Informations.Num() >= 2)
 		{
 			Informations[0].TrimEndInline(); // Trim whitespace from the end of the filename
@@ -1263,8 +1428,13 @@ public:
 			// Filename ID (or we expect it to be the username, but it's empty, or is the ID, we have to assume it's the current user)
 			if (Informations.Num() == 2 || Informations[1].IsEmpty() || Informations[1].StartsWith(TEXT("ID:")))
 			{
-				// TODO: thread safety
-				LockUser = FGitSourceControlModule::Get().GetProvider().GetLockUser();
+				if (FGitSourceControlModule* Module =
+						FGitSourceControlModule::GetThreadSafe())
+				{
+					LockUser = Module->AccessSettings()
+						.GetLockSettingsSnapshot()
+						.LfsUserName;
+				}
 			}
 			// Filename Username ID
 			else
@@ -1950,110 +2120,45 @@ static void EnsureOwnLocksWritable(const TMap<FString, FString>& InLocks)
 
 bool GetAllLocks(const FString& InRepositoryRoot, const FString& GitBinaryFallback, TArray<FString>& OutErrorMessages, TMap<FString, FString>& OutLocks, bool bInvalidateCache, TOptional<TMap<FString, FString>>* OutRawServerLocks)
 {
-	// You may ask, why are we ignoring state cache, and instead maintaining our own lock cache?
-	// The answer is that state cache updating is another operation, and those that update status
-	// (and thus the state cache) are using GetAllLocks. However, querying remote locks are almost always
-	// irrelevant in most of those update status cases. So, we need to provide a fast way to provide
-	// an updated local lock state. We could do this through the relevant lfs lock command arguments, which
-	// as you will see below, we use only for offline cases, but the exec cost of doing this isn't worth it
-	// when we can easily maintain this cache here. So, we are really emulating an internal Git LFS locks cache
-	// call, which gets fed into the state cache, rather than reimplementing the state cache :)
+	// 图标、权限和解锁必须使用同一个认证接口；普通 GET 列表可能与 verify 不一致并复活旧锁。
+	// Badges, permissions, and unlocks share the authenticated API. A plain GET listing can disagree
+	// with verify and resurrect an obsolete lock after a successful release.
 	const FDateTime CurrentTime = FDateTime::Now();
-	bool bCacheExpired = bInvalidateCache;
-	if (!bInvalidateCache)
+	if (!bInvalidateCache && CurrentTime - FGitLockedFilesCache::LastUpdated <= CacheLimit)
 	{
-		const FTimespan CacheTimeElapsed = CurrentTime - FGitLockedFilesCache::LastUpdated;
-		bCacheExpired = CacheTimeElapsed > CacheLimit;
-	}
-	bool bResult = false;
-	if (bCacheExpired)
-	{
-		// Our cache expired, or they asked us to expire cache. Query locks directly from the remote server.
-		TArray<FString> ErrorMessages;
-		TArray<FString> Results;
-		bResult = RunLFSCommand(TEXT("locks"), InRepositoryRoot, GitBinaryFallback, FGitSourceControlModule::GetEmptyStringArray(), FGitSourceControlModule::GetEmptyStringArray(),
-								Results, OutErrorMessages);
-		if (bResult)
-		{
-			TMap<FString, FString> FreshLocks;
-			for (const FString& Result : Results)
-			{
-				FGitLfsLocksParser LockFile(InRepositoryRoot, Result);
-#if UE_BUILD_DEBUG && GIT_DEBUG_STATUS
-				UE_LOG(LogSourceControl, Log, TEXT("LockedFile(%s, %s)"), *LockFile.LocalFilename, *LockFile.LockUser);
-#endif
-				FreshLocks.Add(MoveTemp(LockFile.LocalFilename), MoveTemp(LockFile.LockUser));
-			}
-			FGitLockedFilesCache::LastUpdated = CurrentTime;
-			if (OutRawServerLocks)
-			{
-				OutRawServerLocks->Emplace(FreshLocks);
-			}
-			// smooth over eventually-consistent listings before anyone consumes them
-			OutLocks = FGitLockedFilesCache::UpdateFromServerListing(InRepositoryRoot, FreshLocks);
-			EnsureOwnLocksWritable(OutLocks);
-			return bResult;
-		}
-		// We tried to invalidate the UE cache, but we failed for some reason. Try updating lock state from LFS cache.
-		// Get the last known state of remote locks
-		TArray<FString> Params;
-		Params.Add(TEXT("--cached"));
-
-		FGitSourceControlModule* GitSourceControl = FGitSourceControlModule::GetThreadSafe();
-		if (!GitSourceControl)
-		{
-			bResult = false;
-		}
-		else
-		{
-			FGitSourceControlProvider& Provider = GitSourceControl->GetProvider();
-			const FString& LockUser = Provider.GetLockUser();
-
-			Results.Reset();
-			bResult = RunLFSCommand(TEXT("locks"), InRepositoryRoot, GitBinaryFallback, Params, FGitSourceControlModule::GetEmptyStringArray(), Results, OutErrorMessages);
-			for (const FString& Result : Results)
-			{
-				FGitLfsLocksParser LockFile(InRepositoryRoot, Result);
-	#if UE_BUILD_DEBUG && GIT_DEBUG_STATUS
-				UE_LOG(LogSourceControl, Log, TEXT("LockedFile(%s, %s)"), *LockFile.LocalFilename, *LockFile.LockUser);
-	#endif
-				// Only update remote locks
-				if (LockFile.LockUser != LockUser)
-				{
-					OutLocks.Add(MoveTemp(LockFile.LocalFilename), MoveTemp(LockFile.LockUser));
-				}
-			}
-			// Get the latest local state of our own locks
-			Params.Reset(1);
-			Params.Add(TEXT("--local"));
-
-			Results.Reset();
-			bResult &= RunLFSCommand(TEXT("locks"), InRepositoryRoot, GitBinaryFallback, Params, FGitSourceControlModule::GetEmptyStringArray(), Results, OutErrorMessages);
-			for (const FString& Result : Results)
-			{
-				FGitLfsLocksParser LockFile(InRepositoryRoot, Result);
-	#if UE_BUILD_DEBUG && GIT_DEBUG_STATUS
-				UE_LOG(LogSourceControl, Log, TEXT("LockedFile(%s, %s)"), *LockFile.LocalFilename, *LockFile.LockUser);
-	#endif
-				// Only update local locks
-				if (LockFile.LockUser == LockUser)
-				{
-					OutLocks.Add(MoveTemp(LockFile.LocalFilename), MoveTemp(LockFile.LockUser));
-				}
-			}
-			if (bResult)
-			{
-				EnsureOwnLocksWritable(OutLocks);
-			}
-		}
-	}
-	if (!bResult)
-	{
-		// We can use our internally tracked local lock cache (an effective combination of --cached and --local)
 		OutLocks = FGitLockedFilesCache::GetLockedFiles();
-		bResult = true;
+		return true;
 	}
-	return bResult;
+
+	TArray<FString> Lines;
+	TArray<GitLfsUnlock::FVerifiedLock> VerifiedLocks;
+	FString ParseError;
+	const bool bListed = RunLFSCommand(TEXT("locks"), InRepositoryRoot, GitBinaryFallback,
+		{TEXT("--verify")}, FGitSourceControlModule::GetEmptyStringArray(), Lines, OutErrorMessages);
+	if (!GitLfsUnlock::ParseVerification(bListed, Lines, VerifiedLocks, ParseError))
+	{
+		OutErrorMessages.Add(ParseError);
+		OutLocks = FGitLockedFilesCache::GetLockedFiles();
+		return false;
+	}
+
+	TMap<FString, FString> FreshLocks;
+	TSet<FString> FreshOwnFiles;
+	for (int32 Index = 0; Index < VerifiedLocks.Num(); ++Index)
+	{
+		const auto& Lock = VerifiedLocks[Index];
+		const FString AbsoluteFile = FPaths::ConvertRelativePathToFull(InRepositoryRoot, Lock.RelativePath);
+		const FString& Line = Lines[Index];
+		const int32 OwnerStart = Line.Find(TEXT("\t")) + 1;
+		const int32 OwnerEnd = Line.Find(TEXT("\tID:"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+		FreshLocks.Add(AbsoluteFile, Line.Mid(OwnerStart, OwnerEnd - OwnerStart).TrimStartAndEnd());
+		if (Lock.bOurs) { FreshOwnFiles.Add(AbsoluteFile); }
+	}
+	FGitLockedFilesCache::LastUpdated = CurrentTime;
+	if (OutRawServerLocks) { OutRawServerLocks->Emplace(FreshLocks); }
+	OutLocks = FGitLockedFilesCache::UpdateFromServerListing(InRepositoryRoot, FreshLocks, FreshOwnFiles);
+	EnsureOwnLocksWritable(OutLocks);
+	return true;
 }
 
 void GetLockedFiles(const TArray<FString>& InFiles, TArray<FString>& OutFiles)

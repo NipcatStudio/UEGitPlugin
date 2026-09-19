@@ -24,6 +24,7 @@
 #include "GitSourceControlUtils.h"
 #include "ISourceControlModule.h"
 #include "SourceControlHelpers.h"
+#include "SourceControlOperations.h"
 #include "Framework/Commands/UIAction.h"
 #include "Framework/MultiBox/MultiBoxExtender.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
@@ -186,8 +187,53 @@ TSharedRef<FExtender> FGitSourceControlModule::OnExtendContentBrowserAssetSelect
 	return Extender;
 }
 
+bool FGitSourceControlModule::CanUnlockAssets(const TArray<FAssetData> SelectedAssets) const
+{
+	ISourceControlProvider& Provider = ISourceControlModule::Get().GetProvider();
+	if (&Provider != &GitSourceControlProvider || !Provider.IsAvailable() || !Provider.UsesCheckout())
+	{
+		return false;
+	}
+	for (const FAssetData& Asset : SelectedAssets)
+	{
+		const FSourceControlStatePtr State = Provider.GetState(
+			SourceControlHelpers::PackageFilename(Asset.PackageName.ToString()), EStateCacheUsage::Use);
+		if (State.IsValid() && StaticCastSharedPtr<FGitSourceControlState>(State)->State.LockState == ELockState::Locked)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+void FGitSourceControlModule::UnlockAssets(const TArray<FAssetData> SelectedAssets) const
+{
+	if (!CanUnlockAssets(SelectedAssets))
+	{
+		return;
+	}
+	TArray<FString> Files;
+	for (const FAssetData& Asset : SelectedAssets)
+	{
+		Files.AddUnique(SourceControlHelpers::PackageFilename(Asset.PackageName.ToString()));
+	}
+	const auto Operation = ISourceControlOperation::Create<FRevert>();
+	Operation->SetSoftRevert(true);
+	ISourceControlModule::Get().GetProvider().Execute(Operation, Files, EConcurrency::Asynchronous);
+}
+
 void FGitSourceControlModule::CreateGitContentBrowserAssetMenu(FMenuBuilder& MenuBuilder, const TArray<FAssetData> SelectedAssets)
 {
+	if (CanUnlockAssets(SelectedAssets))
+	{
+		MenuBuilder.AddMenuEntry(
+			LOCTEXT("UnlockKeepChanges", "Unlock (Keep Changes)"),
+			LOCTEXT("UnlockKeepChangesTooltip", "释放选中资产由当前账号持有的锁，保留本地修改、暂存内容及未推送提交。其他人随后可以签出这些资产。"),
+			FSlateIcon(),
+			FUIAction(
+				FExecuteAction::CreateRaw(this, &FGitSourceControlModule::UnlockAssets, SelectedAssets),
+				FCanExecuteAction::CreateRaw(this, &FGitSourceControlModule::CanUnlockAssets, SelectedAssets)));
+	}
 	if (!FGitSourceControlModule::Get().GetProvider().GetStatusBranchNames().Num())
 	{
 		return;

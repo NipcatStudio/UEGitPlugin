@@ -14,8 +14,10 @@ Apply and build in an isolated source checkout; this is not an Unreal target bui
   go test ./lfshttp -run Proxy -count=1
   go build -trimpath -ldflags="-s -w -X github.com/git-lfs/git-lfs/v3/config.GitCommit=35ec69f0+explicit-proxy1" -o git-lfs.exe .
 
-本次仅重建 Windows AMD64 可执行文件；其它平台二进制未更改。
-Only the Windows AMD64 executable is rebuilt here; other platform binaries are unchanged.
+以上命令用于单独重现代理修复；当前内置工具还应用 verified-id-batch.patch。
+The commands above reproduce the proxy-only fix; current bundled tools also apply verified-id-batch.patch.
+当前四平台构建与版本标识以 verified-id-batch.patch 的说明为准。
+Use verified-id-batch.patch for the current four-platform build and version suffix.
 
 diff --git a/lfshttp/proxy.go b/lfshttp/proxy.go
 index af189e6..939cd74 100644

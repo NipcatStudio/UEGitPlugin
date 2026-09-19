@@ -137,6 +137,10 @@ public:
 private:
 	TSharedRef<FExtender> OnExtendContentBrowserAssetSelectionMenu(const TArray<FAssetData>& SelectedAssets);
 	void CreateGitContentBrowserAssetMenu(FMenuBuilder& MenuBuilder, const TArray<FAssetData> SelectedAssets);
+	/** 选中资产中至少有当前账号持有的 LFS 锁时，允许主动释放。 */
+	bool CanUnlockAssets(const TArray<FAssetData> SelectedAssets) const;
+	/** 仅释放选中资产的本人锁；保留本地修改、暂存内容及未推送提交。 */
+	void UnlockAssets(const TArray<FAssetData> SelectedAssets) const;
 	void DiffAssetAgainstGitOriginBranch(const TArray<FAssetData> SelectedAssets, FString BranchName) const;
 	void DiffAgainstOriginBranch(UObject* InObject, const FString& InPackagePath, const FString& InPackageName, const FString& BranchName) const;
 

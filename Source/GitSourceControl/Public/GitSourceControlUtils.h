@@ -53,6 +53,11 @@ private:
 
 struct FGitVersion;
 
+/**
+ * 单端 LFS 的临时视图；认证所有权独立于显示用户名，显式解锁同步移除两者。
+ * Temporary single-endpoint LFS view; authenticated ownership is separate from display names,
+ * and an explicit release removes both facts together.
+ */
 class FGitLockedFilesCache
 {
 public:
@@ -62,10 +67,10 @@ public:
  static void SetLockedFiles(const TMap<FString, FString>& newLocks);
  static void AddLockedFile(const FString& filePath, const FString& lockUser);
  static void RemoveLockedFile(const FString& filePath);
- // Feed a fresh remote lock listing through flap damping (the LFS lock API of some hosts is
- // eventually consistent and individual listings randomly omit or resurrect locks for a while
- // after any mutation). Returns the smoothed lock set that callers should treat as current.
- static TMap<FString, FString> UpdateFromServerListing(const FString& InRepositoryRoot, const TMap<FString, FString>& FreshLocks);
+ /** 只接收完整认证列表；平滑暂时差异时保留认证身份，不能从显示用户名推导本人所有权。 */
+ static TMap<FString, FString> UpdateFromServerListing(const FString& InRepositoryRoot, const TMap<FString, FString>& FreshLocks, const TSet<FString>& AuthenticatedOwnFiles);
+	/** 当前缓存是否有服务器认证为本人的锁；显示用户名不授予权限。 */
+	static bool IsOwnedByCurrentCredential(const FString& FilePath);
 
 	// A lock transition observed by this cache (our own lock/unlock, or a background listing
 	// diff). Queued on whatever thread noticed it and drained on the game thread by
@@ -86,6 +91,8 @@ private:
  static void SetLockedFilesInternal(const TMap<FString, FString>& newLocks);
  // update local read/write state when our own lock statuses change
 	static TMap<FString, FString> LockedFiles;
+	/** 当前凭据通过 verify 认证持有的路径；与 LockedFiles 使用同一互斥锁。 */
+	static TSet<FString> AuthenticatedOwnFiles;
 	// guards LockedFiles and the streak maps: source control commands run on pooled worker
 	// threads, so listings and lock/unlock completions can touch the cache concurrently
 	static FCriticalSection LockedFilesMutex;
@@ -236,7 +243,22 @@ TArray<FString> GetSourceControlledAssetPaths();
  */
 GITSOURCECONTROL_API  bool RunCommand( const FString & InCommand, const FString & InPathToGitBinary, const FString & InRepositoryRoot, const TArray< FString > & InParameters, const TArray< FString > & InFiles, TArray< FString > & OutResults, TArray< FString > & OutErrorMessages );
 
-
+/**
+ * 运行会写入仓库的 Git 命令；每个实际子进程（包括拆分后的每一批及 index.lock
+ * 恢复重试）启动前都调用写边界。边界返回 false 时立即停止，未启动的后续进程不会执行。
+ * Runs a repository-mutating Git command and invokes the write boundary immediately before every
+ * real subprocess, including every split batch and index-lock retry. A rejected boundary stops all
+ * later processes.
+ */
+GITSOURCECONTROL_API bool RunCommandWithPreWriteBoundary(
+	const FString& InCommand,
+	const FString& InPathToGitBinary,
+	const FString& InRepositoryRoot,
+	const TArray<FString>& InParameters,
+	const TArray<FString>& InFiles,
+	TFunctionRef<bool()> InPreWriteBoundary,
+	TArray<FString>& OutResults,
+	TArray<FString>& OutErrorMessages);
 bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters, const TArray<FString>& InFiles, FString& OutResults, FString& OutErrors, const int32 ExpectedReturnCode = 0);
 
 /**
@@ -424,9 +446,19 @@ void RemoveRedundantErrors(FGitSourceControlCommand& InCommand, const FString& I
 
 	bool RunLFSCommand(const FString& InCommand, const FString& InRepositoryRoot, const FString& GitBinaryFallback, const TArray<FString>& InParameters, const TArray<FString>& InFiles, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages);
 
+	/** 当前选择的内置 LFS 是否支持一次进程提交多个精确 ID；系统 LFS 返回 false。 */
+	bool SupportsBatchedLFSUnlock();
 
-
-
+	/** 每个实际 LFS 写子进程启动前调用写边界；拒绝后不执行后续批次。 */
+	bool RunLFSCommandWithPreWriteBoundary(
+		const FString& InCommand,
+		const FString& InRepositoryRoot,
+		const FString& GitBinaryFallback,
+		const TArray<FString>& InParameters,
+		const TArray<FString>& InFiles,
+		TFunctionRef<bool()> InPreWriteBoundary,
+		TArray<FString>& OutResults,
+		TArray<FString>& OutErrorMessages);
 
 /**
  * Helper function for various commands to update cached states.

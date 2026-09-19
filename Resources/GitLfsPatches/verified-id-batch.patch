@@ -1,0 +1,320 @@
+批量精确 ID 解锁 / Batched exact-ID unlock
+
+与 explicit-empty-proxy.patch 一起应用，保留原并发路径锁功能。
+Apply together with explicit-empty-proxy.patch; preserves the original concurrent path-lock commands.
+Source: https://github.com/git-lfs/git-lfs.git
+Base: 35ec69f0e544a91a266ebe92ac4cf2198f61cbcd
+Toolchain: Go 1.19.13, CGO_ENABLED=0
+
+  git apply --unidiff-zero <explicit-empty-proxy.patch>
+  git apply --unidiff-zero <this-patch>
+  go test ./locking ./lfshttp -run 'Unlock|Proxy' -count=1
+  go build -trimpath -ldflags="-s -w -X github.com/git-lfs/git-lfs/v3/config.GitCommit=35ec69f0+proxy-idbatch-unlock1" -o <output> .
+  python <plugin>/Resources/GitLfsPatches/test_batch_cli.py <built-git-lfs-executable>
+
+本次将代理与批量 ID 两个补丁构建进全部四个平台工具；Win64 执行回归测试，其余仅交叉编译。
+Both patches are built into all four bundled tools; Win64 is runtime-tested, others are cross-compiled only.
+GOOS/GOARCH -> output:
+  windows/amd64 -> git-lfs.exe
+  linux/amd64 -> git-lfs
+  darwin/amd64 -> git-lfs-mac-amd64
+  darwin/arm64 -> git-lfs-mac-arm64
+
+主动解锁保留工作区与暂存内容，不以本地修改阻止释放本人锁；--force 仍表示打破他人锁，插件不会使用它。
+Explicit unlock preserves worktree and index edits. --force retains its separate foreign-lock meaning and is never passed by the plugin.
+
+diff --git a/commands/command_unlock.go b/commands/command_unlock.go
+index edad215..c2d0ac6 100644
+--- a/commands/command_unlock.go
++++ b/commands/command_unlock.go
+@@ -6,7 +6,6 @@ import (
+ 
+ 	"github.com/git-lfs/git-lfs/v3/errors"
+ 	"github.com/git-lfs/git-lfs/v3/git"
+-	"github.com/git-lfs/git-lfs/v3/locking"
+ 	"github.com/git-lfs/git-lfs/v3/tr"
+ 	"github.com/spf13/cobra"
+ )
+@@ -17,8 +16,9 @@ var (
+ 
+ // unlockFlags holds the flags given to the `git lfs unlock` command
+ type unlockFlags struct {
+-	// Id is the Id of the lock that is being unlocked.
+-	Id string
++	// 待解锁的精确 ID；重复 --id 组成一批，不重新按路径解析。
++	// Exact IDs to release; repeated --id flags form one batch without path re-resolution.
++	Ids []string
+ 	// Force specifies whether or not the `lfs unlock` command was invoked
+ 	// with "--force", signifying the user's intent to break another
+ 	// individual's lock(s).
+@@ -47,7 +47,12 @@ func handleUnlockError(locks []unlockResponse, id string, path string, err error
+ 
+ func unlockCommand(cmd *cobra.Command, args []string) {
+ 	hasPath := len(args) > 0
+-	hasId := len(unlockCmdFlags.Id) > 0
++	hasId := len(unlockCmdFlags.Ids) > 0
++	for _, id := range unlockCmdFlags.Ids {
++		if id == "" {
++			Exit(tr.Tr.Get("Lock IDs must not be empty"))
++		}
++	}
+ 	if hasPath == hasId {
+ 		// If there is both an `--id` AND a `<path>`, or there is
+ 		// neither, print the usage and quit.
+@@ -73,11 +78,6 @@ func unlockCommand(cmd *cobra.Command, args []string) {
+ 			os.Exit(2)
+ 		}
+ 		paths := make([]string, 0, len(args))
+-		modifiedFiles, err := git.GetModifiedFiles()
+-		if err != nil {
+-			Error(err.Error())
+-			os.Exit(2)
+-		}
+ 		for _, pathspec := range args {
+ 			path, err := lockPathRel(pathspec, repo)
+ 			if err != nil {
+@@ -89,16 +89,8 @@ func unlockCommand(cmd *cobra.Command, args []string) {
+ 				path = pathspec
+ 			}
+ 
+-			// If modified, handle the error
+-			_, ok := modifiedFiles[path]
+-			if ok {
+-				if err := unlockAbortWhenFileModified(); err != nil {
+-					locks = handleUnlockError(locks, "", path, err)
+-					success = false
+-					continue
+-				}
+-			}
+-
++			// 主动释放锁不还原文件，未提交修改不需要借用 --force 来绕过检查。
++			// Explicit unlock preserves content; local edits must not require --force to release our own lock.
+ 			paths = append(paths, path)
+ 		}
+ 
+@@ -132,16 +124,27 @@ func unlockCommand(cmd *cobra.Command, args []string) {
+ 				}
+ 			}
+ 		}
+-	} else if unlockCmdFlags.Id != "" {
+-		// This call can early-out
+-		unlockAbortIfFileModifiedById(unlockCmdFlags.Id, lockClient)
+-
+-		err := lockClient.UnlockFileById(unlockCmdFlags.Id, unlockCmdFlags.Force, "")
+-		if err != nil {
+-			locks = handleUnlockError(locks, unlockCmdFlags.Id, "", errors.New(tr.Tr.Get("Unable to unlock %v: %v", unlockCmdFlags.Id, errors.Cause(err))))
+-			success = false
+-		} else if !locksCmdFlags.JSON {
+-			Print(tr.Tr.Get("Unlocked Lock %s", unlockCmdFlags.Id))
++	} else if hasId {
++		ids := make([]string, 0, len(unlockCmdFlags.Ids))
++		seen := make(map[string]bool)
++		for _, id := range unlockCmdFlags.Ids {
++			if seen[id] {
++				continue
++			}
++			seen[id] = true
++			ids = append(ids, id)
++		}
++		results := lockClient.UnlockMultipleIds(ids, unlockCmdFlags.Force, "")
++		for _, id := range ids {
++			result, ok := results.Load(id)
++			if !ok || result != true {
++				locks = handleUnlockError(locks, id, "", errors.New(tr.Tr.Get("Unable to unlock %v: %v", id, result)))
++				success = false
++			} else if locksCmdFlags.JSON {
++				locks = append(locks, unlockResponse{Id: id, Unlocked: true})
++			} else {
++				Print(tr.Tr.Get("Unlocked Lock %s", id))
++			}
+ 		}
+ 	} else {
+ 		Exit(tr.Tr.Get("Exactly one of --id or a set of paths must be provided"))
+@@ -157,59 +160,10 @@ func unlockCommand(cmd *cobra.Command, args []string) {
+ 	}
+ }
+ 
+-func unlockAbortWhenFileModified() error {
+-	if unlockCmdFlags.Force {
+-		// Only a warning
+-		Error(tr.Tr.Get("warning: unlocking with uncommitted changes because --force"))
+-		return nil
+-	}
+-	return errors.New(tr.Tr.Get("Cannot unlock file with uncommitted changes"))
+-}
+-
+-func unlockAbortIfFileModified(path string) error {
+-	modified, err := git.IsFileModified(path)
+-
+-	if err != nil {
+-		if unlockCmdFlags.Force {
+-			// Since git/git@b9a7d55, `git-status(1)` causes an
+-			// error when asked about files that don't exist,
+-			// causing `err != nil`, as above.
+-			//
+-			// Unlocking a files that does not exist with
+-			// --force is OK.
+-			return nil
+-		}
+-		return err
+-	}
+-
+-	if modified {
+-		return unlockAbortWhenFileModified()
+-	}
+-	return nil
+-}
+-
+-func unlockAbortIfFileModifiedById(id string, lockClient *locking.Client) error {
+-	// Get the path so we can check the status
+-	filter := map[string]string{"id": id}
+-	// try local cache first
+-	locks, _ := lockClient.SearchLocks(filter, 0, true, false)
+-	if len(locks) == 0 {
+-		// Fall back on calling server
+-		locks, _ = lockClient.SearchLocks(filter, 0, false, false)
+-	}
+-
+-	if len(locks) == 0 {
+-		// Don't block if we can't determine the path, may be cleaning up old data
+-		return nil
+-	}
+-
+-	return unlockAbortIfFileModified(locks[0].Path)
+-}
+-
+ func init() {
+ 	RegisterCommand("unlock", unlockCommand, func(cmd *cobra.Command) {
+ 		cmd.Flags().StringVarP(&lockRemote, "remote", "r", "", "specify which remote to use when interacting with locks")
+-		cmd.Flags().StringVarP(&unlockCmdFlags.Id, "id", "i", "", "unlock a lock by its ID")
++		cmd.Flags().StringArrayVarP(&unlockCmdFlags.Ids, "id", "i", nil, "unlock locks by their exact IDs (repeatable)")
+ 		cmd.Flags().BoolVarP(&unlockCmdFlags.Force, "force", "f", false, "forcibly break another user's lock(s)")
+ 		cmd.Flags().BoolVarP(&locksCmdFlags.JSON, "json", "", false, "print output in json")
+ 	})
+diff --git a/locking/locks.go b/locking/locks.go
+index 50bb6fa..0c3778f 100644
+--- a/locking/locks.go
++++ b/locking/locks.go
+@@ -298,6 +298,34 @@ func (c *Client) UnlockMultipleFiles(paths []string, force bool, repo string) (*
+ 	return &lockMap, nil
+ }
+ 
++// 在同一个客户端和缓存内并发释放明确给定的 ID，不按路径重新寻找另一个锁。
++// Release supplied IDs concurrently in one client/cache, without resolving different locks by path.
++func (c *Client) UnlockMultipleIds(ids []string, force bool, repo string) *sync.Map {
++	c.client.CacheUploadClient(c.Remote)
++	results := &sync.Map{}
++	concurrency := c.ConcurrentRequests
++	if concurrency < 1 {
++		concurrency = 1
++	}
++	limiter := make(chan struct{}, concurrency)
++	var done sync.WaitGroup
++	for _, id := range ids {
++		limiter <- struct{}{}
++		done.Add(1)
++		go func(id string) {
++			defer done.Done()
++			defer func() { <-limiter }()
++			if err := c.UnlockFileById(id, force, repo); err != nil {
++				results.Store(id, err)
++			} else {
++				results.Store(id, true)
++			}
++		}(id)
++	}
++	done.Wait()
++	return results
++}
++
+ // UnlockFileById attempts to unlock a lock with a given id on the current remote
+ // Force causes the file to be unlocked from other users as well
+ func (c *Client) UnlockFileById(id string, force bool, repo string) error {
+diff --git a/locking/unlock_ids_test.go b/locking/unlock_ids_test.go
+new file mode 100644
+index 0000000..de82ffb
+--- /dev/null
++++ b/locking/unlock_ids_test.go
+@@ -0,0 +1,82 @@
++package locking
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/git-lfs/git-lfs/v3/config"
++	"github.com/git-lfs/git-lfs/v3/git"
++	"github.com/git-lfs/git-lfs/v3/lfsapi"
++	"github.com/git-lfs/git-lfs/v3/lfshttp"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// 本地服务验证并发上限、精确 ID、原分支和非强制语义；不访问真实锁服务。
++// A local server checks bounded concurrency, exact IDs, frozen ref and non-force semantics.
++func TestUnlockMultipleIds(t *testing.T) {
++	var active, peak int32
++	var mu sync.Mutex
++	seen := map[string]int{}
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		assert.Equal(t, "POST", r.Method)
++		assert.True(t, strings.HasPrefix(r.URL.Path, "/api/locks/"))
++		assert.True(t, strings.HasSuffix(r.URL.Path, "/unlock"))
++		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/locks/"), "/unlock")
++		var body struct {
++			Force bool `json:"force"`
++			Ref   struct {
++				Name string `json:"name"`
++			} `json:"ref"`
++		}
++		assert.NoError(t, json.NewDecoder(r.Body).Decode(&body))
++		assert.False(t, body.Force)
++		assert.Equal(t, "refs/heads/test", body.Ref.Name)
++		n := atomic.AddInt32(&active, 1)
++		defer atomic.AddInt32(&active, -1)
++		mu.Lock()
++		if n > peak {
++			peak = n
++		}
++		seen[id]++
++		mu.Unlock()
++		time.Sleep(40 * time.Millisecond)
++		w.Header().Set("Content-Type", "application/vnd.git-lfs+json")
++		if id == "blocked" {
++			w.WriteHeader(http.StatusConflict)
++			json.NewEncoder(w).Encode(map[string]string{"message": "still locked"})
++		} else {
++			json.NewEncoder(w).Encode(map[string]interface{}{"lock": Lock{Id: id, Path: "Content/" + id + ".uasset"}})
++		}
++	}))
++	defer srv.Close()
++	api, err := lfsapi.NewClient(lfshttp.NewContext(nil, nil, map[string]string{"lfs.url": srv.URL + "/api"}))
++	require.NoError(t, err)
++	client, err := NewClient("", api, config.New())
++	require.NoError(t, err)
++	defer client.Close()
++	client.RemoteRef = &git.Ref{Name: "test", Type: git.RefTypeLocalBranch}
++	client.ConcurrentRequests = 2
++	ids := []string{"id-0", "id-1", "id,2", "blocked", "id-4", "id-5"}
++	results := client.UnlockMultipleIds(ids, false, "")
++	mu.Lock()
++	defer mu.Unlock()
++	require.Equal(t, int32(2), peak)
++	for _, id := range ids {
++		assert.Equal(t, 1, seen[id])
++		result, ok := results.Load(id)
++		require.True(t, ok)
++		if id == "blocked" {
++			_, isError := result.(error)
++			assert.True(t, isError)
++		} else {
++			assert.Equal(t, true, result)
++		}
++	}
++}
