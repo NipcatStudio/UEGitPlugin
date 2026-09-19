@@ -117,6 +117,142 @@ FString GetAutomationTestGitBinary()
 }
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlWritableRevertTest,
+	"GitSourceControl.State.RevertWritable",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitSourceControlWritableRevertTest::RunTest(const FString& Parameters)
+{
+	const FString GitBinary = GetAutomationTestGitBinary();
+	if (!TestFalse(TEXT("还原测试需要 Git"), GitBinary.IsEmpty())) { return false; }
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	const FString Root = FPaths::ConvertRelativePathToFull(FPaths::Combine(FPaths::ProjectSavedDir(),
+		TEXT("Automation"), TEXT("UEGitWritableRevert-") + FGuid::NewGuid().ToString(EGuidFormats::Digits)));
+	if (!TestTrue(TEXT("创建独立还原测试仓库"), PlatformFile.CreateDirectoryTree(*Root))) { return false; }
+	ON_SCOPE_EXIT { PlatformFile.DeleteDirectoryRecursively(*Root); };
+	TArray<FString> GitOutput;
+	auto Git = [&](const TArray<FString>& Args, bool bExpectedSuccess = true)
+	{
+		TArray<FString> Errors;
+		GitOutput.Reset();
+		const bool bSuccess = GitSourceControlUtils::RunCommand(Args[0], GitBinary, Root,
+			TArray<FString>(Args.GetData() + 1, Args.Num() - 1), {}, GitOutput, Errors);
+		return TestEqual(TEXT("夹具 Git 命令结果"), bSuccess, bExpectedSuccess);
+	};
+	auto Write = [&](const TCHAR* File, const TCHAR* Text)
+	{
+		return TestTrue(TEXT("写入夹具文件"), FFileHelper::SaveStringToFile(Text, *FPaths::Combine(Root, File)));
+	};
+	auto Content = [&](const TCHAR* File)
+	{
+		FString Text;
+		TestTrue(TEXT("读取夹具文件"), FFileHelper::LoadFileToString(Text, *FPaths::Combine(Root, File)));
+		return Text;
+	};
+	if (!Git({TEXT("init"), TEXT("-b"), TEXT("test")})
+		|| !Git({TEXT("config"), TEXT("user.name"), TEXT("UEGitAutomation")})
+		|| !Git({TEXT("config"), TEXT("user.email"), TEXT("uegit@example.invalid")})
+		|| !Git({TEXT("config"), TEXT("commit.gpgsign"), TEXT("false")})
+		|| !Git({TEXT("config"), TEXT("core.hooksPath"), TEXT("no-hooks")})
+		|| !Write(TEXT("Selected.txt"), TEXT("baseline")) || !Write(TEXT("Other.txt"), TEXT("baseline"))
+		|| !Write(TEXT("[1].txt"), TEXT("literal baseline")) || !Write(TEXT("1.txt"), TEXT("neighbor baseline"))
+		|| !Git({TEXT("add"), TEXT("--"), TEXT(".")}) || !Git({TEXT("commit"), TEXT("-m"), TEXT("baseline")})
+		|| !Git({TEXT("rev-parse"), TEXT("HEAD")})) { return false; }
+	const FString BaselineCommit = GitOutput[0];
+	if (!Write(TEXT("Selected.txt"), TEXT("current local revision"))
+		|| !Git({TEXT("commit"), TEXT("-am"), TEXT("local-current")})
+		|| !Git({TEXT("rev-parse"), TEXT("HEAD")})) { return false; }
+	const FString CurrentCommit = GitOutput[0];
+	const FString Selected = FPaths::Combine(Root, TEXT("Selected.txt"));
+
+	// 夹具是无 LFS 的独立 Git 仓库；命令仍保留创建时的设置快照，不改真实 Provider 配置。
+	// The fixture is plain Git; retain each command's settings snapshot without changing the real provider.
+	auto Configure = [&](FGitSourceControlCommand& Command, const TArray<FString>& Files)
+	{
+		Command.PathToGitBinary = GitBinary;
+		Command.PathToGitRoot = Root;
+		Command.PathToRepositoryRoot = Root;
+		Command.Files = Files;
+		Command.bUsingGitLfsLocking = false;
+	};
+	auto LoadCurrentRevision = [&]()
+	{
+		TSharedRef<FUpdateStatus, ESPMode::ThreadSafe> Operation = ISourceControlOperation::Create<FUpdateStatus>();
+		Operation->SetUpdateHistory(true);
+		TSharedRef<FGitUpdateStatusWorker, ESPMode::ThreadSafe> Worker = MakeShared<FGitUpdateStatusWorker, ESPMode::ThreadSafe>();
+		FGitSourceControlCommand Command(Operation, Worker);
+		Configure(Command, {Selected});
+		TestTrue(TEXT("真实 UpdateStatus worker 提供本地历史"), Worker->Execute(Command));
+		FGitSourceControlState State(Selected);
+		State.State = Worker->States.FindRef(Selected);
+		State.History = Worker->Histories.FindRef(Selected);
+		return State.GetCurrentRevision();
+	};
+	auto Sync = [&](const FString& Revision, const TArray<FString>& Files, bool bForce, bool bLastSynced, bool bStale = false)
+	{
+		TSharedRef<FSync, ESPMode::ThreadSafe> Operation = ISourceControlOperation::Create<FSync>();
+		Operation->SetRevision(Revision);
+		Operation->SetForce(bForce);
+		Operation->SetLastSyncedFlag(bLastSynced);
+		TSharedRef<FGitSyncWorker, ESPMode::ThreadSafe> Worker = MakeShared<FGitSyncWorker, ESPMode::ThreadSafe>();
+		FGitSourceControlCommand Command(Operation, Worker);
+		Configure(Command, Files);
+		if (bStale) { Command.bSettingsUsingGitLfsLocking = !Command.bSettingsUsingGitLfsLocking; }
+		return Worker->Execute(Command);
+	};
+	FGitSourceControlState NoHistory(Selected);
+	TestFalse(TEXT("没有历史不伪造当前修订"), NoHistory.GetCurrentRevision().IsValid());
+	const TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> CurrentRevision = LoadCurrentRevision();
+	if (!TestTrue(TEXT("Writable Revert 获得有效当前修订"), CurrentRevision.IsValid())) { return false; }
+	TestEqual(TEXT("当前修订来自本地 HEAD 的文件历史"), CurrentRevision->GetRevision(), CurrentCommit.Left(8));
+	if (!Write(TEXT("Selected.txt"), TEXT("staged edit")) || !Write(TEXT("Other.txt"), TEXT("unrelated staged"))
+		|| !Git({TEXT("add"), TEXT("--"), TEXT("Selected.txt"), TEXT("Other.txt")})
+		|| !Write(TEXT("Selected.txt"), TEXT("offline writable edit"))
+		|| !Write(TEXT("Other.txt"), TEXT("unrelated working edit"))) { return false; }
+	TestTrue(TEXT("UI 的强制指定修订同步真实还原文件"), Sync(CurrentRevision->GetRevision(), {Selected}, true, false));
+	TestEqual(TEXT("选中文件恢复为当前修订"), Content(TEXT("Selected.txt")), FString(TEXT("current local revision")));
+	Git({TEXT("show"), TEXT(":Selected.txt")});
+	TestEqual(TEXT("选中文件的暂存内容同时恢复"), FString::Join(GitOutput, TEXT("\n")), FString(TEXT("current local revision")));
+	Git({TEXT("show"), TEXT(":Other.txt")});
+	TestEqual(TEXT("保留未选中文件的暂存内容"), FString::Join(GitOutput, TEXT("\n")), FString(TEXT("unrelated staged")));
+	TestEqual(TEXT("保留未选中文件的工作区内容"), Content(TEXT("Other.txt")), FString(TEXT("unrelated working edit")));
+	TestTrue(TEXT("支持指定历史修订但不切换 HEAD"), Sync(BaselineCommit, {Selected}, true, false));
+	TestEqual(TEXT("历史修订被准确还原"), Content(TEXT("Selected.txt")), FString(TEXT("baseline")));
+	TestTrue(TEXT("Uncontrolled Revert 的 LastSynced 标志恢复本地 HEAD"), Sync(TEXT(""), {Selected}, true, true));
+	TestEqual(TEXT("LastSynced 不取更旧或远端版本"), Content(TEXT("Selected.txt")), FString(TEXT("current local revision")));
+	Write(TEXT("[1].txt"), TEXT("literal edit"));
+	Write(TEXT("1.txt"), TEXT("neighbor edit"));
+	TestTrue(TEXT("路径按字面值还原"), Sync(CurrentCommit, {FPaths::Combine(Root, TEXT("[1].txt"))}, true, false));
+	TestEqual(TEXT("只还原带括号的明确文件"), Content(TEXT("[1].txt")), FString(TEXT("literal baseline")));
+	TestEqual(TEXT("不把括号当通配符误改相邻文件"), Content(TEXT("1.txt")), FString(TEXT("neighbor edit")));
+	Write(TEXT("Selected.txt"), TEXT("protected edit"));
+	TestFalse(TEXT("未确认强制覆盖不能丢弃修改"), Sync(CurrentCommit, {Selected}, false, false));
+	TestFalse(TEXT("空范围不得变为整仓库操作"), Sync(CurrentCommit, {}, true, false));
+	TestFalse(TEXT("目录不得变为整仓库还原"), Sync(CurrentCommit, {Root}, true, false));
+	TestFalse(TEXT("引号不能扩张文件参数范围"), Sync(CurrentCommit, {FPaths::Combine(Root, TEXT("\" . \""))}, true, false));
+	TestFalse(TEXT("不安全修订不得写文件"), Sync(TEXT("HEAD\" --force"), {Selected}, true, false));
+	TestFalse(TEXT("设置快照过期时写边界拒绝还原"), Sync(CurrentCommit, {Selected}, true, false, true));
+	TestEqual(TEXT("拒绝后保留工作区修改"), Content(TEXT("Selected.txt")), FString(TEXT("protected edit")));
+	Git({TEXT("rev-parse"), TEXT("HEAD")});
+	TestEqual(TEXT("全部还原都未移动 HEAD"), GitOutput[0], CurrentCommit);
+	TestFalse(TEXT("没有执行 fetch"), PlatformFile.FileExists(*FPaths::Combine(Root, TEXT(".git/FETCH_HEAD"))));
+
+	// 构造真正的合并冲突，验证补充对端历史后仍返回本地修订而不是 MERGE_HEAD。
+	// A real merge conflict verifies that supplemental remote history cannot become the current revision.
+	if (!Git({TEXT("checkout"), TEXT("HEAD"), TEXT("--"), TEXT(".")})
+		|| !Git({TEXT("checkout"), TEXT("-b"), TEXT("other"), BaselineCommit})
+		|| !Write(TEXT("Selected.txt"), TEXT("other branch"))
+		|| !Git({TEXT("commit"), TEXT("-am"), TEXT("other-change")})
+		|| !Git({TEXT("checkout"), TEXT("test")})
+		|| !Git({TEXT("merge"), TEXT("--no-ff"), TEXT("other")}, false)) { return false; }
+	const TSharedPtr<ISourceControlRevision, ESPMode::ThreadSafe> ConflictRevision = LoadCurrentRevision();
+	if (TestTrue(TEXT("冲突仍有明确本地当前修订"), ConflictRevision.IsValid()))
+	{
+		TestEqual(TEXT("冲突不能把对端提交当作当前版本"), ConflictRevision->GetRevision(), CurrentCommit.Left(8));
+	}
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitSourceControlRemoteScopeTest,
 	"GitSourceControl.State.RemoteScope",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)

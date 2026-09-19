@@ -72,7 +72,13 @@ TSharedPtr<class ISourceControlRevision, ESPMode::ThreadSafe> FGitSourceControlS
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 2
 TSharedPtr<class ISourceControlRevision, ESPMode::ThreadSafe> FGitSourceControlState::GetCurrentRevision() const
 {
-	return nullptr;
+	// 历史首项由 UpdateStatus 保证来自本地 HEAD，不能拿冲突对端或无历史状态冒充当前版本。
+	// UpdateStatus keeps local HEAD history first; a conflict-side revision or missing history is not a local baseline.
+	if (!IsSourceControlled() || IsAdded() || History.IsEmpty())
+	{
+		return nullptr;
+	}
+	return History[0];
 }
 #endif
 

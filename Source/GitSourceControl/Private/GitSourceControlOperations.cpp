@@ -1503,8 +1503,10 @@ void GetMissingVsExistingFiles(const TArray<FString>& InFiles, TArray<FString>& 
 				OutOtherThanAddedExistingFiles.Add(State->GetFilename());
 				OutAllExistingFiles.Add(State->GetFilename());
 			}
-			else if (State->CanRevert()) // for locked but unmodified files
+			else if (State->IsSourceControlled())
 			{
+				// 显式 Revert 不能因瞬时“无锁”图标被跳过；远端解锁核验由 worker 负责。
+				// A transient unlocked badge must not skip an explicit Revert; the worker verifies release.
 				OutOtherThanAddedExistingFiles.Add(State->GetFilename());
 			}
 		}
@@ -1563,25 +1565,60 @@ bool FGitRevertWorker::Execute(FGitSourceControlCommand& InCommand)
 	{
 		TArray<FString> Parms;
 		Parms.Add(TEXT("--hard"));
-		InCommand.bCommandSuccessful &= GitSourceControlUtils::RunCommand(TEXT("reset"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, Parms, FGitSourceControlModule::GetEmptyStringArray(), InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+		InCommand.bCommandSuccessful &= RunGitCommandMutationAfterLockBoundary(
+			InCommand,
+			TEXT("Git reset --hard"),
+			TEXT("reset"),
+			Parms,
+			FGitSourceControlModule::GetEmptyStringArray(),
+			InCommand.ResultInfo.InfoMessages,
+			InCommand.ResultInfo.ErrorMessages);
 
 		Parms.Reset(2);
 		Parms.Add(TEXT("-f")); // force
 		Parms.Add(TEXT("-d")); // remove directories
-		InCommand.bCommandSuccessful &= GitSourceControlUtils::RunCommand(TEXT("clean"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, Parms, FGitSourceControlModule::GetEmptyStringArray(), InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+		InCommand.bCommandSuccessful &= RunGitCommandMutationAfterLockBoundary(
+			InCommand,
+			TEXT("Git clean -fd"),
+			TEXT("clean"),
+			Parms,
+			FGitSourceControlModule::GetEmptyStringArray(),
+			InCommand.ResultInfo.InfoMessages,
+			InCommand.ResultInfo.ErrorMessages);
 	}
 	else
 	{
 		if (MissingFiles.Num() > 0)
 		{
 			// "Added" files that have been deleted needs to be removed from revision control
-			InCommand.bCommandSuccessful &= GitSourceControlUtils::RunCommand(TEXT("rm"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, FGitSourceControlModule::GetEmptyStringArray(), MissingFiles, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+			InCommand.bCommandSuccessful &= RunGitCommandMutationAfterLockBoundary(
+				InCommand,
+				TEXT("Git rm during revert"),
+				TEXT("rm"),
+				FGitSourceControlModule::GetEmptyStringArray(),
+				MissingFiles,
+				InCommand.ResultInfo.InfoMessages,
+				InCommand.ResultInfo.ErrorMessages);
 		}
 		if (AllExistingFiles.Num() > 0)
 		{
 			// reset and revert any changes already added to the index
-			InCommand.bCommandSuccessful &= GitSourceControlUtils::RunCommand(TEXT("reset"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, FGitSourceControlModule::GetEmptyStringArray(), AllExistingFiles, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
-			InCommand.bCommandSuccessful &= GitSourceControlUtils::RunCommand(TEXT("checkout"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, FGitSourceControlModule::GetEmptyStringArray(), AllExistingFiles, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+			InCommand.bCommandSuccessful &= RunGitCommandMutationAfterLockBoundary(
+				InCommand,
+				TEXT("Git reset during revert"),
+				TEXT("reset"),
+				FGitSourceControlModule::GetEmptyStringArray(),
+				AllExistingFiles,
+				InCommand.ResultInfo.InfoMessages,
+				InCommand.ResultInfo.ErrorMessages);
+			InCommand.bCommandSuccessful &= RunGitCommandMutationAfterLockBoundary(
+				InCommand,
+				TEXT("Git checkout during revert"),
+				TEXT("checkout"),
+				FGitSourceControlModule::GetEmptyStringArray(),
+				AllExistingFiles,
+				InCommand.ResultInfo.InfoMessages,
+				InCommand.ResultInfo.ErrorMessages);
 		}
 		if (OtherThanAddedExistingFiles.Num() > 0)
 		{
@@ -1591,15 +1628,28 @@ bool FGitRevertWorker::Execute(FGitSourceControlCommand& InCommand)
 			int32 Attempts = 10;
 			while( Attempts-- > 0 )
 			{
-				CheckoutSuccess = GitSourceControlUtils::RunCommand(TEXT("checkout"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, FGitSourceControlModule::GetEmptyStringArray(), OtherThanAddedExistingFiles, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+				bool bWriteBoundaryPassed = false;
+				CheckoutSuccess = RunGitCommandMutationAfterLockBoundary(
+					InCommand,
+					TEXT("Git checkout retry during revert"),
+					TEXT("checkout"),
+					FGitSourceControlModule::GetEmptyStringArray(),
+					OtherThanAddedExistingFiles,
+					InCommand.ResultInfo.InfoMessages,
+					InCommand.ResultInfo.ErrorMessages,
+					&bWriteBoundaryPassed);
 				if (CheckoutSuccess)
+				{
+					break;
+				}
+				if (!bWriteBoundaryPassed)
 				{
 					break;
 				}
 
 				FPlatformProcess::Sleep(0.1f);
 			}
-			
+
 			InCommand.bCommandSuccessful &= CheckoutSuccess;
 		}
 	}
@@ -1609,7 +1659,11 @@ bool FGitRevertWorker::Execute(FGitSourceControlCommand& InCommand)
 		// unlock files: execute the LFS command on relative filenames
 		// (unlock only locked files, that is, not Added files)
 		TArray<FString> LockedFiles;
-		GitSourceControlUtils::GetLockedFiles(OtherThanAddedExistingFiles, LockedFiles);
+		{
+			// 普通 LFS 的解锁与无锁确认不能由可能过期的图标缓存筛掉。
+			// A stale badge cache must not skip ordinary LFS release or authoritative absence checks.
+			LockedFiles = OtherThanAddedExistingFiles.FilterByPredicate(GitSourceControlUtils::IsFileLFSLockable);
+		}
 		if (LockedFiles.Num() > 0)
 		{
 			// A revert works on the working tree and cannot undo local commits: files whose
@@ -1649,7 +1703,11 @@ bool FGitRevertWorker::Execute(FGitSourceControlCommand& InCommand)
 
 	// now update the status of our files
 	TMap<FString, FGitSourceControlState> UpdatedStates;
-	bool bSuccess = RunUpdateStatusForCommand(InCommand, FilesToUpdate, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
+	bool bSuccess = RunUpdateStatusForCommand(
+		InCommand,
+		FilesToUpdate,
+		InCommand.ResultInfo.ErrorMessages,
+		UpdatedStates);
 	if (bSuccess)
 	{
 		GitSourceControlUtils::CollectNewStates(UpdatedStates, States);
@@ -1671,6 +1729,69 @@ FName FGitSyncWorker::GetName() const
 
 bool FGitSyncWorker::Execute(FGitSourceControlCommand& InCommand)
 {
+	const TSharedRef<FSync, ESPMode::ThreadSafe> Operation = StaticCastSharedRef<FSync>(InCommand.Operation);
+	if (!Operation->GetRevision().IsEmpty() || Operation->IsLastSyncedFlagSet())
+	{
+		// UE 的 Writable/Uncontrolled Revert 使用强制同步到当前修订；这不是拉取远端或切分支。
+		// UE Writable/Uncontrolled Revert requests a forced revision sync, not a pull or branch switch.
+		InCommand.bCommandSuccessful = false;
+		if (!Operation->IsForced() || Operation->IsHeadRevisionFlagSet()
+			|| (Operation->IsLastSyncedFlagSet() && !Operation->GetRevision().IsEmpty())
+			|| InCommand.Files.IsEmpty())
+		{
+			InCommand.ResultInfo.ErrorMessages.Add(TEXT("指定修订的同步需要明确强制覆盖、唯一修订来源和非空文件范围；未修改文件。"));
+			return false;
+		}
+		TArray<FString> Files;
+		for (const FString& File : InCommand.Files)
+		{
+			const FString AbsoluteFile = FPaths::ConvertRelativePathToFull(InCommand.PathToRepositoryRoot, File);
+			if (File.IsEmpty() || FPaths::DirectoryExists(AbsoluteFile)
+				|| AbsoluteFile.Contains(TEXT("\"")) || AbsoluteFile.Contains(TEXT("\r")) || AbsoluteFile.Contains(TEXT("\n"))
+				|| !FPaths::IsUnderDirectory(AbsoluteFile, InCommand.PathToGitRoot))
+			{
+				InCommand.ResultInfo.ErrorMessages.Add(FString::Printf(TEXT("还原范围必须是当前仓库内的明确文件：%s"), *File));
+				return false;
+			}
+			Files.AddUnique(AbsoluteFile);
+		}
+		const FString Revision = Operation->IsLastSyncedFlagSet() ? TEXT("HEAD") : Operation->GetRevision();
+		if (Revision.Contains(TEXT("\"")) || Revision.Contains(TEXT("\\"))
+			|| Revision.Contains(TEXT("\r")) || Revision.Contains(TEXT("\n")) || Revision.Contains(TEXT("\t")))
+		{
+			InCommand.ResultInfo.ErrorMessages.Add(TEXT("修订参数含不安全字符；未修改文件。"));
+			return false;
+		}
+		TArray<FString> ResolvedRevision;
+		bool bResolved = GitSourceControlUtils::RunCommand(TEXT("rev-parse"), InCommand.PathToGitBinary,
+			InCommand.PathToGitRoot, {TEXT("--verify"), TEXT("--end-of-options"), FString::Printf(TEXT("\"%s^{commit}\""), *Revision)},
+			{}, ResolvedRevision, InCommand.ResultInfo.ErrorMessages);
+		bResolved = bResolved && ResolvedRevision.Num() == 1;
+		if (bResolved)
+		{
+			bResolved = ResolvedRevision[0].Len() == 40 || ResolvedRevision[0].Len() == 64;
+			for (TCHAR Character : ResolvedRevision[0]) { bResolved &= FChar::IsHexDigit(Character); }
+		}
+		if (!bResolved)
+		{
+			InCommand.ResultInfo.ErrorMessages.Add(FString::Printf(TEXT("无法解析本地提交修订：%s；未修改文件。"), *Revision));
+			return false;
+		}
+		InCommand.bCommandSuccessful = GitSourceControlUtils::RunCommandWithPreWriteBoundary(
+			TEXT("--literal-pathspecs"), InCommand.PathToGitBinary, InCommand.PathToGitRoot,
+			{TEXT("checkout"), ResolvedRevision[0], TEXT("--")}, Files,
+			[&InCommand]()
+			{
+				return EnsureCommandLockWriteBoundary(InCommand, TEXT("Git restore selected revision"), InCommand.ResultInfo.ErrorMessages);
+			}, InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages);
+		TMap<FString, FGitSourceControlState> UpdatedStates;
+		if (RunUpdateStatusForCommand(InCommand, Files, InCommand.ResultInfo.ErrorMessages, UpdatedStates))
+		{
+			GitSourceControlUtils::CollectNewStates(UpdatedStates, States);
+		}
+		return InCommand.bCommandSuccessful;
+	}
+
 	TArray<FString> Results;
 	const bool bFetched = GitSourceControlUtils::FetchRemote(
 		InCommand.PathToGitBinary,
@@ -1810,10 +1931,18 @@ bool FGitUpdateStatusWorker::Execute(FGitSourceControlCommand& InCommand)
 
 	TSharedRef<FUpdateStatus, ESPMode::ThreadSafe> Operation = StaticCastSharedRef<FUpdateStatus>(InCommand.Operation);
 
+	// 事务扫描完整权威 LFS 列表，所以单文件状态刷新也不会遗漏此前由 UGit 创建的锁。
+	// The transaction scans the full authoritative LFS list, so even a one-file status refresh
+	// cannot miss a lock previously created by UGit.
+
 	if(InCommand.Files.Num() > 0)
 	{
 		TMap<FString, FGitSourceControlState> UpdatedStates;
-		InCommand.bCommandSuccessful = RunUpdateStatusForCommand(InCommand, InCommand.Files, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
+		InCommand.bCommandSuccessful = RunUpdateStatusForCommand(
+			InCommand,
+			InCommand.Files,
+			InCommand.ResultInfo.ErrorMessages,
+			UpdatedStates);
 		GitSourceControlUtils::RemoveRedundantErrors(InCommand, TEXT("' is outside repository"));
 		if (InCommand.bCommandSuccessful)
 		{
@@ -1825,15 +1954,29 @@ bool FGitUpdateStatusWorker::Execute(FGitSourceControlCommand& InCommand)
 					const FString& File = State.Key;
 					TGitSourceControlHistory History;
 
-					if (State.Value.IsConflicted())
+					// 当前修订始终取本地 HEAD 的首项；对端历史只作为冲突参考，不能覆盖本地基线。
+					// Current revision is the first local HEAD entry; conflict-side history is supplemental only.
+					const bool bLocalHistorySucceeded = GitSourceControlUtils::RunGetHistory(
+						InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, File, false,
+						InCommand.ResultInfo.ErrorMessages, History);
+					InCommand.bCommandSuccessful &= bLocalHistorySucceeded;
+					if (!bLocalHistorySucceeded)
 					{
-						// In case of a merge conflict, we first need to get the tip of the "remote branch" (MERGE_HEAD)
-						GitSourceControlUtils::RunGetHistory(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, File, true,
-															 InCommand.ResultInfo.ErrorMessages, History);
+						History.Reset();
 					}
-					// Get the history of the file in the current branch
-					InCommand.bCommandSuccessful &= GitSourceControlUtils::RunGetHistory(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, File, false,
-																						 InCommand.ResultInfo.ErrorMessages, History);
+					else if (!History.IsEmpty() && State.Value.IsConflicted())
+					{
+						TGitSourceControlHistory MergeHistory;
+						if (GitSourceControlUtils::RunGetHistory(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, File, true,
+							InCommand.ResultInfo.ErrorMessages, MergeHistory))
+						{
+							History.Append(MergeHistory);
+							for (int32 Index = 0; Index < History.Num(); ++Index)
+							{
+								History[Index]->RevisionNumber = History.Num() - Index;
+							}
+						}
+					}
 					Histories.Add(*File, History);
 				}
 			}
@@ -1843,9 +1986,13 @@ bool FGitUpdateStatusWorker::Execute(FGitSourceControlCommand& InCommand)
 	{
 		// no path provided: only update the status of assets in Content/ directory and also Config files
 		const TArray<FString> ProjectDirs = GitSourceControlUtils::GetSourceControlledAssetPaths();
-		
+
 		TMap<FString, FGitSourceControlState> UpdatedStates;
-		InCommand.bCommandSuccessful = RunUpdateStatusForCommand(InCommand, ProjectDirs, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
+		InCommand.bCommandSuccessful = RunUpdateStatusForCommand(
+			InCommand,
+			ProjectDirs,
+			InCommand.ResultInfo.ErrorMessages,
+			UpdatedStates);
 		GitSourceControlUtils::RemoveRedundantErrors(InCommand, TEXT("' is outside repository"));
 		if (InCommand.bCommandSuccessful)
 		{
