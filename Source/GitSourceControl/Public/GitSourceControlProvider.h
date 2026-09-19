@@ -194,6 +194,12 @@ public:
 #if ENGINE_MAJOR_VERSION == 5	
 	/** Helper function used to update changelists state cache */
 	TSharedRef<FGitSourceControlChangelistState, ESPMode::ThreadSafe> GetStateInternal(const FGitSourceControlChangelist& InChangelist);
+
+	/** 在主线程按新鲜文件状态更新其变更列表归属；不影响其他文件。 */
+	void UpdateChangelistState(const TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe>& InState);
+
+	/** 在主线程取得变更列表中的已知路径，供后台目录刷新识别已消失的文件。 */
+	TArray<FString> GetFilesInChangelists() const;
 #endif
 
 	/**

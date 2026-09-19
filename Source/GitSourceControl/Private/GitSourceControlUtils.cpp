@@ -12,6 +12,8 @@
 #include "GitSourceControlSettings.h"
 #include "GitLfsUnlock.h"
 #include "HAL/PlatformProcess.h"
+#include "HAL/PlatformTime.h"
+#include "HAL/PlatformTLS.h"
 #include "SourceControlOperations.h"
 
 #include "HAL/PlatformFile.h"
@@ -513,6 +515,18 @@ bool ShouldUseLegacyLfsLockCache(
 	}
 
 // Launch the Git command line process and extract its results & errors
+void LogPerformance(const FString& InMessage, double InSeconds)
+{
+	if (InSeconds >= 0.5)
+	{
+		UE_LOG(LogSourceControl, Display, TEXT("[GitTiming][thread=%u] %s"), FPlatformTLS::GetCurrentThreadId(), *InMessage);
+	}
+	else
+	{
+		UE_LOG(LogSourceControl, Verbose, TEXT("[GitTiming][thread=%u] %s"), FPlatformTLS::GetCurrentThreadId(), *InMessage);
+	}
+}
+
 bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters, const TArray<FString>& InFiles, FString& OutResults, FString& OutErrors, const int32 ExpectedReturnCode /* = 0 */)
 {
 	int32 ReturnCode = 0;
@@ -587,12 +601,21 @@ bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitB
 	}
 #endif
 
+	const double ProcessStartedAt = FPlatformTime::Seconds();
 	const bool bProcessLaunched = FPlatformProcess::ExecProcess(
 		*PathToGitOrEnvBinary,
 		*FullCommand,
 		&ReturnCode,
 		&OutResults,
 		&OutErrors);
+	const double ProcessSeconds = FPlatformTime::Seconds() - ProcessStartedAt;
+	FString CommandLabel = InCommand;
+	if (InCommand == TEXT("-c") && InParameters.Num() > 1)
+	{
+		CommandLabel = InParameters[1] == TEXT("--no-optional-locks") ? TEXT("status") : InParameters[1];
+	}
+	LogPerformance(FString::Printf(TEXT("subprocess=%s files=%d success=%d elapsed=%.3fs"),
+		*CommandLabel, InFiles.Num(), bProcessLaunched && ReturnCode == ExpectedReturnCode, ProcessSeconds), ProcessSeconds);
 	if (!bProcessLaunched && OutErrors.IsEmpty())
 	{
 		OutErrors = FString::Printf(TEXT("无法启动 Git/LFS 进程：%s"), *PathToGitOrEnvBinary);
@@ -2340,7 +2363,7 @@ static void ParseFileStatusResult(
 	ParseDirectoryStatusResult(InUsingLfsLocking, Results, OutStates);
 }
 
-void ParseStatusResults(
+bool ParseStatusResults(
 	const FString& InPathToGitBinary,
 	const FString& InRepositoryRoot,
 	bool InUsingLfsLocking,
@@ -2349,26 +2372,60 @@ void ParseStatusResults(
 	const TArray<FString>& InFiles,
 	const TMap<FString, FString>& InResults,
 	TMap<FString, FGitSourceControlState>& OutStates,
-	bool& InOutSettingsSuperseded)
+	bool& InOutSettingsSuperseded,
+	const TArray<FString>* InKnownChangelistFiles)
 {
 	TSet<FString> Files;
+	TArray<FString> Directories;
 	for (const auto& File : InFiles)
 	{
 		if (FPaths::DirectoryExists(File))
 		{
+			Directories.Add(File);
 			TArray<FString> DirectoryFiles;
 			const bool bResult = ListFilesInDirectoryRecurse(InPathToGitBinary, InRepositoryRoot, File, DirectoryFiles);
-			if (bResult)
+			if (!bResult)
 			{
-				for (const auto& InnerFile : DirectoryFiles)
-				{
-					Files.Add(InnerFile);
-				}
+				return false;
+			}
+			for (const auto& InnerFile : DirectoryFiles)
+			{
+				Files.Add(InnerFile);
 			}
 		}
 		else
 		{
 			Files.Add(File);
+		}
+	}
+	// 已删除或被忽略的旧列表项可同时消失于 status 和 ls-files。只对账已查询目录中的
+	// 同仓路径；现存但既未跟踪也未出现在 -uall 结果中的文件是 ignored，不能伪装成 clean。
+	// Old entries can disappear from both status and ls-files. Reconcile only queried directories in
+	// this repo; an existing file absent from both tracked paths and -uall is ignored, not tracked-clean.
+	if (InKnownChangelistFiles && !Directories.IsEmpty())
+	{
+		for (const FString& KnownFile : *InKnownChangelistFiles)
+		{
+			if (Files.Contains(KnownFile) || !Directories.ContainsByPredicate(
+				[&KnownFile](const FString& Directory) { return FPaths::IsUnderDirectory(KnownFile, Directory); }))
+			{
+				continue;
+			}
+			FString FileCopy = KnownFile;
+			if (!FPaths::IsSamePath(ChangeRepositoryRootIfSubmodule(FileCopy, InRepositoryRoot), InRepositoryRoot))
+			{
+				continue;
+			}
+			if (InResults.Contains(KnownFile) || !FPaths::FileExists(KnownFile))
+			{
+				Files.Add(KnownFile);
+			}
+			else
+			{
+				FGitSourceControlState IgnoredState(KnownFile);
+				IgnoredState.State.TreeState = ETreeState::Ignored;
+				OutStates.Add(KnownFile, MoveTemp(IgnoredState));
+			}
 		}
 	}
 	ParseFileStatusResult(
@@ -2381,6 +2438,7 @@ void ParseStatusResults(
 		InResults,
 		OutStates,
 		InOutSettingsSuperseded);
+	return true;
 }
 
 void CheckRemote(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& Files,
@@ -2635,67 +2693,6 @@ FString GetFullPathFromGitStatus(const FString& Result, const FString& InReposit
 	return File;
 }
 
-#if ENGINE_MAJOR_VERSION == 5
-bool UpdateChangelistStateByCommand()
-{
-	// TODO: This is a temporary solution.
-	FModuleManager &ModuleManager = FModuleManager::Get();
-	FName GitModuleName = "GitSourceControl";
-
-	if (!ModuleManager.IsModuleLoaded(GitModuleName))
-	{
-		UE_LOG(LogSourceControl, Warning, TEXT("GitSourceControl module is not loaded."));
-		return false;
-	}
-
-	FGitSourceControlModule& GitSourceControl = FModuleManager::GetModuleChecked<FGitSourceControlModule>("GitSourceControl");
-	FGitSourceControlProvider& Provider = GitSourceControl.GetProvider();
-	if (!Provider.IsGitAvailable())
-	{
-		return false;
-	}
-	TSharedRef<FGitSourceControlChangelistState, ESPMode::ThreadSafe> StagedChangelist = Provider.GetStateInternal(FGitSourceControlChangelist::StagedChangelist);
-	TSharedRef<FGitSourceControlChangelistState, ESPMode::ThreadSafe> WorkingChangelist = Provider.GetStateInternal(FGitSourceControlChangelist::WorkingChangelist);
-	StagedChangelist->Files.RemoveAll([](const FSourceControlStateRef& InState){ return true; });
-	WorkingChangelist->Files.RemoveAll([](const FSourceControlStateRef& InState){ return true; });
-
-	TArray<FString> Files;
-	Files.Add(TEXT("Content/"));
-	TArray<FString> Parameters;
-	Parameters.Add(TEXT("--porcelain"));
-	TArray<FString> Results;
-	TArray<FString> ErrorMsg;
-	const bool bResult = RunStatusWithLiteralPaths(
-		Provider.GetGitBinaryPath(),
-		Provider.GetPathToRepositoryRoot(),
-		Parameters,
-		Files,
-		Results,
-		ErrorMsg);
-	for (const auto& Result : Results)
-	{
-		FString File = GetFullPathFromGitStatus(Result, Provider.GetPathToRepositoryRoot());
-		TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> State = Provider.GetStateInternal(File);
-		// Staged check
-		if (!TChar<TCHAR>::IsWhitespace(Result[0]))
-		{
-			WorkingChangelist->Files.Remove(State);
-			State->Changelist = FGitSourceControlChangelist::StagedChangelist;
-			StagedChangelist->Files.AddUnique(State);
-			continue;
-		}
-		// Working check
-		if (!TChar<TCHAR>::IsWhitespace(Result[1]))
-		{
-			StagedChangelist->Files.Remove(State);
-			State->Changelist = FGitSourceControlChangelist::WorkingChangelist;
-			WorkingChangelist->Files.AddUnique(State);
-		}
-	}
-	return true;
-}
-#endif
-
 // Run a batch of Git "status" command to update status of given files and/or directories.
 bool RunUpdateStatus(
 	const FString& InPathToGitBinary,
@@ -2706,8 +2703,10 @@ bool RunUpdateStatus(
 	const TArray<FString>& InFiles,
 	TArray<FString>& OutErrorMessages,
 	TMap<FString, FGitSourceControlState>& OutStates,
-	bool& InOutSettingsSuperseded)
+	bool& InOutSettingsSuperseded,
+	const TArray<FString>* InKnownChangelistFiles)
 {
+	const double StartedAt = FPlatformTime::Seconds();
 	// Remove files that aren't in the repository
 	const TArray<FString>& RepoFiles = InFiles.FilterByPredicate([InRepositoryRoot](const FString& File) { return File.StartsWith(InRepositoryRoot); });
 
@@ -2722,13 +2721,14 @@ bool RunUpdateStatus(
 	// We skip checking ignored since no one ignores files that Unreal would read in as revision controlled (Content/{*.uasset,*.umap},Config/*.ini).
 	TArray<FString> Results;
 	// avoid locking the index when not needed (useful for status updates)
-	const bool bResult = RunStatusWithLiteralPaths(
+	bool bResult = RunStatusWithLiteralPaths(
 		InPathToGitBinary,
 		InRepositoryRoot,
 		Parameters,
 		RepoFiles,
 		Results,
 		OutErrorMessages);
+	const double LocalStatusFinishedAt = FPlatformTime::Seconds();
 	TMap<FString, FString> ResultsMap;
 	for (const auto& Result : Results)
 	{
@@ -2738,7 +2738,7 @@ bool RunUpdateStatus(
 	}
 	if (bResult)
 	{
-		ParseStatusResults(
+		bResult = ParseStatusResults(
 			InPathToGitBinary,
 			InRepositoryRoot,
 			InUsingLfsLocking,
@@ -2747,15 +2747,22 @@ bool RunUpdateStatus(
 			RepoFiles,
 			ResultsMap,
 			OutStates,
-			InOutSettingsSuperseded);
+			InOutSettingsSuperseded,
+			InKnownChangelistFiles);
+		if (!bResult)
+		{
+			OutErrorMessages.Add(TEXT("无法完整枚举 Git 跟踪文件，保留原有状态和变更列表。"));
+		}
 	}
-
-#if ENGINE_MAJOR_VERSION == 5
-	UpdateChangelistStateByCommand();
-#endif
-
-	CheckRemote(InPathToGitBinary, InRepositoryRoot, RepoFiles, OutErrorMessages, OutStates);
-
+	const double ParsedAt = FPlatformTime::Seconds();
+	if (bResult)
+	{
+		CheckRemote(InPathToGitBinary, InRepositoryRoot, RepoFiles, OutErrorMessages, OutStates);
+	}
+	const double FinishedAt = FPlatformTime::Seconds();
+	LogPerformance(FString::Printf(TEXT("status scopes=%d states=%d success=%d local=%.3fs parse_locks=%.3fs remote=%.3fs total=%.3fs"),
+		RepoFiles.Num(), OutStates.Num(), bResult, LocalStatusFinishedAt - StartedAt,
+		ParsedAt - LocalStatusFinishedAt, FinishedAt - ParsedAt, FinishedAt - StartedAt), FinishedAt - StartedAt);
 	return bResult;
 }
 
@@ -3249,6 +3256,12 @@ bool UpdateCachedStates(const TMap<const FString, FGitState>& InResults)
 			}
 		}
 		State->TimeStamp = Now;
+#if ENGINE_MAJOR_VERSION == 5
+		if (NewState.bFromStatus && NewState.TreeState != ETreeState::Unset)
+		{
+			Provider.UpdateChangelistState(State);
+		}
+#endif
 
 		// We've just updated the state, no need for UpdateStatus to be ran for this file again.
 		Provider.AddFileToIgnoreForceCache(State->LocalFilename);

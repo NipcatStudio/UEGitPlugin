@@ -532,6 +532,9 @@ void FGitSourceControlProvider::Close()
 
 	// clear the cache
 	StateCache.Empty();
+#if ENGINE_MAJOR_VERSION == 5
+	ChangelistsStateCache.Empty();
+#endif
 	// Remove all extensions to the "Revision Control" menu in the Editor Toolbar
 	GitSourceControlMenu.Unregister();
 
@@ -583,6 +586,62 @@ TSharedRef<FGitSourceControlChangelistState, ESPMode::ThreadSafe> FGitSourceCont
 		ChangelistsStateCache.Add(InChangelist, NewState);
 		return NewState;
 	}
+}
+
+void FGitSourceControlProvider::UpdateChangelistState(
+	const TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe>& InState)
+{
+	check(IsInGameThread());
+	if (InState->State.TreeState == ETreeState::Unset)
+	{
+		return;
+	}
+
+	FGitSourceControlChangelist Destination;
+	if (InState->State.TreeState == ETreeState::Staged)
+	{
+		Destination = FGitSourceControlChangelist::StagedChangelist;
+	}
+	else if (InState->State.TreeState == ETreeState::Working
+		|| InState->State.TreeState == ETreeState::Untracked)
+	{
+		Destination = FGitSourceControlChangelist::WorkingChangelist;
+	}
+	if (InState->Changelist == Destination)
+	{
+		return;
+	}
+
+	// 变更列表与文件缓存共用已解析的 Git 状态；不再为 UI 另扫目录，也不从 worker 修改数组。
+	// Changelists share the parsed Git state with the file cache: no extra scan or worker-side array writes.
+	const auto Staged = GetStateInternal(FGitSourceControlChangelist::StagedChangelist);
+	const auto Working = GetStateInternal(FGitSourceControlChangelist::WorkingChangelist);
+	Staged->Files.Remove(InState);
+	Working->Files.Remove(InState);
+	InState->Changelist = Destination;
+	if (Destination == FGitSourceControlChangelist::StagedChangelist)
+	{
+		Staged->Files.Add(InState);
+	}
+	else if (Destination == FGitSourceControlChangelist::WorkingChangelist)
+	{
+		Working->Files.Add(InState);
+	}
+	Staged->TimeStamp = Working->TimeStamp = FDateTime::Now();
+}
+
+TArray<FString> FGitSourceControlProvider::GetFilesInChangelists() const
+{
+	check(IsInGameThread());
+	TArray<FString> Files;
+	for (const auto& Changelist : ChangelistsStateCache)
+	{
+		for (const FSourceControlStateRef& State : Changelist.Value->Files)
+		{
+			Files.Add(State->GetFilename());
+		}
+	}
+	return Files;
 }
 #endif
 
@@ -1379,6 +1438,7 @@ ECommandResult::Type FGitSourceControlProvider::ExecuteSynchronousCommand(FGitSo
 
 ECommandResult::Type FGitSourceControlProvider::IssueCommand(FGitSourceControlCommand& InCommand, const bool bSynchronous)
 {
+	InCommand.QueuedAtSeconds = FPlatformTime::Seconds();
 	if (!bSynchronous && GThreadPool != nullptr)
 	{
 		// Queue this to our worker thread(s) for resolving.

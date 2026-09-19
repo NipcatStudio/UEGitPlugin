@@ -130,12 +130,24 @@ public:
 	/** Whether we are running multi-treaded or not*/
 	EConcurrency::Type Concurrency;
 
+	/** 命令创建、入队、开始与结束时间（单调时钟秒），用于区分准备、排队及执行耗时。 */
+	double CreatedAtSeconds = 0.0;
+	double QueuedAtSeconds = 0.0;
+	double WorkStartedAtSeconds = 0.0;
+	double WorkFinishedAtSeconds = 0.0;
+
+	/** 执行 Git 操作的线程编号，用于关联同一线程的子进程耗时日志。 */
+	uint32 WorkerThreadId = 0;
+
 	/** Files to perform this operation on */
 	TArray<FString> Files;
 
 #if ENGINE_MAJOR_VERSION == 5
     /** Changelist to perform this operation on */
     FGitSourceControlChangelist Changelist;
+
+	/** 主线程冻结的变更列表路径；仅用于已查询目录内消失文件的状态对账。 */
+	TArray<FString> KnownChangelistFiles;
 #endif
 
 	/** Potential error, warning and info message storage */

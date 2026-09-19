@@ -9,6 +9,8 @@
 #include "GitSourceControlModule.h"
 #include "GitSourceControlSettings.h"
 #include "GitSourceControlUtils.h"
+#include "HAL/PlatformTime.h"
+#include "HAL/PlatformTLS.h"
 
 FGitSourceControlCommand::FGitSourceControlCommand(const TSharedRef<class ISourceControlOperation, ESPMode::ThreadSafe>& InOperation, const TSharedRef<class IGitSourceControlWorker, ESPMode::ThreadSafe>& InWorker, const FSourceControlOperationComplete& InOperationCompleteDelegate)
 	: Operation(InOperation)
@@ -20,6 +22,7 @@ FGitSourceControlCommand::FGitSourceControlCommand(const TSharedRef<class ISourc
 	, bAutoDelete(true)
 	, Concurrency(EConcurrency::Synchronous)
 {
+	CreatedAtSeconds = FPlatformTime::Seconds();
 	// cache the providers settings here
 	const FGitSourceControlModule& GitSourceControl = FGitSourceControlModule::Get();
 	const FGitSourceControlProvider& Provider = GitSourceControl.GetProvider();
@@ -28,6 +31,9 @@ FGitSourceControlCommand::FGitSourceControlCommand(const TSharedRef<class ISourc
 	PathToGitBinary = Provider.GetGitBinaryPath();
 	PathToRepositoryRoot = Provider.GetPathToRepositoryRoot();
 	PathToGitRoot = Provider.GetPathToGitRoot();
+#if ENGINE_MAJOR_VERSION == 5
+	KnownChangelistFiles = Provider.GetFilesInChangelists();
+#endif
 	bUsingGitLfsLocking = Provider.UsesCheckout();
 	LfsUserName = LockSettings.LfsUserName;
 	bSettingsUsingGitLfsLocking =
@@ -64,8 +70,9 @@ void FGitSourceControlCommand::UpdateRepositoryRootIfSubmodule(TArray<FString>& 
 		PathToGitRoot = NewRepositoryRoot;
 	}
 
+	const bool bRepositoryChanged = !FPaths::IsSamePath(NewRepositoryRoot, PathToRepositoryRoot);
 	PathToRepositoryRoot = NewRepositoryRoot;
-	if (bUsingGitLfsLocking)
+	if (bUsingGitLfsLocking && bRepositoryChanged)
 	{
 		// 构造函数先看到主 Provider 根；切换为子模块后必须重抓该仓的 live branch，后续
 		// commit/push 边界与显式 refspec 才不会拿主仓分支校验子模块。
@@ -81,7 +88,10 @@ void FGitSourceControlCommand::UpdateRepositoryRootIfSubmodule(TArray<FString>& 
 
 bool FGitSourceControlCommand::DoWork()
 {
+	WorkStartedAtSeconds = FPlatformTime::Seconds();
+	WorkerThreadId = FPlatformTLS::GetCurrentThreadId();
 	bCommandSuccessful = Worker->Execute(*this);
+	WorkFinishedAtSeconds = FPlatformTime::Seconds();
 	FPlatformAtomics::InterlockedExchange(&bExecuteProcessed, 1);
 
 	return bCommandSuccessful;
@@ -110,6 +120,17 @@ bool FGitSourceControlCommand::IsCanceled() const
 
 ECommandResult::Type FGitSourceControlCommand::ReturnResults()
 {
+	if (bExecuteProcessed && WorkFinishedAtSeconds > 0.0)
+	{
+		const double Now = FPlatformTime::Seconds();
+		GitSourceControlUtils::LogPerformance(
+			FString::Printf(TEXT("operation=%s files=%d thread=%u success=%d setup=%.3fs queue=%.3fs work=%.3fs delivery=%.3fs total=%.3fs"),
+				*Operation->GetName().ToString(), Files.Num(), WorkerThreadId, bCommandSuccessful,
+				QueuedAtSeconds > 0.0 ? QueuedAtSeconds - CreatedAtSeconds : 0.0,
+				QueuedAtSeconds > 0.0 ? WorkStartedAtSeconds - QueuedAtSeconds : 0.0,
+				WorkFinishedAtSeconds - WorkStartedAtSeconds, Now - WorkFinishedAtSeconds, Now - CreatedAtSeconds),
+			Now - CreatedAtSeconds);
+	}
 	// Save any messages that have accumulated
 	for (const auto& String : ResultInfo.InfoMessages)
 	{

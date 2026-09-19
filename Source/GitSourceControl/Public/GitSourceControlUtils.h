@@ -376,7 +376,8 @@ bool RunCommit(
  * @param[out]	OutStates			States of files for witch the status has been gathered (distinct than InFiles in case of a "directory status")
  * @param[out]	InOutSettingsSuperseded	旧命令快照生成 fail-closed 状态时置位 / Set when an obsolete command snapshot produced fail-closed states
  */
-GITSOURCECONTROL_API void ParseStatusResults(
+/** 解析成功才返回 true；目录枚举失败时不发布不完整状态。 */
+GITSOURCECONTROL_API bool ParseStatusResults(
 	const FString& InPathToGitBinary,
 	const FString& InRepositoryRoot,
 	bool InUsingLfsLocking,
@@ -385,7 +386,8 @@ GITSOURCECONTROL_API void ParseStatusResults(
 	const TArray<FString>& InFiles,
 	const TMap<FString, FString>& InResults,
 	TMap<FString, FGitSourceControlState>& OutStates,
-	bool& InOutSettingsSuperseded);
+	bool& InOutSettingsSuperseded,
+	const TArray<FString>* InKnownChangelistFiles = nullptr);
 
 /**
  * Checks remote branches to see file differences.
@@ -419,7 +421,11 @@ bool RunUpdateStatus(
 	const TArray<FString>& InFiles,
 	TArray<FString>& OutErrorMessages,
 	TMap<FString, FGitSourceControlState>& OutStates,
-	bool& InOutSettingsSuperseded);
+	bool& InOutSettingsSuperseded,
+	const TArray<FString>* InKnownChangelistFiles = nullptr);
+
+/** 记录不含命令参数或凭据的耗时摘要；至少 0.5 秒时默认可见，其余仅 Verbose 可见。 */
+void LogPerformance(const FString& InMessage, double InSeconds);
 
 #if ENGINE_MAJOR_VERSION == 5
 /**
@@ -448,17 +454,6 @@ bool UpdateFileStagingOnSavedInternal(const FString& Filename);
  * @param   ObjectSaveContext	Context for save (for adapting delegate)
  */    
 void UpdateStateOnAssetRename(const FAssetData& InAssetData, const FString& InOldName);
-
-#if ENGINE_MAJOR_VERSION == 5
-/**
- * 
- *
- * @param	Filename			Saved filename
- * @param	Pkg					Package (for adapting delegate)
- * @param   ObjectSaveContext	Context for save (for adapting delegate)
- */
-bool UpdateChangelistStateByCommand();
-#endif
 
 /**
  * Run a Git "cat-file" command to dump the binary content of a revision into a file.

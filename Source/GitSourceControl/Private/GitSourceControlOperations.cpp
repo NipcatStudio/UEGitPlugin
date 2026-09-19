@@ -387,6 +387,10 @@ static bool RunUpdateStatusForCommand(
 	TArray<FString>& OutErrorMessages,
 	TMap<FString, FGitSourceControlState>& OutStates)
 {
+	const TArray<FString>* KnownChangelistFiles = nullptr;
+#if ENGINE_MAJOR_VERSION == 5
+	KnownChangelistFiles = &InCommand.KnownChangelistFiles;
+#endif
 	return GitSourceControlUtils::RunUpdateStatus(
 		InCommand.PathToGitBinary,
 		InCommand.PathToRepositoryRoot,
@@ -396,7 +400,8 @@ static bool RunUpdateStatusForCommand(
 		InFiles,
 		OutErrorMessages,
 		OutStates,
-		InCommand.bStatusSettingsSuperseded);
+		InCommand.bStatusSettingsSuperseded,
+		KnownChangelistFiles);
 }
 
 static const FGitSourceControlState* FindStateByPath(
@@ -1038,16 +1043,10 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& InCommand)
 		// If we commit, we can push up the deleted state to gone
 		if (bDoCommit)
 		{
-			// Remove any deleted files from status cache
-			TArray<TSharedRef<ISourceControlState, ESPMode::ThreadSafe>> LocalStates;
-			Provider.GetState(InCommand.Files, LocalStates, EStateCacheUsage::Use);
-			for (const auto& State : LocalStates)
-			{
-				if (State->IsDeleted())
-				{
-					Provider.RemoveFileFromCache(State->GetFilename());
-				}
-			}
+			// 保留删除项的共享状态，随后由主线程的新鲜 status 移出变更列表；worker 不能
+			// 提前移除缓存，否则列表会持有再也收不到更新的旧引用。
+			// Keep the shared deleted-file state until the fresh status reaches the game thread.
+			// Removing it here would leave changelists holding an orphaned reference.
 			Operation->SetSuccessMessage(ParseCommitResults(InCommand.ResultInfo.InfoMessages));
 			const FString& Message = (InCommand.ResultInfo.InfoMessages.Num() > 0) ? InCommand.ResultInfo.InfoMessages[0] : TEXT("");
 			UE_LOG(LogSourceControl, Log, TEXT("commit successful: %s"), *Message);
@@ -2123,7 +2122,7 @@ FName FGitMoveToChangelistWorker::GetName() const
 
 bool FGitMoveToChangelistWorker::UpdateStates() const
 {
-	return true;
+	return GitSourceControlUtils::UpdateCachedStates(States);
 }
 
 bool FGitMoveToChangelistWorker::Execute(FGitSourceControlCommand& InCommand)
@@ -2159,13 +2158,18 @@ bool FGitMoveToChangelistWorker::Execute(FGitSourceControlCommand& InCommand)
 
 	if (bResult)
 	{
-		TMap<FString, FGitSourceControlState> DummyStates;
-		RunUpdateStatusForCommand(
+		TMap<FString, FGitSourceControlState> UpdatedStates;
+		bResult = RunUpdateStatusForCommand(
 			InCommand,
 			InCommand.Files,
-			InCommand.ResultInfo.InfoMessages,
-			DummyStates);
+			InCommand.ResultInfo.ErrorMessages,
+			UpdatedStates);
+		if (bResult)
+		{
+			GitSourceControlUtils::CollectNewStates(UpdatedStates, States);
+		}
 	}
+	InCommand.bCommandSuccessful = bResult;
 	return bResult;
 }
 
@@ -2176,12 +2180,22 @@ FName FGitUpdateStagingWorker::GetName() const
 
 bool FGitUpdateStagingWorker::Execute(FGitSourceControlCommand& InCommand)
 {
-	return GitSourceControlUtils::UpdateChangelistStateByCommand();
+	check(InCommand.Operation->GetName() == GetName());
+	const TArray<FString> Files = InCommand.Files.IsEmpty()
+		? GitSourceControlUtils::GetSourceControlledAssetPaths() : InCommand.Files;
+	TMap<FString, FGitSourceControlState> UpdatedStates;
+	InCommand.bCommandSuccessful = RunUpdateStatusForCommand(
+		InCommand, Files, InCommand.ResultInfo.ErrorMessages, UpdatedStates);
+	if (InCommand.bCommandSuccessful)
+	{
+		GitSourceControlUtils::CollectNewStates(UpdatedStates, States);
+	}
+	return InCommand.bCommandSuccessful;
 }
 
 bool FGitUpdateStagingWorker::UpdateStates() const
 {
-	return true;
+	return GitSourceControlUtils::UpdateCachedStates(States);
 }
 #endif
 
