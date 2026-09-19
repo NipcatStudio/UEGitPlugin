@@ -492,4 +492,80 @@ bool FGitSourceControlLiteralPathScopeTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FGitSourceControlModifiedPresentationTest,
+	"GitSourceControl.State.ModifiedPresentation",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitSourceControlModifiedPresentationTest::RunTest(const FString& Parameters)
+{
+	FGitSourceControlState State(TEXT("Content/ModifiedPresentation.uasset"));
+	State.State.FileState = EFileState::Modified;
+	State.State.TreeState = ETreeState::Working;
+	State.State.RemoteState = ERemoteState::UpToDate;
+
+	State.State.LockState = ELockState::NotLocked;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 2
+	TestEqual(
+		TEXT("未持锁的本地修改应使用 ModifiedLocally 图标"),
+		State.GetIcon().GetStyleName(),
+		FName(TEXT("RevisionControl.ModifiedLocally")));
+#endif
+	TestEqual(
+		TEXT("未持锁的本地修改应明确显示未 Checkout"),
+		State.GetDisplayName().ToString(),
+		FString(TEXT("本地已修改，未 Checkout")));
+	TestTrue(
+		TEXT("未持锁的本地修改应提示补取 LFS 锁"),
+		State.GetDisplayTooltip().ToString().Contains(TEXT("没有持有 LFS 锁"))
+			&& State.GetDisplayTooltip().ToString().Contains(TEXT("Check Out")));
+	TestTrue(TEXT("未持锁的本地修改仍应提供 Checkout 入口"), State.CanCheckout());
+	TestFalse(TEXT("未持锁的本地修改不应报告为 Checkout"), State.IsCheckedOut());
+	TestTrue(TEXT("未持锁的既有本地修改仍应允许继续编辑"), State.CanEdit());
+	TestFalse(
+		TEXT("未持锁的本地修改不应进入 Checked Out Filter"),
+		State.IsCheckedOut() || State.IsAdded());
+
+	State.State.LockState = ELockState::Locked;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 2
+	TestEqual(
+		TEXT("当前用户持锁的本地修改应保留绿色 CheckedOut 图标"),
+		State.GetIcon().GetStyleName(),
+		FName(TEXT("RevisionControl.CheckedOut")));
+#endif
+	TestEqual(
+		TEXT("当前用户持锁的本地修改应显示已 Checkout"),
+		State.GetDisplayName().ToString(),
+		FString(TEXT("已 Checkout（本地已修改）")));
+	TestFalse(TEXT("当前用户持锁后不应重复提供 Checkout"), State.CanCheckout());
+	TestTrue(TEXT("当前用户持锁时应报告为 Checkout"), State.IsCheckedOut());
+	TestTrue(
+		TEXT("当前用户持锁时应进入 Checked Out Filter"),
+		State.IsCheckedOut() || State.IsAdded());
+
+	State.State.LockState = ELockState::Unlockable;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 2
+	TestEqual(
+		TEXT("非锁模式的本地修改也应使用 ModifiedLocally 图标"),
+		State.GetIcon().GetStyleName(),
+		FName(TEXT("RevisionControl.ModifiedLocally")));
+#endif
+	TestEqual(
+		TEXT("非锁模式不应声称缺少 Checkout"),
+		State.GetDisplayName().ToString(),
+		FString(TEXT("本地已修改")));
+	TestTrue(
+		TEXT("非锁模式以 Unlockable 兼容投影满足 UE no-checkout consumers"),
+		State.IsCheckedOut());
+	TestFalse(
+		TEXT("Unlockable 兼容投影不得伪造远端锁所有权"),
+		State.HasVerifiedOwnLock());
+	TestTrue(
+		TEXT("UE Checked Out Filter 对 no-checkout provider 保留 Unlockable 兼容例外"),
+		State.IsCheckedOut() || State.IsAdded());
+	TestTrue(TEXT("非锁模式的已跟踪文件仍应允许编辑"), State.CanEdit());
+
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

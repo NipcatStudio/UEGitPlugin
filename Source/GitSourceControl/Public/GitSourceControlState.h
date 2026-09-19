@@ -9,7 +9,11 @@
 #include "GitSourceControlRevision.h"
 #include "Runtime/Launch/Resources/Version.h"
 
-/** A consolidation of state priorities. */
+/**
+ * 面向 Editor 的 Git 状态优先级投影；高优先级异常会覆盖普通文件修改状态。
+ * Editor-facing Git state priority projection. Higher-priority failures override ordinary file
+ * modification states.
+ */
 namespace EGitState
 {
 	enum Type
@@ -78,7 +82,10 @@ namespace ETreeState
 	};
 }
 
-/** LFS locks status of this file */
+/**
+ * 文件的 LFS 锁所有权与未知状态；不能从本地内容修改推断远端所有权。
+ * LFS lock ownership and unknown state; local content changes never establish remote ownership.
+ */
 namespace ELockState
 {
 	enum Type
@@ -89,6 +96,8 @@ namespace ELockState
 		NotLocked,
 		Locked,
 		LockedOther,
+		/** 枚举哨兵，仅用于完整遍历测试；不得作为运行时状态。 / Sentinel for exhaustive tests only; never use it as runtime state. */
+		Count,
 	};
 }
 
@@ -172,6 +181,8 @@ public:
 	virtual bool CanCheckIn() const override;
 	virtual bool CanCheckout() const override;
 	virtual bool IsCheckedOut() const override;
+	/** 仅表示当前用户持有插件核验过的远端锁；不包含 UE no-checkout 兼容投影。 */
+	bool HasVerifiedOwnLock() const;
 	virtual bool IsCheckedOutOther(FString* Who = NULL) const override;
 	virtual bool IsCheckedOutInOtherBranch(const FString& CurrentBranch = FString()) const override;
 	virtual bool IsModifiedInOtherBranch(const FString& CurrentBranch = FString()) const override;
@@ -196,7 +207,7 @@ private:
 	EGitState::Type GetGitState() const;
 
 public:
-	/** History of the item, if any */
+	/** 本地 HEAD 的文件历史按新到旧排列，首项为当前本地版本；冲突对端历史只能附在末尾。 */
 	TGitSourceControlHistory History;
 
 	/** Filename on disk */

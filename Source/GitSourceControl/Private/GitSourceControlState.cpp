@@ -115,6 +115,15 @@ FSlateIcon FGitSourceControlState::GetIcon() const
 	case EGitState::Deleted:
 		return GET_ICON_RETURN(MarkedForDelete);
 	case EGitState::Modified:
+		// UE 5.2+ 提供中性的本地修改图标；绿色勾只表示当前用户实际持锁。
+		// UE 5.2+ provides a neutral local-modification icon; reserve the green check for a lock actually owned by the current user.
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 2
+		if (State.LockState != ELockState::Locked)
+		{
+			return GET_ICON_RETURN(ModifiedLocally);
+		}
+#endif
+		return GET_ICON_RETURN(CheckedOut);
 	case EGitState::CheckedOut:
 		return GET_ICON_RETURN(CheckedOut);
 	case EGitState::CommittedUnpushed:
@@ -186,8 +195,17 @@ FText FGitSourceControlState::GetDisplayName() const
 	case EGitState::Deleted:
 		return LOCTEXT("MarkedForDelete", "Marked for delete");
 	case EGitState::Modified:
+		if (State.LockState == ELockState::Locked)
+		{
+			return LOCTEXT("CheckedOutModified", "已 Checkout（本地已修改）");
+		}
+		if (State.LockState == ELockState::NotLocked)
+		{
+			return LOCTEXT("ModifiedLocallyNotCheckedOut", "本地已修改，未 Checkout");
+		}
+		return LOCTEXT("ModifiedLocally", "本地已修改");
 	case EGitState::CheckedOut:
-		return LOCTEXT("CheckedOut", "Checked out");
+		return LOCTEXT("CheckedOut", "已 Checkout");
 	case EGitState::CommittedUnpushed:
 		return LOCTEXT("CommittedUnpushed", "Committed, not pushed");
 	case EGitState::Ignored:
@@ -220,8 +238,23 @@ FText FGitSourceControlState::GetDisplayTooltip() const
 	case EGitState::Deleted:
 		return LOCTEXT("MarkedForDelete_Tooltip", "The file(s) are marked for delete");
 	case EGitState::Modified:
+		if (State.LockState == ELockState::Locked)
+		{
+			return LOCTEXT(
+				"CheckedOutModified_Tooltip",
+				"文件已由当前用户 Checkout，并包含尚未提交的本地修改。");
+		}
+		if (State.LockState == ELockState::NotLocked)
+		{
+			return LOCTEXT(
+				"ModifiedLocallyNotCheckedOut_Tooltip",
+				"文件存在本地修改，但当前没有持有 LFS 锁；可执行 Check Out 补取锁。");
+		}
+		return LOCTEXT(
+			"ModifiedLocally_Tooltip",
+			"文件包含尚未提交的本地修改。");
 	case EGitState::CheckedOut:
-		return LOCTEXT("CheckedOut_Tooltip", "The file(s) are checked out");
+		return LOCTEXT("CheckedOut_Tooltip", "文件已由当前用户 Checkout。");
 	case EGitState::CommittedUnpushed:
 		return LOCTEXT("CommittedUnpushed_Tooltip", "All local changes are committed and waiting to be pushed; the lock is held until the push lands.");
 	case EGitState::Ignored:
@@ -251,7 +284,11 @@ bool FGitSourceControlState::CanCheckIn() const
 	// We can check in if this is new content
 	if (IsAdded())
 	{
-		return true;
+		// 新增状态不能覆盖未知或他人持锁；只有明确允许本地工作的锁状态可提交。
+		// Added content cannot override unknown or foreign ownership; submit requires a workable lock state.
+		return State.LockState == ELockState::Locked
+			|| State.LockState == ELockState::NotLocked
+			|| State.LockState == ELockState::Unlockable;
 	}
 
 	// Cannot check back in if conflicted or not current
@@ -275,8 +312,12 @@ bool FGitSourceControlState::CanCheckIn() const
 		return true;
 	}
 
-	// We can check in any file that has been modified, unless someone else locked it.
-	if (State.LockState != ELockState::LockedOther && IsModified() && IsSourceControlled())
+	// 已修改文件只接受明确可工作的 NotLocked/Unlockable；未知或他人锁失败关闭。
+	// Modified files accept explicitly workable NotLocked/Unlockable states; unknown or foreign locks fail closed.
+	if ((State.LockState == ELockState::NotLocked
+			|| State.LockState == ELockState::Unlockable)
+		&& IsModified()
+		&& IsSourceControlled())
 	{
 		return true;
 	}
@@ -293,22 +334,31 @@ bool FGitSourceControlState::CanCheckout() const
 	}
 	else
 	{
-		// We don't want to allow checkout if the file is out-of-date, as modifying an out-of-date binary file will most likely result in a merge conflict
-		return State.LockState == ELockState::NotLocked && IsCurrent();
+		// 只有未锁定且当前版本的受控文件才能取得锁，避免修改过期的二进制内容。
+		// Only unlocked, current, controlled files may acquire a lock; stale binary edits risk merge conflicts.
+		const bool bCanAcquireOrdinaryLock = State.LockState == ELockState::NotLocked;
+		return bCanAcquireOrdinaryLock
+			&& IsCurrent()
+			&& IsSourceControlled();
 	}
 }
 
 bool FGitSourceControlState::IsCheckedOut() const
 {
-	if (State.LockState == ELockState::Unlockable)
-	{
-		return IsSourceControlled(); // TODO: try modified instead? might block editing the file with a holding pattern
-	}
-	else
-	{
-		// We check for modified here too, because sometimes you don't lock a file but still want to push it. CanCheckout still true, so that you can lock it later...
-		return State.LockState == ELockState::Locked || (State.FileState == EFileState::Modified && State.LockState != ELockState::LockedOther);
-	}
+	// UE 5.7 同一接口既驱动 Checked Out Filter，又是 SettingsHelpers、Wwise 和删除预处理
+	// 判断 no-checkout provider 文件“已打开可编辑”的唯一入口。Locked 仍是远端所有权；
+	// Unlockable 只是 UE 兼容投影。LFS lockable 的 NotLocked/离线 Modified 不再伪装为 checkout。
+	// UE 5.7 uses this one interface for both the Checked Out filter and the only "opened/editable"
+	// signal consumed by SettingsHelpers, Wwise, and delete preprocessing for no-checkout providers.
+	// Locked remains remote ownership; Unlockable is an explicit UE adapter. LFS NotLocked states do
+	// not masquerade as checkout.
+	return HasVerifiedOwnLock()
+		|| (State.LockState == ELockState::Unlockable && !IsAdded());
+}
+
+bool FGitSourceControlState::HasVerifiedOwnLock() const
+{
+	return State.LockState == ELockState::Locked;
 }
 
 bool FGitSourceControlState::IsCheckedOutOther(FString* Who) const
@@ -379,8 +429,24 @@ bool FGitSourceControlState::IsIgnored() const
 
 bool FGitSourceControlState::CanEdit() const
 {
-	// Perforce does not care about it being current
-	return IsCheckedOut() || IsAdded();
+	// 编辑能力与远端锁所有权分离：普通 Git 中已跟踪文件无需锁；LFS 中新增文件、当前用户
+	// 持锁文件，以及离线 Make Writable 后已经产生的未锁本地修改仍可编辑。
+	// Editability is separate from remote lock ownership: tracked files need no lock in ordinary Git,
+	// while LFS additions, verified own locks, and already-modified unlocked files created through the
+	// offline Make Writable path remain editable.
+	if (State.LockState == ELockState::Locked)
+	{
+		return true;
+	}
+	if (State.LockState == ELockState::Unlockable)
+	{
+		return IsSourceControlled();
+	}
+	if (State.LockState == ELockState::NotLocked)
+	{
+		return IsAdded() || (IsModified() && IsSourceControlled());
+	}
+	return false;
 }
 
 bool FGitSourceControlState::CanDelete() const
