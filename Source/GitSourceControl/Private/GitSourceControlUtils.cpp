@@ -3118,7 +3118,10 @@ bool RunGetHistory(const FString& InPathToGitBinary, const FString& InRepository
 	{
 		TArray<FString> Results;
 		TArray<FString> Parameters;
-		Parameters.Add(TEXT("--follow")); // follow file renames
+		// 只查当前路径的历史：UE 重定向器和变化的 LFS 指针无法可靠地提供跨路径谱系，
+		// --follow 却可能为了仅有的一条修订遍历整个仓库历史。
+		// Scope history to the current path: redirectors and changing LFS pointers cannot
+		// reliably preserve rename ancestry, while --follow may scan the repository for one revision.
 		Parameters.Add(TEXT("--date=raw"));
 		Parameters.Add(TEXT("--name-status")); // relative filename at this revision, preceded by a status character
 		Parameters.Add(TEXT("--pretty=medium")); // make sure format matches expected in ParseLogResults
