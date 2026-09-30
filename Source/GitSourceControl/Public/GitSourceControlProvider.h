@@ -188,7 +188,7 @@ public:
 		bool bInLockableAttributesAvailable);
 #endif
 
-	/** Helper function used to update state cache */
+	/** 取得文件状态缓存；仓库外路径直接返回已知的不可管理状态，不查询 Git 或修改文件权限。 */
 	TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> GetStateInternal(const FString& Filename);
 
 #if ENGINE_MAJOR_VERSION == 5	

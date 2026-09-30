@@ -555,19 +555,25 @@ void FGitSourceControlProvider::Close()
 
 TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> FGitSourceControlProvider::GetStateInternal(const FString& Filename)
 {
-	TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe>* State = StateCache.Find(Filename);
-	if (State != NULL)
+	auto Cached = StateCache.Find(Filename);
+	if (!Cached)
 	{
-		// found cached item
-		return (*State);
+		Cached = &StateCache.Add(Filename, MakeShared<FGitSourceControlState, ESPMode::ThreadSafe>(Filename));
 	}
-	else
+	const auto State = *Cached;
+	if (!PathToGitRoot.IsEmpty() && !FPaths::IsRelative(Filename)
+		&& !FPaths::IsSamePath(Filename, PathToGitRoot)
+		&& !FPaths::IsUnderDirectory(Filename, PathToGitRoot))
 	{
-		// cache an unknown state for this item
-		TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> NewState = MakeShareable( new FGitSourceControlState(Filename) );
-		StateCache.Add(Filename, NewState);
-		return NewState;
+		// 引擎内容等仓库外路径已经能确定归属；保留 Unknown 会让原生菜单反复发起无法完成的查询。
+		// External ownership is already known; leaving engine content Unknown repeatedly queues unfulfillable menu queries.
+		State->State = FGitState();
+		State->State.FileState = EFileState::OutsideRepository;
+		State->State.TreeState = ETreeState::NotInRepo;
+		State->TimeStamp = FDateTime::Now();
+		State->History.Empty();
 	}
+	return State;
 }
 
 #if ENGINE_MAJOR_VERSION == 5
@@ -837,6 +843,22 @@ ECommandResult::Type FGitSourceControlProvider::Execute( const FSourceControlOpe
 	}
 
 	TArray<FString> AbsoluteFiles = SourceControlHelpers::AbsoluteFilenames(InFiles);
+	if (InOperation->GetName() == TEXT("UpdateStatus")
+		|| InOperation->GetName() == TEXT("UpdateChangelistsStatus"))
+	{
+		const bool bExplicitFiles = !AbsoluteFiles.IsEmpty();
+		AbsoluteFiles.RemoveAll([this](const FString& File)
+		{
+			return GetStateInternal(File)->State.FileState == EFileState::OutsideRepository;
+		});
+		if (bExplicitFiles && AbsoluteFiles.IsEmpty())
+		{
+			// 全部为仓库外资产时直接完成查询；过滤后的空范围绝不能转换成全工程刷新。
+			// Complete external-only queries here; a filtered empty selection must never become a project-wide refresh.
+			InOperationCompleteDelegate.ExecuteIfBound(InOperation, ECommandResult::Succeeded);
+			return ECommandResult::Succeeded;
+		}
+	}
 
 	// Query to see if we allow this operation
 	TSharedPtr<IGitSourceControlWorker, ESPMode::ThreadSafe> Worker = CreateWorker(InOperation->GetName());

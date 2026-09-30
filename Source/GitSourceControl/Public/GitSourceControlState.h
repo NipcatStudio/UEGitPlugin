@@ -44,7 +44,9 @@ namespace EGitState
 	};
 }
 
-/** Corresponds to diff file states. */
+/** 文件变化及归属的明确分类；仓库外已知状态不能与尚未查询的 Unknown 混淆。
+ * Explicit file change and ownership classification; known external files are not unqueried Unknown state.
+ */
 namespace EFileState
 {
 	enum Type
@@ -58,6 +60,8 @@ namespace EFileState
 		Renamed,
 		Missing,
 		Unmerged,
+		/** 已确认不属于当前 Provider 的仓库；不能查询、暂存或签出。 / Known outside the provider repository, not eligible for Git operations. */
+		OutsideRepository,
 	};
 }
 

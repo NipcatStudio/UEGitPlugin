@@ -230,6 +230,10 @@ FText FGitSourceControlState::GetDisplayName() const
 
 FText FGitSourceControlState::GetDisplayTooltip() const
 {
+	if (State.FileState == EFileState::OutsideRepository)
+	{
+		return LOCTEXT("OutsideRepository_Tooltip", "该文件不属于当前 Git 仓库；本工程的版本控制不会查询、暂存或签出它。");
+	}
 	switch (GetGitState())
 	{
 	case EGitState::NotAtHead:

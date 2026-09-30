@@ -13,6 +13,7 @@
 #include "GitSourceControlState.h"
 #include "GitSourceControlUtils.h"
 #include "HAL/PlatformFileManager.h"
+#include "HAL/PlatformProcess.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -271,6 +272,75 @@ bool FGitScopedRefreshTest::RunTest(const FString& Parameters)
 	FailedCommand.PathToGitBinary = FPaths::Combine(Root, TEXT("missing-git-executable"));
 	TestFalse(TEXT("查询失败必须返回失败"), FailedWorker->Execute(FailedCommand));
 	TestTrue(TEXT("失败不能发布空白或部分状态来清除旧列表"), FailedWorker->States.IsEmpty());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGitRepositoryBoundaryTest,
+	"GitSourceControl.State.RepositoryBoundary",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGitRepositoryBoundaryTest::RunTest(const FString& Parameters)
+{
+	FGitSourceControlProvider& Provider = FGitSourceControlModule::Get().GetProvider();
+	FString RepositoryRoot = Provider.GetPathToGitRoot();
+	FPaths::NormalizeDirectoryName(RepositoryRoot);
+	if (!TestTrue(TEXT("边界回归需要已初始化的 Git Provider"), Provider.IsEnabled() && !RepositoryRoot.IsEmpty()))
+	{
+		return false;
+	}
+	const FString Token = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+	const FString External = FPaths::ConvertRelativePathToFull(FPaths::Combine(
+		FPlatformProcess::UserTempDir(), TEXT("UEGitBoundary-") + Token, TEXT("External.uasset")));
+	const FString Sibling = RepositoryRoot + TEXT("-outside-") + Token + TEXT("/Sibling.uasset");
+	const FString Internal = FPaths::Combine(RepositoryRoot, TEXT("Saved/Automation"), Token, TEXT("Inside.uasset"));
+	const FString Nested = FPaths::Combine(RepositoryRoot, TEXT("Plugins"), Token, TEXT("Content/Nested.uasset"));
+	const TArray<FString> TestFiles{External, Sibling, Internal, Nested};
+	ON_SCOPE_EXIT {
+		for (const FString& File : TestFiles)
+		{
+			Provider.RemoveFileFromCache(File);
+		}
+	};
+
+	// 仅使用合成路径，不创建或保存资产；已知仓库外状态必须能让菜单完成，而不是伪装成 Git ignored。
+	// Synthetic paths create no assets; known external ownership must complete menu checks without pretending to be Git-ignored.
+	for (const FString& File : {External, Sibling})
+	{
+		const auto State = Provider.GetStateInternal(File);
+		TestEqual(TEXT("仓库外归属明确，不沿用初始 Unknown"), State->State.FileState, EFileState::OutsideRepository);
+		TestFalse(TEXT("仓库外路径不会让菜单无限等待初始化"), State->IsUnknown());
+		TestFalse(TEXT("不伪装为 Git ignored"), State->IsIgnored());
+		TestFalse(TEXT("不允许对仓库外路径暂存或签出"), State->CanAdd() || State->CanCheckout());
+		TestFalse(TEXT("不伪造持锁或受控"), State->IsCheckedOut() || State->IsSourceControlled());
+	}
+	TestTrue(TEXT("仓库内未查询的路径仍保持 Unknown"), Provider.GetStateInternal(Internal)->IsUnknown());
+	TestTrue(TEXT("插件和嵌套仓库范围不会被排除"), Provider.GetStateInternal(Nested)->IsUnknown());
+
+	const TArray<FSourceControlOperationRef> Operations{
+		ISourceControlOperation::Create<FUpdateStatus>(), ISourceControlOperation::Create<FUpdatePendingChangelistsStatus>()};
+	for (const auto& Operation : Operations)
+	{
+		/** 完成信息由委托共同持有，即使回归失败意外排队也不能悬空引用测试栈。
+		 * The callback owns completion storage even if a regression unexpectedly queues work beyond this test.
+		 */
+		struct FCompletion
+		{
+			int32 Count = 0;
+			ECommandResult::Type Result = ECommandResult::Failed;
+		};
+		const auto Completion = MakeShared<FCompletion>();
+		const auto Delegate = FSourceControlOperationComplete::CreateLambda(
+			[Completion](const FSourceControlOperationRef&, ECommandResult::Type Result)
+			{
+				++Completion->Count;
+				Completion->Result = Result;
+			});
+		TestEqual(TEXT("显式仓库外查询立即完成，不退化为全工程刷新"),
+			Provider.Execute(Operation, FSourceControlChangelistPtr(), {External, Sibling}, EConcurrency::Asynchronous, Delegate),
+			ECommandResult::Succeeded);
+		TestEqual(TEXT("完成回调在返回前恰好执行一次"), Completion->Count, 1);
+		TestEqual(TEXT("完成回调返回已知无受控文件，而不是无限 pending"), Completion->Result, ECommandResult::Succeeded);
+	}
 	return true;
 }
 
