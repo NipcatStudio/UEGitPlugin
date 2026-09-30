@@ -475,8 +475,9 @@ bool RunDumpToFile(const FString& InPathToGitBinary, const FString& InRepository
  * @param	bMergeConflict		In case of a merge conflict, we also need to get the tip of the "remote branch" (MERGE_HEAD) before the log of the "current branch" (HEAD)
  * @param	OutErrorMessages	Any errors (from StdErr) as an array per-line
  * @param	OutHistory			The history of the file
+ * @param	InRevisionRange	上游独有修订的明确 Git 范围；为空则查询本地 HEAD，冲突时仍用 MERGE_HEAD / Explicit upstream-only range
  */
-bool RunGetHistory(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InFile, bool bMergeConflict, TArray<FString>& OutErrorMessages, TGitSourceControlHistory& OutHistory);
+bool RunGetHistory(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InFile, bool bMergeConflict, TArray<FString>& OutErrorMessages, TGitSourceControlHistory& OutHistory, const FString& InRevisionRange = FString());
 
 /**
  * Helper function to convert a filename array to relative paths.
@@ -520,7 +521,8 @@ void RemoveRedundantErrors(FGitSourceControlCommand& InCommand, const FString& I
  * Helper function for various commands to update cached states.
  * @returns true if any states were updated
  */
-GITSOURCECONTROL_API bool UpdateCachedStates( const TMap< const FString, FGitState > & InResults );
+/** 历史只读操作不刷新锁状态时，保留原状态时间与强制刷新资格。 */
+GITSOURCECONTROL_API bool UpdateCachedStates( const TMap< const FString, FGitState > & InResults, bool bAdvanceStatusTimeStamp = true );
 
 /**
 * Helper function for various commands to collect new states.

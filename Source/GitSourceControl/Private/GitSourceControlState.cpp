@@ -72,10 +72,13 @@ TSharedPtr<class ISourceControlRevision, ESPMode::ThreadSafe> FGitSourceControlS
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 2
 TSharedPtr<class ISourceControlRevision, ESPMode::ThreadSafe> FGitSourceControlState::GetCurrentRevision() const
 {
-	// 历史首项由 UpdateStatus 保证来自本地 HEAD，不能拿冲突对端或无历史状态冒充当前版本。
-	// UpdateStatus keeps local HEAD history first; a conflict-side revision or missing history is not a local baseline.
-	if (!IsSourceControlled() || IsAdded() || History.IsEmpty())
+	// 当前提交修订以本地 HEAD 历史为准，不依赖可能过期的工作区/暂存状态；历史查询不扫描工作区。
+	// The local HEAD history owns the current committed revision, independently of stale worktree/index status.
+	if (History.IsEmpty() || !History[0]->SourceBranch.IsEmpty()
+		|| History[0]->Action == TEXT("delete"))
 	{
+		// 远端独有、合并对端或本地 HEAD 已删除的历史不能充当当前本地修订。
+		// Remote-only, merge-side or locally deleted history is never a current local revision.
 		return nullptr;
 	}
 	return History[0];

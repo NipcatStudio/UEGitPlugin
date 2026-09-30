@@ -72,6 +72,9 @@ public:
 	/** Save any results and call any registered callbacks. */
 	ECommandResult::Type ReturnResults();
 
+	/** 是否为只读文件历史查询；这类命令不冻结锁工作流的分支或刷新锁状态。 */
+	bool IsHistoryQuery() const;
+
 public:
 	/** Path to the Git binary */
 	FString PathToGitBinary;

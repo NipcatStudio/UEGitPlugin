@@ -553,6 +553,12 @@ bool FGitSourceControlWritableRevertTest::RunTest(const FString& Parameters)
 		FGitSourceControlState State(Selected);
 		State.State = Worker->States.FindRef(Selected);
 		State.History = Worker->Histories.FindRef(Selected);
+		TestTrue(TEXT("读取历史不扫描或发布工作区状态"), Worker->States.IsEmpty());
+		if (PlatformFile.FileExists(*FPaths::Combine(Root, TEXT(".git/MERGE_HEAD"))))
+		{
+			TestTrue(TEXT("冲突索引仍使合并对端修订可用于 Diff"),
+				State.History.ContainsByPredicate([](const auto& Revision) { return Revision->SourceBranch == TEXT("MERGE_HEAD"); }));
+		}
 		return State.GetCurrentRevision();
 	};
 	auto Sync = [&](const FString& Revision, const TArray<FString>& Files, bool bForce, bool bLastSynced, bool bStale = false)
@@ -617,6 +623,10 @@ bool FGitSourceControlWritableRevertTest::RunTest(const FString& Parameters)
 	{
 		TestEqual(TEXT("冲突不能把对端提交当作当前版本"), ConflictRevision->GetRevision(), CurrentCommit.Left(8));
 	}
+	if (!Git({TEXT("merge"), TEXT("--abort")})
+		|| !Git({TEXT("rm"), TEXT("--"), TEXT("Selected.txt")})
+		|| !Git({TEXT("commit"), TEXT("-m"), TEXT("delete-selected")})) { return false; }
+	TestFalse(TEXT("本地 HEAD 已删除的路径不能返回旧当前修订"), LoadCurrentRevision().IsValid());
 	return true;
 }
 
@@ -649,6 +659,7 @@ bool FGitSourceControlRemoteScopeTest::RunTest(const FString& Parameters)
 	};
 	const FString Selected = FPaths::Combine(Root, TEXT("Content/Selected.txt"));
 	const FString Other = FPaths::Combine(Root, TEXT("Content/Other.txt"));
+	const FString RemoteOnly = FPaths::Combine(Root, TEXT("Content/RemoteOnly.txt"));
 	if (!Run({TEXT("init"), TEXT("-b"), TEXT("scope-test")})
 		|| !FFileHelper::SaveStringToFile(TEXT("baseline"), *Selected)
 		|| !FFileHelper::SaveStringToFile(TEXT("baseline"), *Other)
@@ -660,6 +671,7 @@ bool FGitSourceControlRemoteScopeTest::RunTest(const FString& Parameters)
 		|| !Run({TEXT("branch"), TEXT("--set-upstream-to=origin/scope-test")})
 		|| !FFileHelper::SaveStringToFile(TEXT("local commit"), *Selected)
 		|| !FFileHelper::SaveStringToFile(TEXT("local commit"), *Other)
+		|| !FFileHelper::SaveStringToFile(TEXT("remote only"), *RemoteOnly)
 		|| !Run({TEXT("add"), TEXT("--"), TEXT("Content")})
 		|| !Run({TEXT("commit"), TEXT("-m"), TEXT("local-change")}))
 	{
@@ -674,6 +686,61 @@ bool FGitSourceControlRemoteScopeTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("使用嵌套仓库自己的 upstream，识别目标文件未推送提交"),
 		States.FindChecked(Selected).State.RemoteState, ERemoteState::AheadUnpushed);
 	TestEqual(TEXT("不扩大到未请求文件"), States.FindChecked(Other).State.RemoteState, OtherBefore);
+
+	// 构造已 fetch 的上游新版本而不访问网络：本地退回基线，远端跟踪引用仍指向后续提交。
+	// Model a fetched upstream revision without network: move local HEAD back while the tracking ref stays ahead.
+	if (!Run({TEXT("update-ref"), TEXT("refs/remotes/origin/scope-test"), TEXT("HEAD")})
+		|| !Run({TEXT("reset"), TEXT("--hard"), TEXT("HEAD^")}))
+	{
+		return false;
+	}
+	const auto ReadHistory = [&](const FString& File)
+	{
+		const auto Operation = ISourceControlOperation::Create<FUpdateStatus>();
+		Operation->SetUpdateHistory(true);
+		const auto Worker = MakeShared<FGitUpdateStatusWorker, ESPMode::ThreadSafe>();
+		FGitSourceControlCommand Command(Operation, Worker);
+		Command.PathToGitBinary = GitBinary;
+		Command.PathToGitRoot = Root;
+		Command.PathToRepositoryRoot = Root;
+		Command.bUsingGitLfsLocking = false;
+		Command.Files = {File};
+		TestTrue(TEXT("远端修订历史查询成功"), Worker->Execute(Command));
+		return Worker;
+	};
+	const auto SelectedWorker = ReadHistory(Selected);
+	const TGitSourceControlHistory SelectedHistory = SelectedWorker->Histories.FindRef(Selected);
+	if (TestEqual(TEXT("本地基线和远端更新均进入历史"), SelectedHistory.Num(), 2))
+	{
+		TestTrue(TEXT("第一条始终是本地 HEAD"), SelectedHistory[0]->SourceBranch.IsEmpty());
+		FGitSourceControlState UnrefreshedState(Selected);
+		UnrefreshedState.History = SelectedHistory;
+		TestTrue(TEXT("获取本地提交修订不依赖工作区状态刷新"), UnrefreshedState.GetCurrentRevision().IsValid());
+		TestEqual(TEXT("上游独有修订明确标注来源"), SelectedHistory[1]->SourceBranch, FString(TEXT("origin/scope-test")));
+		TestTrue(TEXT("远端修订有可辨识的历史描述"), SelectedHistory[1]->Description.Contains(TEXT("远端跟踪")));
+		FString DumpFile = FPaths::Combine(Root, TEXT("remote-diff.txt"));
+		if (TestTrue(TEXT("远端修订可以取出供 Diff"), SelectedHistory[1]->Get(DumpFile, EConcurrency::Synchronous)))
+		{
+			FString Content;
+			TestTrue(TEXT("读取远端修订内容"), FFileHelper::LoadFileToString(Content, *DumpFile));
+			TestEqual(TEXT("Diff 使用远端而非本地字节"), Content, FString(TEXT("local commit")));
+		}
+	}
+	const FGitState* SelectedState = SelectedWorker->States.Find(Selected);
+	TestTrue(TEXT("历史只读路径仍指出远端存在更新"),
+		SelectedState && SelectedState->RemoteState == ERemoteState::NotAtHead
+		&& SelectedState->LockState == ELockState::Unset);
+
+	const auto RemoteOnlyWorker = ReadHistory(RemoteOnly);
+	const TGitSourceControlHistory RemoteOnlyHistory = RemoteOnlyWorker->Histories.FindRef(RemoteOnly);
+	if (TestEqual(TEXT("本地没有该路径时只列出远端修订"), RemoteOnlyHistory.Num(), 1))
+	{
+		TestFalse(TEXT("远端版本不能充当本地当前修订"), RemoteOnlyHistory[0]->SourceBranch.IsEmpty());
+		FGitSourceControlState RemoteOnlyState(RemoteOnly);
+		RemoteOnlyState.State = RemoteOnlyWorker->States.FindRef(RemoteOnly);
+		RemoteOnlyState.History = RemoteOnlyHistory;
+		TestFalse(TEXT("远端独有版本不是本地当前版本"), RemoteOnlyState.GetCurrentRevision().IsValid());
+	}
 	return true;
 }
 

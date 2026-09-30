@@ -219,6 +219,9 @@ public:
 
 	/** Map of filenames to history */
 	TMap<FString, TGitSourceControlHistory> Histories;
+
+	/** 本次是否只读取提交历史与冲突索引；未扫描的工作区和锁状态保持原有时间戳。 */
+	bool bHistoryOnly = false;
 };
 
 /** Copy or Move operation on a single file */

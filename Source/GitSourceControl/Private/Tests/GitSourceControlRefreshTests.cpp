@@ -121,6 +121,7 @@ bool FGitScopedRefreshTest::RunTest(const FString& Parameters)
 	};
 	const FString Scope = FPaths::Combine(Root, TEXT("Content/Inside"));
 	const FString Modified = FPaths::Combine(Scope, TEXT("Modified.txt"));
+	const FString HistoryAsset = FPaths::Combine(Scope, TEXT("History.uasset"));
 	const FString Added = FPaths::Combine(Scope, TEXT("Added.txt"));
 	const FString Deleted = FPaths::Combine(Scope, TEXT("Deleted.txt"));
 	const FString Gone = FPaths::Combine(Scope, TEXT("Gone.txt"));
@@ -135,6 +136,7 @@ bool FGitScopedRefreshTest::RunTest(const FString& Parameters)
 		|| !Git(TEXT("config"), {TEXT("commit.gpgsign"), TEXT("false")})
 		|| !Git(TEXT("config"), {TEXT("core.hooksPath"), TEXT(".git/no-hooks")})
 		|| !Write(TEXT("Content/Inside/Modified.txt"), TEXT("baseline"))
+		|| !Write(TEXT("Content/Inside/History.uasset"), TEXT("history baseline"))
 		|| !Write(TEXT("Content/Inside/Deleted.txt"), TEXT("baseline"))
 		|| !Git(TEXT("add"), {TEXT("Content")})
 		|| !Git(TEXT("commit"), {TEXT("-m"), TEXT("baseline")}))
@@ -205,6 +207,50 @@ bool FGitScopedRefreshTest::RunTest(const FString& Parameters)
 	ExpectTree(TEXT("被忽略的旧列表项不能冒充已跟踪 clean"), Ignored, ETreeState::Ignored);
 	TestFalse(TEXT("不能触及相邻目录"), States.Contains(Outside));
 	TestFalse(TEXT("不能触及范围外插件内容"), States.Contains(PluginFile));
+
+	// 历史读取即使处于 LFS 模式也不扫描工作区，不把缓存中的本地修改或锁状态改成干净。
+	// History skips the worktree scan even in LFS mode and must not erase cached edits or lock state.
+	const auto HistoryOperation = ISourceControlOperation::Create<FUpdateStatus>();
+	HistoryOperation->SetUpdateHistory(true);
+	const auto HistoryWorker = MakeShared<FGitUpdateStatusWorker, ESPMode::ThreadSafe>();
+	FGitSourceControlCommand HistoryCommand(HistoryOperation, HistoryWorker);
+	Configure(HistoryCommand, {HistoryAsset});
+	HistoryCommand.bUsingGitLfsLocking = true;
+	const bool bWasReadOnly = IFileManager::Get().IsReadOnly(*HistoryAsset);
+	if (TestTrue(TEXT("LFS 模式的历史查询不依赖远端锁服务"), HistoryWorker->Execute(HistoryCommand)))
+	{
+		TestTrue(TEXT("历史查询不发布推测的工作区/锁/远端状态"), HistoryWorker->States.IsEmpty());
+		TestTrue(TEXT("历史命令不需要锁工作流的 live branch 快照"), HistoryCommand.IsHistoryQuery());
+		TestEqual(TEXT("历史查询仍得到当前文件的本地修订"),
+			HistoryWorker->Histories.FindRef(HistoryAsset).Num(), 1);
+		TestTrue(TEXT("历史查询不更新无关的仓库 HEAD 摘要"), HistoryCommand.CommitId.IsEmpty());
+		TestEqual(TEXT("历史查询不改动磁盘只读位"), IFileManager::Get().IsReadOnly(*HistoryAsset), bWasReadOnly);
+
+		// 历史完成回调只更新修订，不能让未核验的状态得到新时间戳或免除强制刷新。
+		// History completion updates revisions without revalidating unqueried state or suppressing force-update.
+		FGitSourceControlProvider& Provider = FGitSourceControlModule::Get().GetProvider();
+		const auto CachedState = Provider.GetStateInternal(HistoryAsset);
+		ON_SCOPE_EXIT {
+			Provider.RemoveFileFromIgnoreForceCache(HistoryAsset);
+			Provider.RemoveFileFromCache(HistoryAsset);
+		};
+		const FDateTime OldTimeStamp = FDateTime::FromUnixTimestamp(1);
+		CachedState->TimeStamp = OldTimeStamp;
+		CachedState->State.FileState = EFileState::Modified;
+		CachedState->State.TreeState = ETreeState::Working;
+		CachedState->State.LockState = ELockState::LockedOther;
+		CachedState->State.RemoteState = ERemoteState::NotAtHead;
+		Provider.RemoveFileFromIgnoreForceCache(HistoryAsset);
+		HistoryWorker->UpdateStates();
+		TestEqual(TEXT("历史回调保留旧状态时间戳"), CachedState->GetTimeStamp(), OldTimeStamp);
+		TestTrue(TEXT("历史回调保留本地修改与暂存归属"),
+			CachedState->State.FileState == EFileState::Modified && CachedState->State.TreeState == ETreeState::Working);
+		TestTrue(TEXT("历史回调保留未经核验的锁与远端状态"),
+			CachedState->State.LockState == ELockState::LockedOther
+			&& CachedState->State.RemoteState == ERemoteState::NotAtHead);
+		TestFalse(TEXT("历史回调不屏蔽下次强制状态更新"),
+			Provider.RemoveFileFromIgnoreForceCache(HistoryAsset));
+	}
 
 	if (!TestTrue(TEXT("插件目录刷新成功"), Refresh({FPaths::Combine(Root, TEXT("Plugins"))}, States)))
 	{

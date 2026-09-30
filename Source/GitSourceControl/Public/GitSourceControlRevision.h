@@ -57,6 +57,9 @@ public:
 	/** The description of this revision */
 	FString Description;
 
+	/** 远端独有修订所属的已 fetch 上游分支；本地修订为空。 */
+	FString SourceBranch;
+
 	/** The user that made the change */
 	FString UserName;
 

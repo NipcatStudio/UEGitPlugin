@@ -101,8 +101,7 @@ const FString& FGitSourceControlRevision::GetUserName() const
 
 const FString& FGitSourceControlRevision::GetClientSpec() const
 {
-	static FString EmptyString(TEXT(""));
-	return EmptyString;
+	return SourceBranch;
 }
 
 const FString& FGitSourceControlRevision::GetAction() const

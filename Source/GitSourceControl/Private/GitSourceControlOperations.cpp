@@ -19,6 +19,7 @@
 #include "Logging/MessageLog.h"
 #include "Misc/MessageDialog.h"
 #include "HAL/PlatformProcess.h"
+#include "HAL/PlatformTime.h"
 
 #include <thread>
 
@@ -1921,9 +1922,123 @@ bool FGitUpdateStatusWorker::Execute(FGitSourceControlCommand& InCommand)
 
 	TSharedRef<FUpdateStatus, ESPMode::ThreadSafe> Operation = StaticCastSharedRef<FUpdateStatus>(InCommand.Operation);
 
-	// 事务扫描完整权威 LFS 列表，所以单文件状态刷新也不会遗漏此前由 UGit 创建的锁。
-	// The transaction scans the full authoritative LFS list, so even a one-file status refresh
-	// cannot miss a lock previously created by UGit.
+	bHistoryOnly = Operation->ShouldUpdateHistory() && !InCommand.Files.IsEmpty();
+	if (bHistoryOnly)
+	{
+		const double StartedAt = FPlatformTime::Seconds();
+		// 历史只读取提交和所选路径的冲突索引；不扫描工作区，不发布推测的本地修改状态。
+		// History reads commits and selected paths' conflict index only, never scanning or reclassifying the worktree.
+		TArray<FString> LiteralPaths;
+		const FString RepositoryAnchor = FPaths::Combine(InCommand.PathToRepositoryRoot, TEXT(".git"));
+		for (const FString& File : InCommand.Files)
+		{
+			FString RelativePath = File;
+			if (!FPaths::IsUnderDirectory(File, InCommand.PathToRepositoryRoot)
+				|| FPaths::DirectoryExists(File)
+				|| !FPaths::MakePathRelativeTo(RelativePath, *RepositoryAnchor))
+			{
+				InCommand.ResultInfo.ErrorMessages.Add(TEXT("文件历史只接受当前仓库中的明确文件路径。"));
+				return false;
+			}
+			LiteralPaths.Add(TEXT(":(literal)") + RelativePath);
+		}
+		TArray<FString> ConflictEntries;
+		InCommand.bCommandSuccessful = GitSourceControlUtils::RunCommandWithLiteralPaths(
+			TEXT("ls-files"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot,
+			{TEXT("--unmerged"), TEXT("--")}, LiteralPaths,
+			ConflictEntries, InCommand.ResultInfo.ErrorMessages);
+		if (!InCommand.bCommandSuccessful)
+		{
+			return false;
+		}
+		TSet<FString> ConflictedFiles;
+		for (const FString& Entry : ConflictEntries)
+		{
+			int32 TabIndex;
+			if (Entry.FindChar(TEXT('\t'), TabIndex))
+			{
+				ConflictedFiles.Add(FPaths::ConvertRelativePathToFull(
+					InCommand.PathToRepositoryRoot, Entry.Mid(TabIndex + 1).TrimQuotes()));
+			}
+		}
+		FString UpstreamBranch;
+		const bool bHasUpstream = GitSourceControlUtils::GetRemoteBranchName(
+			InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, UpstreamBranch);
+		for (const FString& File : InCommand.Files)
+		{
+			TGitSourceControlHistory History;
+			if (!GitSourceControlUtils::RunGetHistory(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot,
+				File, false, InCommand.ResultInfo.ErrorMessages, History))
+			{
+				InCommand.bCommandSuccessful = false;
+				break;
+			}
+			if (bHasUpstream)
+			{
+				TGitSourceControlHistory RemoteHistory;
+				const FString Range = FString::Printf(TEXT("HEAD..%s"), *UpstreamBranch);
+				if (!GitSourceControlUtils::RunGetHistory(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot,
+					File, false, InCommand.ResultInfo.ErrorMessages, RemoteHistory, Range))
+				{
+					InCommand.bCommandSuccessful = false;
+					break;
+				}
+				if (!RemoteHistory.IsEmpty())
+				{
+					FGitState RemoteState;
+					RemoteState.FileState = EFileState::Unset;
+					RemoteState.TreeState = ETreeState::Unset;
+					RemoteState.LockState = ELockState::Unset;
+					RemoteState.RemoteState = ERemoteState::NotAtHead;
+					RemoteState.HeadBranch = UpstreamBranch;
+					States.Add(File, MoveTemp(RemoteState));
+					for (auto& Revision : RemoteHistory)
+					{
+						Revision->SourceBranch = UpstreamBranch;
+						Revision->Description = FString::Printf(TEXT("[远端跟踪 %s（最近一次 fetch）]\n%s"),
+							*UpstreamBranch, *Revision->Description);
+					}
+					History.Append(RemoteHistory);
+				}
+			}
+			if (ConflictedFiles.Contains(File))
+			{
+				TGitSourceControlHistory MergeHistory;
+				if (GitSourceControlUtils::RunGetHistory(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot,
+					File, true, InCommand.ResultInfo.ErrorMessages, MergeHistory))
+				{
+					for (const auto& Revision : MergeHistory)
+					{
+						if (!History.ContainsByPredicate([&Revision](const auto& Existing) { return Existing->CommitId == Revision->CommitId; }))
+						{
+							Revision->SourceBranch = TEXT("MERGE_HEAD");
+							History.Add(Revision);
+						}
+					}
+				}
+			}
+			for (int32 Index = 0; Index < History.Num(); ++Index)
+			{
+				History[Index]->RevisionNumber = History.Num() - Index;
+			}
+			Histories.Add(File, MoveTemp(History));
+		}
+		if (!InCommand.bCommandSuccessful)
+		{
+			States.Empty();
+			Histories.Empty();
+		}
+		int32 RevisionCount = 0;
+		for (const auto& History : Histories)
+		{
+			RevisionCount += History.Value.Num();
+		}
+		const double ElapsedSeconds = FPlatformTime::Seconds() - StartedAt;
+		GitSourceControlUtils::LogPerformance(FString::Printf(
+			TEXT("history files=%d revisions=%d success=%d status_scan=0 locks=0 elapsed=%.3fs"),
+			InCommand.Files.Num(), RevisionCount, InCommand.bCommandSuccessful, ElapsedSeconds), ElapsedSeconds);
+		return InCommand.bCommandSuccessful;
+	}
 
 	if(InCommand.Files.Num() > 0)
 	{
@@ -1937,39 +2052,6 @@ bool FGitUpdateStatusWorker::Execute(FGitSourceControlCommand& InCommand)
 		if (InCommand.bCommandSuccessful)
 		{
 			GitSourceControlUtils::CollectNewStates(UpdatedStates, States);
-			if (Operation->ShouldUpdateHistory())
-			{
-				for (const auto& State : UpdatedStates)
-				{
-					const FString& File = State.Key;
-					TGitSourceControlHistory History;
-
-					// 当前修订始终取本地 HEAD 的首项；对端历史只作为冲突参考，不能覆盖本地基线。
-					// Current revision is the first local HEAD entry; conflict-side history is supplemental only.
-					const bool bLocalHistorySucceeded = GitSourceControlUtils::RunGetHistory(
-						InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, File, false,
-						InCommand.ResultInfo.ErrorMessages, History);
-					InCommand.bCommandSuccessful &= bLocalHistorySucceeded;
-					if (!bLocalHistorySucceeded)
-					{
-						History.Reset();
-					}
-					else if (!History.IsEmpty() && State.Value.IsConflicted())
-					{
-						TGitSourceControlHistory MergeHistory;
-						if (GitSourceControlUtils::RunGetHistory(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, File, true,
-							InCommand.ResultInfo.ErrorMessages, MergeHistory))
-						{
-							History.Append(MergeHistory);
-							for (int32 Index = 0; Index < History.Num(); ++Index)
-							{
-								History[Index]->RevisionNumber = History.Num() - Index;
-							}
-						}
-					}
-					Histories.Add(*File, History);
-				}
-			}
 		}
 	}
 	else
@@ -1999,7 +2081,9 @@ bool FGitUpdateStatusWorker::Execute(FGitSourceControlCommand& InCommand)
 
 bool FGitUpdateStatusWorker::UpdateStates() const
 {
-	bool bUpdated = GitSourceControlUtils::UpdateCachedStates(States);
+	// 仅历史操作没有刷新锁与远端事实，不能推进通用状态的有效时间或跳过后续强制刷新。
+	// A history-only query has not refreshed locks or remote facts; preserve status freshness and force-update eligibility.
+	bool bUpdated = GitSourceControlUtils::UpdateCachedStates(States, !bHistoryOnly);
 
 	FGitSourceControlModule& GitSourceControl = FModuleManager::GetModuleChecked<FGitSourceControlModule>( "GitSourceControl" );
 	FGitSourceControlProvider& Provider = GitSourceControl.GetProvider();
@@ -2013,7 +2097,10 @@ bool FGitUpdateStatusWorker::UpdateStates() const
 	{
 		TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> State = Provider.GetStateInternal(History.Key);
 		State->History = History.Value;
-		State->TimeStamp = Now;
+		if (!bHistoryOnly)
+		{
+			State->TimeStamp = Now;
+		}
 		bUpdated = true;
 	}
 

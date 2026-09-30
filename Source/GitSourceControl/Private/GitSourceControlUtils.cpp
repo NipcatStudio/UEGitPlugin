@@ -3112,7 +3112,7 @@ public:
 
 // Run a Git "log" command and parse it.
 bool RunGetHistory(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InFile, bool bMergeConflict,
-				   TArray<FString>& OutErrorMessages, TGitSourceControlHistory& OutHistory)
+				   TArray<FString>& OutErrorMessages, TGitSourceControlHistory& OutHistory, const FString& InRevisionRange)
 {
 	bool bResults;
 	{
@@ -3134,10 +3134,23 @@ bool RunGetHistory(const FString& InPathToGitBinary, const FString& InRepository
 		}
 		else
 		{
+			// HEAD..upstream 仅包含上游独有提交；不指定范围时仍从本地 HEAD 读取。
+			// HEAD..upstream contains only upstream-only commits; an empty range keeps local HEAD semantics.
+			if (!InRevisionRange.IsEmpty())
+			{
+				Parameters.Add(InRevisionRange);
+			}
 			Parameters.Add(TEXT("--max-count 250")); // Increase default count to 250 from 100
 		}
-		TArray<FString> Files;
-		Files.Add(*InFile);
+		FString RelativePath = InFile;
+		const FString RepositoryAnchor = FPaths::Combine(InRepositoryRoot, TEXT(".git"));
+		if (!FPaths::MakePathRelativeTo(RelativePath, *RepositoryAnchor))
+		{
+			OutErrorMessages.Add(TEXT("无法把历史文件路径转换为当前仓库路径。"));
+			return false;
+		}
+		Parameters.Add(TEXT("--"));
+		TArray<FString> Files{TEXT(":(literal)") + RelativePath};
 		bResults = RunCommandWithLiteralPaths(TEXT("log"), InPathToGitBinary, InRepositoryRoot, Parameters, Files, Results, OutErrorMessages);
 		if (bResults)
 		{
@@ -3146,6 +3159,12 @@ bool RunGetHistory(const FString& InPathToGitBinary, const FString& InRepository
 	}
 	for (auto& Revision : OutHistory)
 	{
+		Revision->PathToRepoRoot = InRepositoryRoot;
+		if (Revision->Action == TEXT("delete"))
+		{
+			Revision->FileSize = 0;
+			continue;
+		}
 		// Get file (blob) sha1 id and size
 		TArray<FString> Results;
 		TArray<FString> Parameters;
@@ -3200,7 +3219,7 @@ TArray<FString> AbsoluteFilenames(const TArray<FString>& InFileNames, const FStr
 	return AbsFiles;
 }
 
-bool UpdateCachedStates(const TMap<const FString, FGitState>& InResults)
+bool UpdateCachedStates(const TMap<const FString, FGitState>& InResults, bool bAdvanceStatusTimeStamp)
 {
 	if (InResults.Num() == 0)
 	{
@@ -3258,7 +3277,10 @@ bool UpdateCachedStates(const TMap<const FString, FGitState>& InResults)
 				State->State.HeadBranch = NewState.HeadBranch;
 			}
 		}
-		State->TimeStamp = Now;
+		if (bAdvanceStatusTimeStamp)
+		{
+			State->TimeStamp = Now;
+		}
 #if ENGINE_MAJOR_VERSION == 5
 		if (NewState.bFromStatus && NewState.TreeState != ETreeState::Unset)
 		{
@@ -3266,8 +3288,12 @@ bool UpdateCachedStates(const TMap<const FString, FGitState>& InResults)
 		}
 #endif
 
-		// We've just updated the state, no need for UpdateStatus to be ran for this file again.
-		Provider.AddFileToIgnoreForceCache(State->LocalFilename);
+		// 只有完整状态刷新才能免除下一次强制更新；历史只读查询没有核验锁与远端。
+		// Only a full status refresh may suppress the next forced update; history did not verify locks or remote state.
+		if (bAdvanceStatusTimeStamp)
+		{
+			Provider.AddFileToIgnoreForceCache(State->LocalFilename);
+		}
 	}
 
 	return true;

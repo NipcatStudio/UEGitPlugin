@@ -9,6 +9,7 @@
 #include "GitSourceControlModule.h"
 #include "GitSourceControlSettings.h"
 #include "GitSourceControlUtils.h"
+#include "SourceControlOperations.h"
 #include "HAL/PlatformTime.h"
 #include "HAL/PlatformTLS.h"
 
@@ -32,14 +33,17 @@ FGitSourceControlCommand::FGitSourceControlCommand(const TSharedRef<class ISourc
 	PathToRepositoryRoot = Provider.GetPathToRepositoryRoot();
 	PathToGitRoot = Provider.GetPathToGitRoot();
 #if ENGINE_MAJOR_VERSION == 5
-	KnownChangelistFiles = Provider.GetFilesInChangelists();
+	if (!IsHistoryQuery())
+	{
+		KnownChangelistFiles = Provider.GetFilesInChangelists();
+	}
 #endif
 	bUsingGitLfsLocking = Provider.UsesCheckout();
 	LfsUserName = LockSettings.LfsUserName;
 	bSettingsUsingGitLfsLocking =
 		LockSettings.bUsingGitLfsLocking;
 	LockSettingsGeneration = LockSettings.Generation;
-	if (bUsingGitLfsLocking)
+	if (bUsingGitLfsLocking && !IsHistoryQuery())
 	{
 		// 任一 LFS 锁工作流都必须在命令创建时直接冻结 live branch；外部 UGit 切分支后
 		// 不能复用 Editor 启动时的 Provider 显示缓存。
@@ -72,7 +76,7 @@ void FGitSourceControlCommand::UpdateRepositoryRootIfSubmodule(TArray<FString>& 
 
 	const bool bRepositoryChanged = !FPaths::IsSamePath(NewRepositoryRoot, PathToRepositoryRoot);
 	PathToRepositoryRoot = NewRepositoryRoot;
-	if (bUsingGitLfsLocking && bRepositoryChanged)
+	if (bUsingGitLfsLocking && bRepositoryChanged && !IsHistoryQuery())
 	{
 		// 构造函数先看到主 Provider 根；切换为子模块后必须重抓该仓的 live branch，后续
 		// commit/push 边界与显式 refspec 才不会拿主仓分支校验子模块。
@@ -84,6 +88,12 @@ void FGitSourceControlCommand::UpdateRepositoryRootIfSubmodule(TArray<FString>& 
 			PathToGitRoot,
 			LockBranch);
 	}
+}
+
+bool FGitSourceControlCommand::IsHistoryQuery() const
+{
+	return Operation->GetName() == TEXT("UpdateStatus")
+		&& StaticCastSharedRef<FUpdateStatus>(Operation)->ShouldUpdateHistory();
 }
 
 bool FGitSourceControlCommand::DoWork()
