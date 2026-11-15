@@ -18,7 +18,7 @@ bool ParseVerification(
 	OutError.Reset();
 	if (!bCommandSucceeded)
 	{
-		OutError = TEXT("Git LFS 身份核验失败；不得将部分结果或空输出当作无锁。");
+		OutError = TEXT("无法查询 Git LFS 锁，请检查网络或身份凭据。");
 		return false;
 	}
 

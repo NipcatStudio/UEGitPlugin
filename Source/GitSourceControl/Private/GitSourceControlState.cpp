@@ -220,7 +220,7 @@ FText FGitSourceControlState::GetDisplayName() const
 	case EGitState::Ignored:
 		return LOCTEXT("Ignore", "Ignore");
 	case EGitState::Lockable:
-		return LOCTEXT("ReadOnly", "Read only");
+		return LOCTEXT("NotCheckedOut", "未 Checkout");
 	case EGitState::None:
 		return LOCTEXT("Unknown", "Unknown");
 	default:
@@ -273,7 +273,7 @@ FText FGitSourceControlState::GetDisplayTooltip() const
 	case EGitState::Ignored:
 		return LOCTEXT("Ignored_Tooltip", "Item is being ignored.");
 	case EGitState::Lockable:
-		return LOCTEXT("ReadOnly_Tooltip", "The file(s) are marked locally as read-only");
+		return LOCTEXT("NotCheckedOut_Tooltip", "当前未持有 LFS 锁；本地保存无需签出。");
 	case EGitState::None:
 		return LOCTEXT("Unknown_Tooltip", "Unknown revision control state");
 	default:
@@ -442,24 +442,20 @@ bool FGitSourceControlState::IsIgnored() const
 
 bool FGitSourceControlState::CanEdit() const
 {
-	// 编辑能力与远端锁所有权分离：普通 Git 中已跟踪文件无需锁；LFS 中新增文件、当前用户
-	// 持锁文件，以及离线 Make Writable 后已经产生的未锁本地修改仍可编辑。
-	// Editability is separate from remote lock ownership: tracked files need no lock in ordinary Git,
-	// while LFS additions, verified own locks, and already-modified unlocked files created through the
-	// offline Make Writable path remain editable.
-	if (State.LockState == ELockState::Locked)
+	// 本地编辑不要求远程锁；只有已知他人持锁才限制编辑。
+	// Local editing requires no remote lock; only known foreign ownership restricts it.
+	switch (State.LockState)
 	{
+	case ELockState::Locked:
 		return true;
-	}
-	if (State.LockState == ELockState::Unlockable)
-	{
+	case ELockState::Unlockable:
+	case ELockState::NotLocked:
+	case ELockState::Unknown:
+	case ELockState::Unset:
 		return IsSourceControlled();
+	default:
+		return false;
 	}
-	if (State.LockState == ELockState::NotLocked)
-	{
-		return IsAdded() || (IsModified() && IsSourceControlled());
-	}
-	return false;
 }
 
 bool FGitSourceControlState::CanDelete() const

@@ -121,10 +121,8 @@ namespace GitSourceControlUtils
 		bool bInUsingGitLfsLocking);
 
 	/**
-	 * 把单端 LFS 的增删事实与认证所有权投影到完整状态；显示用户名不参与权限判断。
-	 * 解锁干净既有文件会显式恢复只读；普通 status 的 Clean+NotLocked 仍可 Preserve 手工 writable 窗口。
-	 * Projects one single-endpoint LFS listing transition into a complete cached state. The resulting
-	 * complete state plus transition provenance owns the permission decision.
+	 * 更新认证锁状态；解锁后仍可本地保存。
+	 * Updates authenticated ownership without disabling local saves after an unlock.
 	 */
 	EGitLocalReadOnlyPolicy ApplyLegacyLfsLockStateTransition(
 		FGitSourceControlState& InOutState,

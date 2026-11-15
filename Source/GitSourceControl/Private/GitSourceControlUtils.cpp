@@ -306,34 +306,7 @@ EGitLocalReadOnlyPolicy GetLocalReadOnlyPolicy(
 		return EGitLocalReadOnlyPolicy::ReadOnly;
 	}
 
-	if (InState.State.LockState == ELockState::Locked)
-	{
-		return EGitLocalReadOnlyPolicy::Writable;
-	}
-
-	if (InState.IsAdded())
-	{
-		const bool bHasWorkableLockState = InState.State.LockState == ELockState::NotLocked
-			|| InState.State.LockState == ELockState::Unlockable;
-		return bHasWorkableLockState
-			? EGitLocalReadOnlyPolicy::Writable
-			: EGitLocalReadOnlyPolicy::ReadOnly;
-	}
-
-	if (InState.IsSourceControlled()
-		&& (InState.State.LockState == ELockState::Unknown
-			|| InState.State.LockState == ELockState::Unset))
-	{
-		// 单端 LFS 的未知/未初始化锁状态不能保留历史 writable 位；UE 在
-		// UsesLocalReadOnlyState 模式按物理位直接放行保存，会绕过 CanEdit。
-		// Unknown/unset single-endpoint LFS state cannot preserve a stale writable bit. In
-		// UsesLocalReadOnlyState mode UE authorizes Save from the physical bit and bypasses CanEdit.
-		return EGitLocalReadOnlyPolicy::ReadOnly;
-	}
-
-	if (InState.State.LockState == ELockState::NotLocked
-		&& InState.IsModified()
-		&& InState.IsSourceControlled())
+	if (InState.CanEdit())
 	{
 		return EGitLocalReadOnlyPolicy::Writable;
 	}
@@ -360,21 +333,7 @@ EGitLocalReadOnlyPolicy ApplyLegacyLfsLockStateTransition(
 		InOutState.State.LockUser.Reset();
 	}
 
-	const EGitLocalReadOnlyPolicy StatePolicy = GetLocalReadOnlyPolicy(
-		InOutState,
-		true);
-	if (!bInLocked
-		&& StatePolicy == EGitLocalReadOnlyPolicy::Preserve
-		&& InOutState.IsSourceControlled()
-		&& !InOutState.IsAdded())
-	{
-		// 锁移除是确定的生命周期边界：干净既有文件必须恢复只读。普通 status 的
-		// Clean+NotLocked 不走这里，仍可 Preserve “Make Writable 后尚未产生 diff”的窗口。
-		// Lock removal is a definite lifecycle boundary, so a clean existing file returns to read-only.
-		// Ordinary Clean+NotLocked status bypasses this block and preserves the pre-diff writable window.
-		return EGitLocalReadOnlyPolicy::ReadOnly;
-	}
-	return StatePolicy;
+	return GetLocalReadOnlyPolicy(InOutState, true);
 }
 
 bool ApplyLocalReadOnlyPolicy(
@@ -2193,6 +2152,7 @@ static void ParseFileStatusResult(
 	TMap<FString, FString> LockedFiles;
 	TMap<FString, FString> Results = InResults;
 	bool bCheckedLockedFiles = false;
+	bool bLockListingAvailable = false;
 	bool bProjectionSettingsSuperseded = false;
 
 	FString Result;
@@ -2255,21 +2215,16 @@ static void ParseFileStatusResult(
 					bSettingsSuperseded;
 				if (bFileSettingsSuperseded)
 				{
-					// 过期命令绝不能在新配置下投影旧 owner/列表结果。所有 lockable 状态先
-					// 失败关闭，下一次 Provider Tick 会提交同代刷新。
-					// A superseded command must never project an old owner or listing under new
-					// settings. Fail every lockable state closed until the provider submits a
-					// same-generation refresh on its next tick.
-					FileState.State.LockUser =
-						TEXT("锁配置已变化，等待刷新");
-					FileState.State.LockState = ELockState::LockedOther;
+					// 旧配置的列表不能表示新配置下的锁所有权。
+					// A listing from old settings cannot establish ownership under new settings.
+					FileState.State.LockState = ELockState::Unknown;
 				}
 				else if (!bCheckedLockedFiles)
 				{
 					bCheckedLockedFiles = true;
 					TArray<FString> ErrorMessages;
 					{
-						GetAllLocks(
+						bLockListingAvailable = GetAllLocks(
 							InRepositoryRoot,
 							InPathToGitBinary,
 							ErrorMessages,
@@ -2290,26 +2245,20 @@ static void ParseFileStatusResult(
 					FTSMessageLog SourceControlLog("SourceControl");
 					for (int32 ErrorIndex = 0; ErrorIndex < ErrorMessages.Num(); ++ErrorIndex)
 					{
-						SourceControlLog.Error(FText::FromString(ErrorMessages[ErrorIndex]));
+						SourceControlLog.Warning(FText::FromString(ErrorMessages[ErrorIndex]));
 					}
 				}
 				if (!bFileSettingsSuperseded
 					&& bProjectionSettingsSuperseded)
 				{
-					// 网络列表返回后再次核对代次，防止设置在等待期间变化后仍把旧结果放开。
-					// Recheck the generation after network listing so a settings change while waiting
-					// cannot make an obsolete result writable.
 					bFileSettingsSuperseded = true;
 					InOutSettingsSuperseded = true;
-					FileState.State.LockUser =
-						TEXT("锁配置已变化，等待刷新");
-					FileState.State.LockState =
-						ELockState::LockedOther;
+					FileState.State.LockState = ELockState::Unknown;
 				}
 				if (bFileSettingsSuperseded)
 				{
-					// 已在上方失败关闭，不接受旧设置的锁状态。
-					// Already failed closed; reject lock state from the old settings.
+					// 等待当前配置的刷新，不采用旧列表。
+					// Wait for a current-settings refresh instead of using the old listing.
 				}
 				else if (LockedFiles.Contains(File))
 				{
@@ -2325,7 +2274,9 @@ static void ParseFileStatusResult(
 				}
 				else
 				{
-					FileState.State.LockState = ELockState::NotLocked;
+					FileState.State.LockState = bLockListingAvailable
+						? ELockState::NotLocked
+						: ELockState::Unknown;
 #if UE_BUILD_DEBUG && GIT_DEBUG_STATUS
 					UE_LOG(LogSourceControl, Log, TEXT("Status(%s) Not Locked"), *File);
 #endif

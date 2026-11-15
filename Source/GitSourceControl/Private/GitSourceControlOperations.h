@@ -17,7 +17,7 @@ namespace GitSourceControlOperations
 	bool IsStateEligibleForCheckInBoundary(
 		const FGitSourceControlState& InState);
 
-	/** index mutation 的状态刷新失败时：仅 lockable LFS 文件失败关闭，普通文件保持 Unlockable。 */
+	/** index 更新后无法刷新时，lockable LFS 文件使用 Unknown，不冒充他人持锁。 */
 	ELockState::Type GetIndexMutationFallbackLockState(
 		bool bUsingGitLfsLocking,
 		const FString& InFilename);

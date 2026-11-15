@@ -220,7 +220,7 @@ ELockState::Type GitSourceControlOperations::GetIndexMutationFallbackLockState(
 {
 	return bUsingGitLfsLocking
 		&& GitSourceControlUtils::IsFileLFSLockable(InFilename)
-			? ELockState::LockedOther
+			? ELockState::Unknown
 			: ELockState::Unlockable;
 }
 
@@ -424,9 +424,8 @@ static const FGitSourceControlState* FindStateByPath(
 }
 
 /**
- * index 已成功变化后立即读取真实 Git/锁状态；只有本地 status 本身失败才投影保守 fallback。
- * Refreshes actual Git/lock state immediately after a successful index mutation. A conservative
- * fallback is projected only when local status itself fails.
+ * index 更新后刷新状态；读取失败时保留已知锁，否则使用 Unknown。
+ * Refreshes state after an index update, retaining known locks or using Unknown if status fails.
  */
 static void CollectStatesAfterIndexMutation(
 	FGitSourceControlCommand& InCommand,
@@ -446,31 +445,41 @@ static void CollectStatesAfterIndexMutation(
 	}
 
 	const FString Warning = TEXT(
-		"Git index 已更新，但无法刷新文件状态；lockable LFS 文件保持失败关闭，下一次 Refresh 将重试。");
+		"Git index 已更新，但无法刷新文件状态；请在提交前刷新状态。");
 	UE_LOG(LogSourceControl, Warning, TEXT("%s"), *Warning);
 	FTSMessageLog SourceControlLog("SourceControl");
 	SourceControlLog.Warning(FText::FromString(Warning));
+	const TMap<FString, FString> CachedLocks = FGitLockedFilesCache::GetLockedFiles();
 	for (const FString& File : InFiles)
 	{
-		const ELockState::Type FallbackLockState =
+		ELockState::Type FallbackLockState =
 			GitSourceControlOperations::GetIndexMutationFallbackLockState(
 				InCommand.bUsingGitLfsLocking,
 				File);
+		const FString* LockUser = CachedLocks.Find(File);
+		if (FallbackLockState == ELockState::Unknown && LockUser)
+		{
+			FallbackLockState = FGitLockedFilesCache::IsOwnedByCurrentCredential(File)
+				? ELockState::Locked
+				: ELockState::LockedOther;
+		}
 		GitSourceControlUtils::CollectNewStates(
 			TArray<FString>{File},
 			OutStates,
 			InFallbackFileState,
 			ETreeState::Staged,
 			FallbackLockState);
-		if (FallbackLockState == ELockState::LockedOther)
+		if (LockUser && (FallbackLockState == ELockState::Locked || FallbackLockState == ELockState::LockedOther))
 		{
-			OutStates.FindChecked(File).LockUser = TEXT("状态刷新失败");
-			if (FPaths::FileExists(File))
-			{
-				GitSourceControlUtils::ApplyLocalReadOnlyPolicy(
-					File,
-					EGitLocalReadOnlyPolicy::ReadOnly);
-			}
+			OutStates.FindChecked(File).LockUser = *LockUser;
+		}
+		if (FPaths::FileExists(File))
+		{
+			FGitSourceControlState FallbackState(File);
+			FallbackState.State = OutStates.FindChecked(File);
+			GitSourceControlUtils::ApplyLocalReadOnlyPolicy(
+				File,
+				GitSourceControlUtils::GetLocalReadOnlyPolicy(FallbackState, InCommand.bUsingGitLfsLocking));
 		}
 	}
 }
