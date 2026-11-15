@@ -33,6 +33,7 @@ namespace EGitState
 		Modified,
 		/** Not modified, but locked explicitly. */
 		CheckedOut,
+		LocalCheckout,
 		/** Locked by us, working tree clean, but local commits touching the file await push. */
 		CommittedUnpushed,
 		Untracked,
@@ -135,6 +136,8 @@ struct FGitState
 	EFileState::Type FileState = EFileState::Unknown;
 	ETreeState::Type TreeState = ETreeState::NotInRepo;
 	ELockState::Type LockState = ELockState::Unknown;
+	/** 已显式完成本地 Checkout；不能据此推断远程持锁。 */
+	bool bLocalCheckout = false;
 	/** Name of user who has locked the file */
 	FString LockUser;
 	ERemoteState::Type RemoteState = ERemoteState::UpToDate;
@@ -185,7 +188,7 @@ public:
 	virtual bool CanCheckIn() const override;
 	virtual bool CanCheckout() const override;
 	virtual bool IsCheckedOut() const override;
-	/** 仅表示当前用户持有插件核验过的远端锁；不包含 UE no-checkout 兼容投影。 */
+	/** 当前用户是否持有核验过的远程锁；本地 Checkout 不算持锁。 */
 	bool HasVerifiedOwnLock() const;
 	virtual bool IsCheckedOutOther(FString* Who = NULL) const override;
 	virtual bool IsCheckedOutInOtherBranch(const FString& CurrentBranch = FString()) const override;

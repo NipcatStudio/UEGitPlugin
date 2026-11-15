@@ -34,6 +34,7 @@
 #include "Logging/MessageLog.h"
 #include "Misc/DateTime.h"
 #include "Misc/ScopeLock.h"
+#include "Misc/SecureHash.h"
 #include "Misc/Timespan.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
@@ -282,6 +283,46 @@ TArray<FGitLockedFilesCache::FLockStateFixup> FGitLockedFilesCache::TakePendingS
 
 namespace GitSourceControlUtils
 {
+static FString GetLocalCheckoutRecordPath(const FString& InFilename)
+{
+	FString Filename = FPaths::ConvertRelativePathToFull(InFilename);
+	FPaths::NormalizeFilename(Filename);
+	FPaths::CollapseRelativeDirectories(Filename);
+#if PLATFORM_WINDOWS
+	Filename.ToLowerInline();
+#endif
+	const FTCHARToUTF8 Utf8Filename(*Filename);
+	const FString Key = FMD5::HashBytes(
+		reinterpret_cast<const uint8*>(Utf8Filename.Get()), Utf8Filename.Length());
+	return FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("SourceControl/LocalCheckouts"), Key + TEXT(".checkout"));
+}
+
+bool IsLocallyCheckedOut(const FString& InFilename)
+{
+	return FPaths::FileExists(GetLocalCheckoutRecordPath(InFilename));
+}
+
+bool SetLocalCheckout(const FString& InFilename, bool bInCheckedOut, FString& OutError)
+{
+	OutError.Reset();
+	const FString RecordPath = GetLocalCheckoutRecordPath(InFilename);
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	if (bInCheckedOut)
+	{
+		if (PlatformFile.CreateDirectoryTree(*FPaths::GetPath(RecordPath))
+			&& FFileHelper::SaveStringToFile(InFilename, *RecordPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+		{
+			return true;
+		}
+	}
+	else if (!PlatformFile.FileExists(*RecordPath) || PlatformFile.DeleteFile(*RecordPath))
+	{
+		return true;
+	}
+	OutError = FString::Printf(TEXT("无法%s本地 Checkout 记录：%s"), bInCheckedOut ? TEXT("写入") : TEXT("清除"), *InFilename);
+	return false;
+}
+
 bool IsLfsReadOnlyPolicyActive(
 	bool bInCommandUsingGitLfsLocking,
 	bool bInSettingsSuperseded,
@@ -301,6 +342,11 @@ EGitLocalReadOnlyPolicy GetLocalReadOnlyPolicy(
 		return EGitLocalReadOnlyPolicy::Preserve;
 	}
 
+	if (InState.State.bLocalCheckout || InState.HasVerifiedOwnLock())
+	{
+		return EGitLocalReadOnlyPolicy::Writable;
+	}
+
 	if (InState.State.LockState == ELockState::LockedOther)
 	{
 		return EGitLocalReadOnlyPolicy::ReadOnly;
@@ -311,7 +357,9 @@ EGitLocalReadOnlyPolicy GetLocalReadOnlyPolicy(
 		return EGitLocalReadOnlyPolicy::Writable;
 	}
 
-	return EGitLocalReadOnlyPolicy::Preserve;
+	return InState.IsSourceControlled()
+		? EGitLocalReadOnlyPolicy::ReadOnly
+		: EGitLocalReadOnlyPolicy::Preserve;
 }
 
 EGitLocalReadOnlyPolicy ApplyLegacyLfsLockStateTransition(
@@ -2203,6 +2251,7 @@ static void ParseFileStatusResult(
 #endif
 			}
 		}
+		FileState.State.bLocalCheckout = bTreatAsLfsLocking && IsLocallyCheckedOut(File);
 		if (!bTreatAsLfsLocking)
 		{
 			FileState.State.LockState = ELockState::Unlockable;
@@ -3230,6 +3279,7 @@ bool UpdateCachedStates(const TMap<const FString, FGitState>& InResults, bool bA
 		}
 		if (bAdvanceStatusTimeStamp)
 		{
+			State->State.bLocalCheckout = bUsingGitLfsLocking && IsLocallyCheckedOut(Pair.Key);
 			State->TimeStamp = Now;
 		}
 #if ENGINE_MAJOR_VERSION == 5

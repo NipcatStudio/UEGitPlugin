@@ -126,25 +126,25 @@ bool FGitSourceControlStateContractMatrixTest::RunTest(const FString& Parameters
 {
 	const TArray<FGitStateContractCase> Cases = {
 		{ TEXT("OrdinaryGitTrackedClean"), EFileState::Unknown, ETreeState::Unmodified, ELockState::Unlockable, ERemoteState::UpToDate, true, false, true, false, false, false, true },
-		{ TEXT("LfsCleanNotLocked"), EFileState::Unknown, ETreeState::Unmodified, ELockState::NotLocked, ERemoteState::UpToDate, false, false, true, true, false, false, false },
+		{ TEXT("LfsCleanNotLocked"), EFileState::Unknown, ETreeState::Unmodified, ELockState::NotLocked, ERemoteState::UpToDate, false, false, false, true, false, false, false },
 		{ TEXT("OfflineModifiedNotLocked"), EFileState::Modified, ETreeState::Working, ELockState::NotLocked, ERemoteState::UpToDate, false, false, true, true, true, true, false },
 		{ TEXT("OwnLockClean"), EFileState::Unknown, ETreeState::Unmodified, ELockState::Locked, ERemoteState::UpToDate, true, false, true, false, true, true, true },
 		{ TEXT("OwnLockModified"), EFileState::Modified, ETreeState::Working, ELockState::Locked, ERemoteState::UpToDate, true, false, true, false, true, true, true },
-		{ TEXT("OtherLockClean"), EFileState::Unknown, ETreeState::Unmodified, ELockState::LockedOther, ERemoteState::UpToDate, false, true, false, false, false, false, false },
-		{ TEXT("OtherLockModified"), EFileState::Modified, ETreeState::Working, ELockState::LockedOther, ERemoteState::UpToDate, false, true, false, false, false, true, false },
+		{ TEXT("OtherLockClean"), EFileState::Unknown, ETreeState::Unmodified, ELockState::LockedOther, ERemoteState::UpToDate, false, false, false, true, false, false, false },
+		{ TEXT("OtherLockModified"), EFileState::Modified, ETreeState::Working, ELockState::LockedOther, ERemoteState::UpToDate, false, false, false, true, false, true, false },
 		{ TEXT("AddedNotLocked"), EFileState::Added, ETreeState::Staged, ELockState::NotLocked, ERemoteState::UpToDate, false, false, true, true, true, true, true },
 		{ TEXT("AddedUnlockable"), EFileState::Added, ETreeState::Staged, ELockState::Unlockable, ERemoteState::UpToDate, false, false, true, false, true, true, true },
-		{ TEXT("AddedLockedOther"), EFileState::Added, ETreeState::Staged, ELockState::LockedOther, ERemoteState::UpToDate, false, true, false, false, false, true, true },
-		{ TEXT("AddedUnknownLock"), EFileState::Added, ETreeState::Staged, ELockState::Unknown, ERemoteState::UpToDate, false, false, true, false, false, true, true },
+		{ TEXT("AddedLockedOther"), EFileState::Added, ETreeState::Staged, ELockState::LockedOther, ERemoteState::UpToDate, false, false, false, true, false, true, true },
+		{ TEXT("AddedUnknownLock"), EFileState::Added, ETreeState::Staged, ELockState::Unknown, ERemoteState::UpToDate, false, false, false, true, false, true, true },
 		{ TEXT("UnknownOutsideRepo"), EFileState::Unknown, ETreeState::NotInRepo, ELockState::Unknown, ERemoteState::UpToDate, false, false, false, false, false, false, false },
 		{ TEXT("Untracked"), EFileState::Unknown, ETreeState::Untracked, ELockState::Unknown, ERemoteState::UpToDate, false, false, false, false, false, false, false },
 		{ TEXT("Ignored"), EFileState::Unknown, ETreeState::Ignored, ELockState::Unknown, ERemoteState::UpToDate, false, false, false, false, false, false, false },
-		{ TEXT("NotCurrentClean"), EFileState::Unknown, ETreeState::Unmodified, ELockState::NotLocked, ERemoteState::NotAtHead, false, false, true, false, false, false, false },
+		{ TEXT("NotCurrentClean"), EFileState::Unknown, ETreeState::Unmodified, ELockState::NotLocked, ERemoteState::NotAtHead, false, false, false, false, false, false, false },
 		{ TEXT("NotCurrentModified"), EFileState::Modified, ETreeState::Working, ELockState::NotLocked, ERemoteState::NotAtHead, false, false, true, false, false, true, false },
 		{ TEXT("ConflictedModified"), EFileState::Unmerged, ETreeState::Working, ELockState::NotLocked, ERemoteState::UpToDate, false, false, true, true, false, true, false },
 		{ TEXT("CommittedUnpushedOwnLock"), EFileState::Unknown, ETreeState::Unmodified, ELockState::Locked, ERemoteState::AheadUnpushed, true, false, true, false, false, false, true },
-		{ TEXT("TrackedUnknownLock"), EFileState::Unknown, ETreeState::Unmodified, ELockState::Unknown, ERemoteState::UpToDate, false, false, true, false, false, false, false },
-		{ TEXT("ModifiedUnknownLock"), EFileState::Modified, ETreeState::Working, ELockState::Unknown, ERemoteState::UpToDate, false, false, true, false, false, true, false },
+		{ TEXT("TrackedUnknownLock"), EFileState::Unknown, ETreeState::Unmodified, ELockState::Unknown, ERemoteState::UpToDate, false, false, false, true, false, false, false },
+		{ TEXT("ModifiedUnknownLock"), EFileState::Modified, ETreeState::Working, ELockState::Unknown, ERemoteState::UpToDate, false, false, false, true, false, true, false },
 	};
 
 	for (const FGitStateContractCase& Case : Cases)
@@ -187,22 +187,25 @@ bool FGitSourceControlStateContractMatrixTest::RunTest(const FString& Parameters
 		const bool bExpectedLocalCapability = bExpectedOwnLock
 			|| LockState == ELockState::NotLocked
 			|| LockState == ELockState::Unlockable;
-		const bool bExpectedLocalEdit = bExpectedLocalCapability
+		const bool bExpectedLocalEdit = bExpectedLocalCapability;
+		const bool bExpectedCheckout = LockState == ELockState::NotLocked
 			|| LockState == ELockState::Unknown
-			|| LockState == ELockState::Unset;
+			|| LockState == ELockState::Unset
+			|| LockState == ELockState::LockedOther;
 		const FString Prefix = FString::Printf(TEXT("Lock enum %d: "), LockValue);
 
 		FGitSourceControlState ModifiedState = MakeState(
 			EFileState::Modified,
 			ETreeState::Working,
 			LockState);
-		const bool bExpectedModifiedCheckout = LockState == ELockState::NotLocked;
+		const bool bExpectedModifiedCheckout = bExpectedCheckout;
 		TestEqual(
 			*(Prefix + TEXT("modified UE checkout projection")),
 			ModifiedState.IsCheckedOut(),
 			bExpectedCheckedOutProjection);
 		TestEqual(*(Prefix + TEXT("modified verified ownership")), ModifiedState.HasVerifiedOwnLock(), bExpectedOwnLock);
-		TestEqual(*(Prefix + TEXT("modified strict other ownership")), ModifiedState.IsCheckedOutOther(), bExpectedOtherLock);
+		TestFalse(*(Prefix + TEXT("foreign lock does not disable native checkout")), ModifiedState.IsCheckedOutOther());
+		TestEqual(*(Prefix + TEXT("remote foreign ownership remains distinct")), ModifiedState.State.LockState == ELockState::LockedOther, bExpectedOtherLock);
 		TestEqual(*(Prefix + TEXT("modified edit allowlist")), ModifiedState.CanEdit(), bExpectedLocalEdit);
 		TestEqual(*(Prefix + TEXT("modified submit allowlist")), ModifiedState.CanCheckIn(), bExpectedLocalCapability);
 		TestEqual(*(Prefix + TEXT("modified delete uses original cached eligibility")), ModifiedState.CanDelete(), !bExpectedOtherLock);
@@ -218,10 +221,10 @@ bool FGitSourceControlStateContractMatrixTest::RunTest(const FString& Parameters
 			EFileState::Added,
 			ETreeState::Staged,
 			LockState);
-		const bool bExpectedAddedCheckout = LockState == ELockState::NotLocked;
+		const bool bExpectedAddedCheckout = bExpectedCheckout;
 		TestEqual(*(Prefix + TEXT("added strict checkout ownership")), AddedState.IsCheckedOut(), bExpectedOwnLock);
 		TestEqual(*(Prefix + TEXT("added verified ownership")), AddedState.HasVerifiedOwnLock(), bExpectedOwnLock);
-		TestEqual(*(Prefix + TEXT("added strict other ownership")), AddedState.IsCheckedOutOther(), bExpectedOtherLock);
+		TestFalse(*(Prefix + TEXT("added native checkout is not blocked by foreign ownership")), AddedState.IsCheckedOutOther());
 		TestEqual(*(Prefix + TEXT("added edit allowlist")), AddedState.CanEdit(), bExpectedLocalEdit);
 		TestEqual(*(Prefix + TEXT("added submit allowlist")), AddedState.CanCheckIn(), bExpectedLocalCapability);
 		TestEqual(*(Prefix + TEXT("added delete uses original cached eligibility")), AddedState.CanDelete(), !bExpectedOtherLock);
@@ -232,13 +235,13 @@ bool FGitSourceControlStateContractMatrixTest::RunTest(const FString& Parameters
 			EFileState::Unknown,
 			ETreeState::Unmodified,
 			LockState);
-		const bool bExpectedCleanEdit = bExpectedLocalEdit;
+		const bool bExpectedCleanEdit = bExpectedOwnLock || bExpectedNoCheckoutAdapter;
 		TestEqual(*(Prefix + TEXT("clean UE checkout projection")), CleanState.IsCheckedOut(), bExpectedCheckedOutProjection);
 		TestEqual(*(Prefix + TEXT("clean verified ownership")), CleanState.HasVerifiedOwnLock(), bExpectedOwnLock);
 		TestEqual(*(Prefix + TEXT("clean edit allowlist")), CleanState.CanEdit(), bExpectedCleanEdit);
 		TestEqual(*(Prefix + TEXT("clean submit allowlist")), CleanState.CanCheckIn(), bExpectedOwnLock);
 		TestEqual(*(Prefix + TEXT("clean delete uses original cached eligibility")), CleanState.CanDelete(), !bExpectedOtherLock);
-		TestEqual(*(Prefix + TEXT("clean checkout allowlist")), CleanState.CanCheckout(), LockState == ELockState::NotLocked);
+		TestEqual(*(Prefix + TEXT("clean checkout allowlist")), CleanState.CanCheckout(), bExpectedCheckout);
 
 		FGitSourceControlState DeletedState = MakeState(
 			EFileState::Deleted,
@@ -258,6 +261,16 @@ bool FGitSourceControlStateContractMatrixTest::RunTest(const FString& Parameters
 			*(Prefix + TEXT("恢复原有过期文件不可删除判断")),
 			NotCurrentCleanState.CanDelete());
 
+		FGitSourceControlState LocalCheckout = ModifiedState;
+		LocalCheckout.State.bLocalCheckout = true;
+		TestTrue(*(Prefix + TEXT("local checkout appears in native Checked Out state")), LocalCheckout.IsCheckedOut());
+		TestTrue(*(Prefix + TEXT("local checkout permits editing")), LocalCheckout.CanEdit());
+		TestTrue(*(Prefix + TEXT("local checkout permits a local commit")), LocalCheckout.CanCheckIn());
+		TestFalse(*(Prefix + TEXT("local checkout is not repeatedly requested")), LocalCheckout.CanCheckout());
+		TestFalse(*(Prefix + TEXT("local checkout remains usable with a foreign remote lock")), LocalCheckout.IsCheckedOutOther());
+		TestEqual(*(Prefix + TEXT("local checkout does not create remote ownership")), LocalCheckout.HasVerifiedOwnLock(), bExpectedOwnLock);
+		TestEqual(*(Prefix + TEXT("local checkout keeps the file writable")),
+			GitSourceControlUtils::GetLocalReadOnlyPolicy(LocalCheckout, true), EGitLocalReadOnlyPolicy::Writable);
 	}
 
 	FGitSourceControlProvider ProviderContract;
@@ -1178,15 +1191,15 @@ bool FGitSourceControlLocalReadOnlyPolicyTest::RunTest(const FString& Parameters
 		{ TEXT("LfsAdded"), EFileState::Added, ETreeState::Staged, ELockState::NotLocked, true, EGitLocalReadOnlyPolicy::Writable },
 		{ TEXT("LfsAddedUnlockable"), EFileState::Added, ETreeState::Staged, ELockState::Unlockable, true, EGitLocalReadOnlyPolicy::Writable },
 		{ TEXT("LfsAddedOtherLock"), EFileState::Added, ETreeState::Staged, ELockState::LockedOther, true, EGitLocalReadOnlyPolicy::ReadOnly },
-		{ TEXT("LfsAddedUnknownLock"), EFileState::Added, ETreeState::Staged, ELockState::Unknown, true, EGitLocalReadOnlyPolicy::Writable },
-		{ TEXT("LfsAddedUnsetLock"), EFileState::Added, ETreeState::Staged, ELockState::Unset, true, EGitLocalReadOnlyPolicy::Writable },
+		{ TEXT("LfsAddedUnknownLock"), EFileState::Added, ETreeState::Staged, ELockState::Unknown, true, EGitLocalReadOnlyPolicy::ReadOnly },
+		{ TEXT("LfsAddedUnsetLock"), EFileState::Added, ETreeState::Staged, ELockState::Unset, true, EGitLocalReadOnlyPolicy::ReadOnly },
 		{ TEXT("LfsOwnLock"), EFileState::Unknown, ETreeState::Unmodified, ELockState::Locked, true, EGitLocalReadOnlyPolicy::Writable },
 		{ TEXT("LfsOtherLock"), EFileState::Unknown, ETreeState::Unmodified, ELockState::LockedOther, true, EGitLocalReadOnlyPolicy::ReadOnly },
 		{ TEXT("LfsOfflineModified"), EFileState::Modified, ETreeState::Working, ELockState::NotLocked, true, EGitLocalReadOnlyPolicy::Writable },
-		{ TEXT("LfsCleanNotLocked"), EFileState::Unknown, ETreeState::Unmodified, ELockState::NotLocked, true, EGitLocalReadOnlyPolicy::Writable },
-		{ TEXT("LfsModifiedUnknownLock"), EFileState::Modified, ETreeState::Working, ELockState::Unknown, true, EGitLocalReadOnlyPolicy::Writable },
-		{ TEXT("LfsCleanUnknownLock"), EFileState::Unknown, ETreeState::Unmodified, ELockState::Unknown, true, EGitLocalReadOnlyPolicy::Writable },
-		{ TEXT("LfsCleanUnsetLock"), EFileState::Unknown, ETreeState::Unmodified, ELockState::Unset, true, EGitLocalReadOnlyPolicy::Writable },
+		{ TEXT("LfsCleanNotLocked"), EFileState::Unknown, ETreeState::Unmodified, ELockState::NotLocked, true, EGitLocalReadOnlyPolicy::ReadOnly },
+		{ TEXT("LfsModifiedUnknownLock"), EFileState::Modified, ETreeState::Working, ELockState::Unknown, true, EGitLocalReadOnlyPolicy::ReadOnly },
+		{ TEXT("LfsCleanUnknownLock"), EFileState::Unknown, ETreeState::Unmodified, ELockState::Unknown, true, EGitLocalReadOnlyPolicy::ReadOnly },
+		{ TEXT("LfsCleanUnsetLock"), EFileState::Unknown, ETreeState::Unmodified, ELockState::Unset, true, EGitLocalReadOnlyPolicy::ReadOnly },
 		{ TEXT("LfsUntracked"), EFileState::Unknown, ETreeState::Untracked, ELockState::NotLocked, true, EGitLocalReadOnlyPolicy::Preserve },
 	};
 
@@ -1209,9 +1222,12 @@ bool FGitSourceControlLocalReadOnlyPolicyTest::RunTest(const FString& Parameters
 		++LockValue)
 	{
 		const ELockState::Type LockState = static_cast<ELockState::Type>(LockValue);
-		const EGitLocalReadOnlyPolicy ExpectedLfs = LockState == ELockState::LockedOther
-			? EGitLocalReadOnlyPolicy::ReadOnly
-			: EGitLocalReadOnlyPolicy::Writable;
+		const bool bWritableModified = LockState == ELockState::Locked
+			|| LockState == ELockState::NotLocked || LockState == ELockState::Unlockable;
+		const EGitLocalReadOnlyPolicy ExpectedModified = bWritableModified
+			? EGitLocalReadOnlyPolicy::Writable : EGitLocalReadOnlyPolicy::ReadOnly;
+		const EGitLocalReadOnlyPolicy ExpectedClean = LockState == ELockState::Locked || LockState == ELockState::Unlockable
+			? EGitLocalReadOnlyPolicy::Writable : EGitLocalReadOnlyPolicy::ReadOnly;
 
 		const FGitSourceControlState AddedState = MakeState(
 			EFileState::Added,
@@ -1242,17 +1258,17 @@ bool FGitSourceControlLocalReadOnlyPolicyTest::RunTest(const FString& Parameters
 		TestEqual(
 			*(Prefix + TEXT("single LFS Added")),
 			static_cast<uint8>(GitSourceControlUtils::GetLocalReadOnlyPolicy(AddedState, true)),
-			static_cast<uint8>(ExpectedLfs));
+			static_cast<uint8>(ExpectedModified));
 
 		TestEqual(
 			*(Prefix + TEXT("single LFS Modified")),
 			static_cast<uint8>(GitSourceControlUtils::GetLocalReadOnlyPolicy(ModifiedState, true)),
-			static_cast<uint8>(ExpectedLfs));
+			static_cast<uint8>(ExpectedModified));
 
 		TestEqual(
 			*(Prefix + TEXT("single LFS Clean")),
 			static_cast<uint8>(GitSourceControlUtils::GetLocalReadOnlyPolicy(CleanState, true)),
-			static_cast<uint8>(ExpectedLfs));
+			static_cast<uint8>(ExpectedClean));
 
 	}
 
@@ -1264,7 +1280,8 @@ bool FGitSourceControlLocalReadOnlyPolicyTest::RunTest(const FString& Parameters
 		const ETreeState::Type TreeState = bModified
 			? ETreeState::Working
 			: ETreeState::Unmodified;
-		const EGitLocalReadOnlyPolicy ExpectedUnlockPolicy = EGitLocalReadOnlyPolicy::Writable;
+		const EGitLocalReadOnlyPolicy ExpectedUnlockPolicy = bModified
+			? EGitLocalReadOnlyPolicy::Writable : EGitLocalReadOnlyPolicy::ReadOnly;
 		const FString Prefix = FString::Printf(
 			TEXT("Legacy transition modified=%d: "),
 			bModified);
@@ -1350,9 +1367,9 @@ bool FGitSourceControlLocalReadOnlyPolicyTest::RunTest(const FString& Parameters
 		TEXT("fresh-state and unlock phases execute in owning order"),
 		TransitionOrder == TArray<FString>{TEXT("fresh"), TEXT("unlock")});
 	TestEqual(
-		TEXT("clean file remains locally writable after Revert/check-in unlock"),
+		TEXT("clean file requires checkout again after Revert/check-in unlock"),
 		static_cast<uint8>(CleanUnlockPolicy),
-		static_cast<uint8>(EGitLocalReadOnlyPolicy::Writable));
+		static_cast<uint8>(EGitLocalReadOnlyPolicy::ReadOnly));
 
 	FGitSourceControlState CachedModifiedAfterWorker = MakeState(
 		EFileState::Unknown,
@@ -1472,6 +1489,8 @@ bool FGitSourceControlLocalReadOnlyPolicyTest::RunTest(const FString& Parameters
 	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
 	ON_SCOPE_EXIT
 	{
+		FString CleanupError;
+		GitSourceControlUtils::SetLocalCheckout(TempFile, false, CleanupError);
 		if (PlatformFile.FileExists(*TempFile))
 		{
 			PlatformFile.SetReadOnly(*TempFile, false);
@@ -1526,16 +1545,16 @@ bool FGitSourceControlLocalReadOnlyPolicyTest::RunTest(const FString& Parameters
 			FailedAddedState,
 			true);
 	TestEqual(
-		TEXT("failed lockable add status still permits local saves"),
+		TEXT("unknown ownership requires checkout rather than implicit writable state"),
 		static_cast<uint8>(FailedAddedPolicy),
-		static_cast<uint8>(EGitLocalReadOnlyPolicy::Writable));
+		static_cast<uint8>(EGitLocalReadOnlyPolicy::ReadOnly));
 	TestTrue(
-		TEXT("failed lockable add status keeps the file writable"),
+		TEXT("unopened file keeps its read-only bit"),
 		GitSourceControlUtils::ApplyLocalReadOnlyPolicy(
 			TempFile,
 			FailedAddedPolicy));
 	TestFalse(TEXT("failed status is not another user's lock"), FailedAddedState.IsCheckedOutOther());
-	TestFalse(TEXT("failed status keeps the file in the Writable filter"), PlatformFile.IsReadOnly(*TempFile));
+	TestTrue(TEXT("checkout is required before local editing"), PlatformFile.IsReadOnly(*TempFile));
 
 	TestTrue(
 		TEXT("offline save starts with a read-only LFS file"),
@@ -1546,10 +1565,17 @@ bool FGitSourceControlLocalReadOnlyPolicyTest::RunTest(const FString& Parameters
 		EFileState::Modified,
 		ETreeState::Working,
 		ELockState::Unknown);
-	TestTrue(TEXT("unknown ownership still permits local editing"), UnknownTrackedState.CanEdit());
+	TestFalse(TEXT("unknown ownership does not implicitly check out the file"), UnknownTrackedState.CanEdit());
+	TestTrue(TEXT("unknown ownership still permits requesting Checkout"), UnknownTrackedState.CanCheckout());
 	TestFalse(TEXT("local editing does not claim a checkout"), UnknownTrackedState.IsCheckedOut());
 	TestFalse(TEXT("local editing does not grant verified ownership"), UnknownTrackedState.HasVerifiedOwnLock());
-	TestFalse(TEXT("unknown ownership still blocks Check In"), UnknownTrackedState.CanCheckIn());
+	TestTrue(TEXT("local Checkout can be persisted"), GitSourceControlUtils::SetLocalCheckout(TempFile, true, FailureReason));
+	UnknownTrackedState.State.bLocalCheckout = GitSourceControlUtils::IsLocallyCheckedOut(TempFile);
+	TestTrue(TEXT("local Checkout survives a new state read"), UnknownTrackedState.State.bLocalCheckout);
+	TestTrue(TEXT("local Checkout is visible to UE"), UnknownTrackedState.IsCheckedOut());
+	TestTrue(TEXT("local Checkout permits editing"), UnknownTrackedState.CanEdit());
+	TestTrue(TEXT("local Checkout permits a local commit"), UnknownTrackedState.CanCheckIn());
+	TestFalse(TEXT("local Checkout does not claim a remote lock"), UnknownTrackedState.HasVerifiedOwnLock());
 	const EGitLocalReadOnlyPolicy UnknownTrackedPolicy =
 		GitSourceControlUtils::GetLocalReadOnlyPolicy(
 			UnknownTrackedState,
@@ -1582,11 +1608,21 @@ bool FGitSourceControlLocalReadOnlyPolicyTest::RunTest(const FString& Parameters
 
 	UnknownTrackedState.State.LockState = ELockState::LockedOther;
 	TestTrue(
-		TEXT("known foreign ownership still applies read-only"),
+		TEXT("local Checkout remains writable even when another user holds the remote lock"),
 		GitSourceControlUtils::ApplyLocalReadOnlyPolicy(
 			TempFile,
 			GitSourceControlUtils::GetLocalReadOnlyPolicy(UnknownTrackedState, true)));
-	TestTrue(TEXT("known foreign ownership still protects the file"), PlatformFile.IsReadOnly(*TempFile));
+	TestFalse(TEXT("remote lock failure does not undo local Checkout"), PlatformFile.IsReadOnly(*TempFile));
+	TestTrue(TEXT("ending local Checkout clears its record"), GitSourceControlUtils::SetLocalCheckout(TempFile, false, FailureReason));
+	UnknownTrackedState.State.bLocalCheckout = GitSourceControlUtils::IsLocallyCheckedOut(TempFile);
+	TestFalse(TEXT("ended local Checkout is not retained on reload"), UnknownTrackedState.State.bLocalCheckout);
+	TestTrue(TEXT("unopened file can request Checkout despite the foreign remote lock"), UnknownTrackedState.CanCheckout());
+	TestTrue(
+		TEXT("ending local Checkout restores read-only"),
+		GitSourceControlUtils::ApplyLocalReadOnlyPolicy(
+			TempFile,
+			GitSourceControlUtils::GetLocalReadOnlyPolicy(UnknownTrackedState, true)));
+	TestTrue(TEXT("unopened file requires Checkout again"), PlatformFile.IsReadOnly(*TempFile));
 
 	FailureReason.Reset();
 	AddExpectedError(

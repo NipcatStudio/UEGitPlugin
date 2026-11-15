@@ -198,7 +198,8 @@ bool FGitSourceControlModule::CanUnlockAssets(const TArray<FAssetData> SelectedA
 	{
 		const FSourceControlStatePtr State = Provider.GetState(
 			SourceControlHelpers::PackageFilename(Asset.PackageName.ToString()), EStateCacheUsage::Use);
-		if (State.IsValid() && StaticCastSharedPtr<FGitSourceControlState>(State)->State.LockState == ELockState::Locked)
+		if (State.IsValid() && (StaticCastSharedPtr<FGitSourceControlState>(State)->HasVerifiedOwnLock()
+			|| StaticCastSharedPtr<FGitSourceControlState>(State)->State.bLocalCheckout))
 		{
 			return true;
 		}
@@ -228,7 +229,7 @@ void FGitSourceControlModule::CreateGitContentBrowserAssetMenu(FMenuBuilder& Men
 	{
 		MenuBuilder.AddMenuEntry(
 			LOCTEXT("UnlockKeepChanges", "Unlock (Keep Changes)"),
-			LOCTEXT("UnlockKeepChangesTooltip", "释放选中资产由当前账号持有的锁，保留本地修改、暂存内容及未推送提交。其他人随后可以签出这些资产。"),
+			LOCTEXT("UnlockKeepChangesTooltip", "结束本地 Checkout，并释放当前账号持有的远程锁；保留本地修改、暂存内容及未推送提交。"),
 			FSlateIcon(),
 			FUIAction(
 				FExecuteAction::CreateRaw(this, &FGitSourceControlModule::UnlockAssets, SelectedAssets),

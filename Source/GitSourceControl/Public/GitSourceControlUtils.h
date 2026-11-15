@@ -106,6 +106,12 @@ private:
 
 namespace GitSourceControlUtils
 {
+	/** 当前工程是否记录了该文件的本地 Checkout。 */
+	bool IsLocallyCheckedOut(const FString& InFilename);
+
+	/** 记录或结束本地 Checkout，不修改文件内容或远程锁。 */
+	bool SetLocalCheckout(const FString& InFilename, bool bInCheckedOut, FString& OutError);
+
 	/**
 	 * 解析状态命令应采用的 LFS 权限模式；设置代次变化时，只要旧命令或新设置任一启用
 	 * LFS，就保持权限收敛，避免旧命令在新锁模式下放开文件。

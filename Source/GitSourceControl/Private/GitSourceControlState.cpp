@@ -124,8 +124,6 @@ FSlateIcon FGitSourceControlState::GetIcon() const
 	case EGitState::Deleted:
 		return GET_ICON_RETURN(MarkedForDelete);
 	case EGitState::Modified:
-		// UE 5.2+ 提供中性的本地修改图标；绿色勾只表示当前用户实际持锁。
-		// UE 5.2+ provides a neutral local-modification icon; reserve the green check for a lock actually owned by the current user.
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 2
 		if (State.LockState != ELockState::Locked)
 		{
@@ -134,6 +132,7 @@ FSlateIcon FGitSourceControlState::GetIcon() const
 #endif
 		return GET_ICON_RETURN(CheckedOut);
 	case EGitState::CheckedOut:
+	case EGitState::LocalCheckout:
 		return GET_ICON_RETURN(CheckedOut);
 	case EGitState::CommittedUnpushed:
 #if ENGINE_MAJOR_VERSION >= 5
@@ -175,6 +174,7 @@ FName FGitSourceControlState::GetSmallIconName() const
 	  return FName("ContentBrowser.SCC_MarkedForDelete_Small");
 	case EGitState::Modified:
         case EGitState::CheckedOut:
+        case EGitState::LocalCheckout:
         case EGitState::CommittedUnpushed:
                 return FName("ContentBrowser.SCC_CheckedOut_Small");
 	case EGitState::Ignored:
@@ -192,7 +192,7 @@ FText FGitSourceControlState::GetDisplayName() const
 	case EGitState::NotAtHead:
 		return LOCTEXT("NotCurrent", "Not current");
 	case EGitState::LockedOther:
-		return FText::Format(LOCTEXT("CheckedOutOther", "Checked out by: {0}"), FText::FromString(State.LockUser));
+		return FText::Format(LOCTEXT("CheckedOutOther", "远程锁由 {0} 持有"), FText::FromString(State.LockUser));
 	case EGitState::NotLatest:
 		return FText::Format(LOCTEXT("ModifiedOtherBranch", "Modified in branch: {0}"), FText::FromString(State.HeadBranch));
 	case EGitState::Unmerged:
@@ -215,6 +215,8 @@ FText FGitSourceControlState::GetDisplayName() const
 		return LOCTEXT("ModifiedLocally", "本地已修改");
 	case EGitState::CheckedOut:
 		return LOCTEXT("CheckedOut", "已 Checkout");
+	case EGitState::LocalCheckout:
+		return LOCTEXT("LocalCheckout", "已 Checkout（未取得远程锁）");
 	case EGitState::CommittedUnpushed:
 		return LOCTEXT("CommittedUnpushed", "Committed, not pushed");
 	case EGitState::Ignored:
@@ -239,7 +241,7 @@ FText FGitSourceControlState::GetDisplayTooltip() const
 	case EGitState::NotAtHead:
 		return LOCTEXT("NotCurrent_Tooltip", "The file(s) are not at the head revision");
 	case EGitState::LockedOther:
-		return FText::Format(LOCTEXT("CheckedOutOther_Tooltip", "Checked out by: {0}"), FText::FromString(State.LockUser));
+		return FText::Format(LOCTEXT("CheckedOutOther_Tooltip", "远程锁由 {0} 持有；本地 Checkout 不会解除它。"), FText::FromString(State.LockUser));
 	case EGitState::NotLatest:
 		return FText::Format(LOCTEXT("ModifiedOtherBranch_Tooltip", "Modified in branch: {0} CL:{1} ({2})"), FText::FromString(State.HeadBranch), FText::FromString(HeadCommit), FText::FromString(HeadAction));
 	case EGitState::Unmerged:
@@ -268,12 +270,18 @@ FText FGitSourceControlState::GetDisplayTooltip() const
 			"文件包含尚未提交的本地修改。");
 	case EGitState::CheckedOut:
 		return LOCTEXT("CheckedOut_Tooltip", "文件已由当前用户 Checkout。");
+	case EGitState::LocalCheckout:
+		if (State.LockState == ELockState::LockedOther)
+		{
+			return FText::Format(LOCTEXT("LocalCheckoutOtherLock_Tooltip", "已完成本地 Checkout，可继续保存；远程锁由 {0} 持有，Push 前须解决冲突。"), FText::FromString(State.LockUser));
+		}
+		return LOCTEXT("LocalCheckout_Tooltip", "已完成本地 Checkout，可继续保存；未取得远程锁，Push 前会重新检查。");
 	case EGitState::CommittedUnpushed:
 		return LOCTEXT("CommittedUnpushed_Tooltip", "All local changes are committed and waiting to be pushed; the lock is held until the push lands.");
 	case EGitState::Ignored:
 		return LOCTEXT("Ignored_Tooltip", "Item is being ignored.");
 	case EGitState::Lockable:
-		return LOCTEXT("NotCheckedOut_Tooltip", "当前未持有 LFS 锁；本地保存无需签出。");
+		return LOCTEXT("NotCheckedOut_Tooltip", "保存前需要 Checkout；远程锁申请失败时仍可完成本地 Checkout。");
 	case EGitState::None:
 		return LOCTEXT("Unknown_Tooltip", "Unknown revision control state");
 	default:
@@ -294,6 +302,10 @@ const FDateTime& FGitSourceControlState::GetTimeStamp() const
 // Deleted and Missing assets cannot appear in the Content Browser, but they do in the Submit files to Revision Control window!
 bool FGitSourceControlState::CanCheckIn() const
 {
+	if (State.bLocalCheckout && IsSourceControlled() && IsCurrent() && !IsConflicted() && (IsAdded() || IsModified()))
+	{
+		return true;
+	}
 	// We can check in if this is new content
 	if (IsAdded())
 	{
@@ -340,32 +352,27 @@ bool FGitSourceControlState::CanCheckIn() const
 
 bool FGitSourceControlState::CanCheckout() const
 {
-	if (State.LockState == ELockState::Unlockable)
+	if (State.bLocalCheckout || HasVerifiedOwnLock())
 	{
-		// Everything is already available for check in (checked out).
 		return false;
 	}
-	else
+	switch (State.LockState)
 	{
-		// 只有未锁定且当前版本的受控文件才能取得锁，避免修改过期的二进制内容。
-		// Only unlocked, current, controlled files may acquire a lock; stale binary edits risk merge conflicts.
-		const bool bCanAcquireOrdinaryLock = State.LockState == ELockState::NotLocked;
-		return bCanAcquireOrdinaryLock
-			&& IsCurrent()
-			&& IsSourceControlled();
+	case ELockState::NotLocked:
+	case ELockState::Unknown:
+	case ELockState::Unset:
+	case ELockState::LockedOther:
+		return IsCurrent() && IsSourceControlled();
+	default:
+		return false;
 	}
 }
 
 bool FGitSourceControlState::IsCheckedOut() const
 {
-	// UE 5.7 同一接口既驱动 Checked Out Filter，又是 SettingsHelpers、Wwise 和删除预处理
-	// 判断 no-checkout provider 文件“已打开可编辑”的唯一入口。Locked 仍是远端所有权；
-	// Unlockable 只是 UE 兼容投影。LFS lockable 的 NotLocked/离线 Modified 不再伪装为 checkout。
-	// UE 5.7 uses this one interface for both the Checked Out filter and the only "opened/editable"
-	// signal consumed by SettingsHelpers, Wwise, and delete preprocessing for no-checkout providers.
-	// Locked remains remote ownership; Unlockable is an explicit UE adapter. LFS NotLocked states do
-	// not masquerade as checkout.
-	return HasVerifiedOwnLock()
+	// Checkout 表示已打开供本地编辑；远程持锁只能由 HasVerifiedOwnLock 判断。
+	// Checkout means opened for local editing; only HasVerifiedOwnLock establishes remote ownership.
+	return State.bLocalCheckout || HasVerifiedOwnLock()
 		|| (State.LockState == ELockState::Unlockable && !IsAdded());
 }
 
@@ -387,7 +394,9 @@ bool FGitSourceControlState::IsCheckedOutOther(FString* Who) const
 			*Who = State.LockUser;
 		}
 	}
-	return State.LockState == ELockState::LockedOther;
+	// 远程锁不再禁用本地 Checkout；持有人仍由图标、提示和 Push 校验展示。
+	// Remote locks no longer disable local checkout; badges, tooltips, and push validation retain ownership.
+	return State.LockState == ELockState::LockedOther && !State.bLocalCheckout && !CanCheckout();
 }
 
 bool FGitSourceControlState::IsCheckedOutInOtherBranch(const FString& CurrentBranch) const
@@ -442,27 +451,23 @@ bool FGitSourceControlState::IsIgnored() const
 
 bool FGitSourceControlState::CanEdit() const
 {
-	// 本地编辑不要求远程锁；只有已知他人持锁才限制编辑。
-	// Local editing requires no remote lock; only known foreign ownership restricts it.
-	switch (State.LockState)
+	if (State.bLocalCheckout || HasVerifiedOwnLock())
 	{
-	case ELockState::Locked:
 		return true;
-	case ELockState::Unlockable:
-	case ELockState::NotLocked:
-	case ELockState::Unknown:
-	case ELockState::Unset:
-		return IsSourceControlled();
-	default:
-		return false;
 	}
+	if (State.LockState == ELockState::Unlockable)
+	{
+		return IsSourceControlled();
+	}
+	return State.LockState == ELockState::NotLocked
+		&& (IsAdded() || (IsModified() && IsSourceControlled()));
 }
 
 bool FGitSourceControlState::CanDelete() const
 {
 	// 恢复原有缓存状态判断，不在这里额外刷新状态或联网校验。
 	// Restore the original cached-state predicate without an extra refresh or network validation here.
-	return IsCurrent() && !IsCheckedOutOther() && IsSourceControlled();
+	return IsCurrent() && State.LockState != ELockState::LockedOther && IsSourceControlled();
 }
 
 bool FGitSourceControlState::IsUnknown() const
@@ -498,11 +503,15 @@ bool FGitSourceControlState::CanRevert() const
 	}
 	// Can revert the file state if we modified, even if it was locked by someone else.
 	// Useful for when someone locked a file, and you just wanna play around with it locallly, and then revert it.
-	return CanCheckIn() || IsModified();
+	return State.bLocalCheckout || CanCheckIn() || IsModified();
 }
 
 EGitState::Type FGitSourceControlState::GetGitState() const
 {
+	if (State.bLocalCheckout && !HasVerifiedOwnLock() && IsCurrent() && !IsConflicted() && !IsAdded() && !IsDeleted())
+	{
+		return EGitState::LocalCheckout;
+	}
 	// No matter what, we must pull from remote, even if we have locked or if we have modified.
 	switch (State.RemoteState)
 	{

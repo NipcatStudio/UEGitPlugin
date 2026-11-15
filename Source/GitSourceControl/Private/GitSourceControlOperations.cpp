@@ -405,6 +405,21 @@ static bool RunUpdateStatusForCommand(
 		KnownChangelistFiles);
 }
 
+static bool EndLocalCheckouts(FGitSourceControlCommand& InCommand, const TArray<FString>& InFiles)
+{
+	bool bSuccess = true;
+	for (const FString& File : InFiles)
+	{
+		FString Error;
+		if (!GitSourceControlUtils::SetLocalCheckout(File, false, Error))
+		{
+			InCommand.ResultInfo.ErrorMessages.Add(Error);
+			bSuccess = false;
+		}
+	}
+	return bSuccess;
+}
+
 static const FGitSourceControlState* FindStateByPath(
 	const TMap<FString, FGitSourceControlState>& InStates,
 	const FString& InFile)
@@ -477,6 +492,7 @@ static void CollectStatesAfterIndexMutation(
 		{
 			FGitSourceControlState FallbackState(File);
 			FallbackState.State = OutStates.FindChecked(File);
+			FallbackState.State.bLocalCheckout = GitSourceControlUtils::IsLocallyCheckedOut(File);
 			GitSourceControlUtils::ApplyLocalReadOnlyPolicy(
 				File,
 				GitSourceControlUtils::GetLocalReadOnlyPolicy(FallbackState, InCommand.bUsingGitLfsLocking));
@@ -536,9 +552,8 @@ static bool ValidateStatesBeforeCheckIn(FGitSourceControlCommand& InCommand)
 }
 
 /**
- * 单端 LFS 允许断网 local commit，但 push 前必须用 raw 新鲜列表拒绝其他用户的锁。
- * Single-endpoint LFS permits an offline local commit, but push must use a fresh raw listing to
- * reject locks owned by another user.
+ * 本地 Checkout 可离线提交；Push 前按新鲜认证身份检查锁，不比较显示用户名。
+ * Local checkouts permit offline commits; push checks fresh authenticated ownership, not display names.
  */
 static bool ValidateLegacyLfsLocksBeforePush(
 	FGitSourceControlCommand& InCommand,
@@ -555,13 +570,15 @@ static bool ValidateLegacyLfsLocksBeforePush(
 		return true;
 	}
 
-	TMap<FString, FString> RawLocks;
-	if (!GitSourceControlUtils::GetAuthoritativeLfsLocks(
-			InCommand.PathToGitRoot,
-			InCommand.PathToGitBinary,
-			RawLocks,
-			InCommand.ResultInfo.ErrorMessages))
+	TArray<FString> Lines;
+	TArray<GitLfsUnlock::FVerifiedLock> Locks;
+	FString ParseError;
+	const bool bListed = GitSourceControlUtils::RunLFSCommand(
+		TEXT("locks"), InCommand.PathToGitRoot, InCommand.PathToGitBinary,
+		{TEXT("--verify")}, {}, Lines, InCommand.ResultInfo.ErrorMessages);
+	if (!GitLfsUnlock::ParseVerification(bListed, Lines, Locks, ParseError))
 	{
+		InCommand.ResultInfo.ErrorMessages.Add(ParseError);
 		InCommand.ResultInfo.ErrorMessages.Add(
 			TEXT("Push 被阻止：无法取得新鲜 Git LFS 锁列表；本地 commit 已保留，可联网后重试 Push。"));
 		return false;
@@ -569,24 +586,14 @@ static bool ValidateLegacyLfsLocksBeforePush(
 
 	for (const FString& File : LockableFiles)
 	{
-		const FString* Owner = RawLocks.Find(File);
-		if (!Owner)
+		const auto* Lock = Locks.FindByPredicate([&](const GitLfsUnlock::FVerifiedLock& Entry)
 		{
-			for (const auto& Lock : RawLocks)
-			{
-				if (FPaths::IsSamePath(Lock.Key, File))
-				{
-					Owner = &Lock.Value;
-					break;
-				}
-			}
-		}
-		if (Owner && *Owner != InCommand.LfsUserName)
+			return FPaths::IsSamePath(FPaths::ConvertRelativePathToFull(InCommand.PathToGitRoot, Entry.RelativePath), File);
+		});
+		if (Lock && !Lock->bOurs)
 		{
 			InCommand.ResultInfo.ErrorMessages.Add(FString::Printf(
-				TEXT("Push 被阻止：文件当前由其他 Git LFS 用户“%s”锁定：%s"),
-				**Owner,
-				*File));
+				TEXT("Push 被阻止：文件的远程锁由其他账号持有：%s"), *File));
 			return false;
 		}
 	}
@@ -664,120 +671,141 @@ FName FGitCheckOutWorker::GetName() const
 
 bool FGitCheckOutWorker::Execute(FGitSourceControlCommand& InCommand)
 {
-	// If we have nothing to process, exit immediately
-	if (InCommand.Files.Num() == 0)
+	check(InCommand.Operation->GetName() == GetName());
+	InCommand.bCommandSuccessful = false;
+	if (InCommand.Files.IsEmpty())
 	{
+		InCommand.bCommandSuccessful = true;
+		return true;
+	}
+	if (!InCommand.bUsingGitLfsLocking)
+	{
+		return false;
+	}
+
+	const TArray<FString> RelativeFiles = GitSourceControlUtils::RelativeFilenames(InCommand.Files, InCommand.PathToGitRoot);
+	const TArray<FString> LockableFiles = RelativeFiles.FilterByPredicate(GitSourceControlUtils::IsFileLFSLockable);
+	if (LockableFiles.IsEmpty())
+	{
+		InCommand.bCommandSuccessful = true;
 		return true;
 	}
 
-	check(InCommand.Operation->GetName() == GetName());
-
-	if (!InCommand.bUsingGitLfsLocking)
+	for (const FString& RelativeFile : LockableFiles)
 	{
-		InCommand.bCommandSuccessful = false;
-		return InCommand.bCommandSuccessful;
-	}
-
-	// lock files: execute the LFS command on relative filenames
-	const TArray<FString>& RelativeFiles = GitSourceControlUtils::RelativeFilenames(InCommand.Files, InCommand.PathToGitRoot);
-
-	const TArray<FString>& LockableRelativeFiles = RelativeFiles.FilterByPredicate(GitSourceControlUtils::IsFileLFSLockable);
-
-	if (LockableRelativeFiles.Num() < 1)
-	{
-		InCommand.bCommandSuccessful = true;
-		return InCommand.bCommandSuccessful;
-	}
-
-	UE_LOG(LogSourceControl, Display, TEXT("LFS 签出上下文：仓库=%s；文件=%s"),
-		*InCommand.PathToGitRoot, *FString::Join(LockableRelativeFiles, TEXT("；")));
-	const FString& LockUser = InCommand.LfsUserName;
-	bool bSuccess = false;
-	{
-		bool bLockWriteAttempted = false;
-		bSuccess = GitSourceControlUtils::RunLFSCommandWithPreWriteBoundary(
-			TEXT("lock"),
-			InCommand.PathToGitRoot,
-			InCommand.PathToGitBinary,
-			FGitSourceControlModule::GetEmptyStringArray(),
-			LockableRelativeFiles,
-			[&]()
-			{
-				const bool bBoundaryPassed = EnsureLockCommandWriteBoundary(
-					InCommand,
-					TEXT("Git LFS lock"),
-					InCommand.ResultInfo.ErrorMessages);
-				bLockWriteAttempted |= bBoundaryPassed;
-				return bBoundaryPassed;
-			},
-			InCommand.ResultInfo.InfoMessages,
-			InCommand.ResultInfo.ErrorMessages);
-		if (bLockWriteAttempted && !bSuccess)
+		const FString File = FPaths::ConvertRelativePathToFull(InCommand.PathToGitRoot, RelativeFile);
+		if (!FPaths::IsUnderDirectory(File, InCommand.PathToGitRoot) || !FPaths::FileExists(File))
 		{
-			// 部分托管服务（已在 git.code.tencent.com 观察到）的 lock POST 可能在服务器
-			// 成功后于客户端超时；用新鲜权威列表确认全部路径仍由当前用户持有，避免把
-			// 已成功的 checkout 永久表现为失败。
-			// The lock endpoint of some hosts (observed on git.code.tencent.com) is flaky: the
-			// lock POST can time out client-side while the lock is created server-side, after
-			// which every retry fails with "lock already created" and checkout looks permanently
-			// broken to the user. Confirm against a fresh listing - if we own the lock for every
-			// file we asked for, this checkout has in fact succeeded.
-			TArray<GitLfsUnlock::FVerifiedLock> ServerLocks;
-			TArray<FString> LockListingErrors;
-			TArray<FString> LockLines;
-			FString ParseError;
-			const bool bListed = GitSourceControlUtils::RunLFSCommand(
-				TEXT("locks"), InCommand.PathToGitRoot, InCommand.PathToGitBinary,
-				{TEXT("--verify")}, FGitSourceControlModule::GetEmptyStringArray(), LockLines, LockListingErrors);
-			if (GitLfsUnlock::ParseVerification(bListed, LockLines, ServerLocks, ParseError))
-			{
-				bSuccess = true;
-				for (const FString& RelativeFile : LockableRelativeFiles)
-				{
-					const auto* Verified = ServerLocks.FindByPredicate([&](const GitLfsUnlock::FVerifiedLock& Entry)
-					{
-						return FPaths::IsSamePath(Entry.RelativePath, RelativeFile);
-					});
-					if (!Verified || !Verified->bOurs)
-					{
-						bSuccess = false;
-						break;
-					}
-				}
-				if (bSuccess)
-				{
-					UE_LOG(LogSourceControl, Warning, TEXT("CheckOut: 'git lfs lock' reported failure but the server lists us as lock owner of all %d file(s); treating the checkout as successful."), LockableRelativeFiles.Num());
-				}
-			}
-			else
-			{
-				InCommand.ResultInfo.ErrorMessages.Append(LockListingErrors);
-				InCommand.ResultInfo.ErrorMessages.Add(ParseError);
-			}
+			InCommand.ResultInfo.ErrorMessages.Add(FString::Printf(TEXT("Checkout 文件不存在或不属于当前仓库：%s"), *File));
+			return false;
 		}
+	}
+
+	TArray<FString> RemoteErrors;
+	bool bBoundaryRejected = false;
+	const bool bLocked = GitSourceControlUtils::RunLFSCommandWithPreWriteBoundary(
+		TEXT("lock"), InCommand.PathToGitRoot, InCommand.PathToGitBinary,
+		{}, LockableFiles,
+		[&]()
+		{
+			const bool bAllowed = EnsureLockCommandWriteBoundary(InCommand, TEXT("Git LFS lock"), InCommand.ResultInfo.ErrorMessages);
+			bBoundaryRejected |= !bAllowed;
+			return bAllowed;
+		},
+		InCommand.ResultInfo.InfoMessages, RemoteErrors);
+	if (bBoundaryRejected || !EnsureLockCommandWriteBoundary(InCommand, TEXT("Checkout"), InCommand.ResultInfo.ErrorMessages))
+	{
+		return false;
+	}
+
+	TArray<GitLfsUnlock::FVerifiedLock> VerifiedLocks;
+	TArray<FString> LockLines;
+	bool bVerified = false;
+	if (!bLocked)
+	{
+		FString ParseError;
+		const bool bListed = GitSourceControlUtils::RunLFSCommand(
+			TEXT("locks"), InCommand.PathToGitRoot, InCommand.PathToGitBinary,
+			{TEXT("--verify")}, {}, LockLines, RemoteErrors);
+		bVerified = GitLfsUnlock::ParseVerification(bListed, LockLines, VerifiedLocks, ParseError);
+		if (!bVerified)
+		{
+			RemoteErrors.Add(ParseError);
+		}
+	}
+
+	const TMap<FString, FString> CachedLocks = FGitLockedFilesCache::GetLockedFiles();
+	bool bSuccess = true;
+	TArray<FString> LocalFiles;
+	for (const FString& RelativeFile : LockableFiles)
+	{
+		if (!EnsureLockCommandWriteBoundary(InCommand, TEXT("Checkout"), InCommand.ResultInfo.ErrorMessages))
+		{
+			bSuccess = false;
+			break;
+		}
+		const FString File = FPaths::ConvertRelativePathToFull(InCommand.PathToGitRoot, RelativeFile);
+		const int32 LockIndex = VerifiedLocks.IndexOfByPredicate([&](const GitLfsUnlock::FVerifiedLock& Lock)
+		{
+			return FPaths::IsSamePath(Lock.RelativePath, RelativeFile);
+		});
+		const bool bOwned = bLocked || (LockIndex != INDEX_NONE && VerifiedLocks[LockIndex].bOurs);
+		ELockState::Type LockState = bOwned ? ELockState::Locked
+			: bVerified ? ELockState::NotLocked : ELockState::Unknown;
+		FString LockUser = bOwned ? InCommand.LfsUserName : FString();
+		if (!bOwned && LockIndex != INDEX_NONE)
+		{
+			LockState = ELockState::LockedOther;
+			const FString& Line = LockLines[LockIndex];
+			const int32 OwnerStart = Line.Find(TEXT("\t")) + 1;
+			const int32 OwnerEnd = Line.Find(TEXT("\tID:"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+			LockUser = Line.Mid(OwnerStart, OwnerEnd - OwnerStart).TrimStartAndEnd();
+		}
+		else if (!bOwned && !bVerified && CachedLocks.Contains(File))
+		{
+			LockState = FGitLockedFilesCache::IsOwnedByCurrentCredential(File)
+				? ELockState::Locked : ELockState::LockedOther;
+			LockUser = CachedLocks[File];
+		}
+
+		FString Error;
+		if (!GitSourceControlUtils::SetLocalCheckout(File, !bOwned, Error)
+			|| !GitSourceControlUtils::ApplyLocalReadOnlyPolicy(File, EGitLocalReadOnlyPolicy::Writable, &Error))
+		{
+			InCommand.ResultInfo.ErrorMessages.Add(Error);
+			if (!bOwned)
+			{
+				EndLocalCheckouts(InCommand, {File});
+			}
+			bSuccess = false;
+			continue;
+		}
+		if (bOwned)
+		{
+			FGitLockedFilesCache::AddLockedFile(File, InCommand.LfsUserName);
+		}
+		else
+		{
+			LocalFiles.Add(File);
+		}
+		GitSourceControlUtils::CollectNewStates({File}, States, EFileState::Unset, ETreeState::Unset, LockState);
+		FGitState& State = States.FindChecked(File);
+		State.LockUser = LockUser;
+		State.bLocalCheckout = !bOwned;
+	}
+
+	if (!LocalFiles.IsEmpty())
+	{
+		const FString Warning = FString::Printf(TEXT("未取得远程锁，已完成本地 Checkout：%s"), *FString::Join(LocalFiles, TEXT("；")));
+		InCommand.ResultInfo.InfoMessages.Add(Warning);
+		UE_LOG(LogSourceControl, Warning, TEXT("%s"), *Warning);
+	}
+	for (const FString& Error : RemoteErrors)
+	{
+		UE_LOG(LogSourceControl, Warning, TEXT("%s"), *Error);
 	}
 	InCommand.bCommandSuccessful = bSuccess;
-	if (bSuccess)
-	{
-		TArray<FString> AbsoluteFiles;
-		for (const auto& RelativeFile : LockableRelativeFiles)
-		{
-			FString AbsoluteFile = FPaths::Combine(InCommand.PathToGitRoot, RelativeFile);
-			FPaths::NormalizeFilename(AbsoluteFile);
-			{
-				FGitLockedFilesCache::AddLockedFile(AbsoluteFile, LockUser);
-			}
-			AbsoluteFiles.Add(AbsoluteFile);
-		}
-
-		GitSourceControlUtils::CollectNewStates(AbsoluteFiles, States, EFileState::Unset, ETreeState::Unset, ELockState::Locked);
-		for (auto& State : States)
-		{
-			State.Value.LockUser = LockUser;
-		}
-	}
-
-	return InCommand.bCommandSuccessful;
+	return bSuccess;
 }
 
 bool FGitCheckOutWorker::UpdateStates() const
@@ -1360,6 +1388,11 @@ bool FGitCheckInWorker::Execute(FGitSourceControlCommand& InCommand)
 		// Before, we added only lockable files from CommittedFiles. But now, we want to update all files, not just lockables.
 		FilesToCheckIn.Append(CommittedFiles);
 
+		if (InCommand.bCommandSuccessful)
+		{
+			InCommand.bCommandSuccessful &= EndLocalCheckouts(InCommand, FilesToCheckIn.Array());
+		}
+
 		// now update the status of our files
 		TMap<FString, FGitSourceControlState> UpdatedStates;
 		bool bSuccess = RunUpdateStatusForCommand(
@@ -1541,8 +1574,13 @@ bool FGitRevertWorker::Execute(FGitSourceControlCommand& InCommand)
 			InCommand.bCommandSuccessful = false;
 			return false;
 		}
-		const bool bReleased = RunLFSUnlockIdempotent(InCommand, InCommand.Files,
-			InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages, true);
+		const TArray<FString> RemoteFiles = InCommand.Files.FilterByPredicate([](const FString& File)
+		{
+			return !GitSourceControlUtils::IsLocallyCheckedOut(File) || FGitLockedFilesCache::IsOwnedByCurrentCredential(File);
+		});
+		const bool bReleased = (RemoteFiles.IsEmpty() || RunLFSUnlockIdempotent(InCommand, RemoteFiles,
+			InCommand.ResultInfo.InfoMessages, InCommand.ResultInfo.ErrorMessages, true))
+			&& EndLocalCheckouts(InCommand, InCommand.Files);
 		TMap<FString, FGitSourceControlState> UpdatedStates;
 		const bool bRefreshed = RunUpdateStatusForCommand(InCommand, InCommand.Files,
 			InCommand.ResultInfo.ErrorMessages, UpdatedStates);
@@ -1654,6 +1692,7 @@ bool FGitRevertWorker::Execute(FGitSourceControlCommand& InCommand)
 		}
 	}
 
+	const bool bLocalRevertSucceeded = InCommand.bCommandSuccessful;
 	if (InCommand.bUsingGitLfsLocking)
 	{
 		// unlock files: execute the LFS command on relative filenames
@@ -1662,7 +1701,11 @@ bool FGitRevertWorker::Execute(FGitSourceControlCommand& InCommand)
 		{
 			// 普通 LFS 的解锁与无锁确认不能由可能过期的图标缓存筛掉。
 			// A stale badge cache must not skip ordinary LFS release or authoritative absence checks.
-			LockedFiles = OtherThanAddedExistingFiles.FilterByPredicate(GitSourceControlUtils::IsFileLFSLockable);
+			LockedFiles = OtherThanAddedExistingFiles.FilterByPredicate([](const FString& File)
+			{
+				return GitSourceControlUtils::IsFileLFSLockable(File)
+					&& (!GitSourceControlUtils::IsLocallyCheckedOut(File) || FGitLockedFilesCache::IsOwnedByCurrentCredential(File));
+			});
 		}
 		if (LockedFiles.Num() > 0)
 		{
@@ -1699,6 +1742,10 @@ bool FGitRevertWorker::Execute(FGitSourceControlCommand& InCommand)
 		for (const auto& File : MissingFiles) FilesToUpdate.Add(File);
 		for (const auto& File : AllExistingFiles) FilesToUpdate.Add(File);
 		for (const auto& File : OtherThanAddedExistingFiles) FilesToUpdate.Add(File);
+	}
+	if (bLocalRevertSucceeded)
+	{
+		InCommand.bCommandSuccessful &= EndLocalCheckouts(InCommand, FilesToUpdate);
 	}
 
 	// now update the status of our files
