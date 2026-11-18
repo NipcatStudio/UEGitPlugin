@@ -31,6 +31,13 @@ public class GitSourceControl : ModuleRules
 			PrivateDependencyModuleNames.Add("ToolMenus");
 		}
 
+		bool bUsePreSubmitValidation = Target.Version.MajorVersion == 5 && Target.Version.MinorVersion >= 7;
+		PrivateDefinitions.Add($"UEGIT_WITH_PRE_SUBMIT_VALIDATION={(bUsePreSubmitValidation ? 1 : 0)}");
+		if (bUsePreSubmitValidation)
+		{
+			PrivateDependencyModuleNames.AddRange(new string[] { "AssetRegistry", "DataValidation" });
+		}
+
 		if (Target.Platform == UnrealTargetPlatform.Win64)
 		{
 			RuntimeDependencies.Add("$(PluginDir)/git-lfs.exe");

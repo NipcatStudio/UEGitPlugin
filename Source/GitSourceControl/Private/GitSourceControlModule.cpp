@@ -6,6 +6,9 @@
 #include "GitSourceControlModule.h"
 
 #include "GitSourceControlStyle.h"
+#if UEGIT_WITH_PRE_SUBMIT_VALIDATION
+#include "GitPreSubmitValidation.h"
+#endif
 
 #include "AssetToolsModule.h"
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
@@ -126,10 +129,16 @@ void FGitSourceControlModule::StartupModule()
 	TArray<FContentBrowserMenuExtender_SelectedAssets>& CBAssetMenuExtenderDelegates = ContentBrowserModule.GetAllAssetViewContextMenuExtenders();
 	CBAssetMenuExtenderDelegates.Add(FContentBrowserMenuExtender_SelectedAssets::CreateRaw( this, &FGitSourceControlModule::OnExtendContentBrowserAssetSelectionMenu ));
 	CbdHandle_OnExtendAssetSelectionMenu = CBAssetMenuExtenderDelegates.Last().GetHandle();
+#if UEGIT_WITH_PRE_SUBMIT_VALIDATION
+	GitPreSubmitValidation::Startup();
+#endif
 }
 
 void FGitSourceControlModule::ShutdownModule()
 {
+#if UEGIT_WITH_PRE_SUBMIT_VALIDATION
+	GitPreSubmitValidation::Shutdown();
+#endif
 	FGitSourceControlStyle::Shutdown();
 
 	// shut down the provider, as this module is going away
