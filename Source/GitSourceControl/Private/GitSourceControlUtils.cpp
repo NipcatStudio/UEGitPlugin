@@ -2141,6 +2141,7 @@ static void ParseDirectoryStatusResult(const bool InUsingLfsLocking, const TMap<
 		{
 			FileState.State.FileState = StatusParser.FileState;
 			FileState.State.TreeState = StatusParser.TreeState;
+			FileState.State.bLocalCheckout = InUsingLfsLocking && IsLocallyCheckedOut(Result.Key);
 			OutStates.Add(Result.Key, MoveTemp(FileState));
 		}
 	}
@@ -2424,6 +2425,7 @@ bool ParseStatusResults(
 			{
 				FGitSourceControlState IgnoredState(KnownFile);
 				IgnoredState.State.TreeState = ETreeState::Ignored;
+				IgnoredState.State.bLocalCheckout = InUsingLfsLocking && IsLocallyCheckedOut(KnownFile);
 				OutStates.Add(KnownFile, MoveTemp(IgnoredState));
 			}
 		}
@@ -3279,7 +3281,8 @@ bool UpdateCachedStates(const TMap<const FString, FGitState>& InResults, bool bA
 		}
 		if (bAdvanceStatusTimeStamp)
 		{
-			State->State.bLocalCheckout = bUsingGitLfsLocking && IsLocallyCheckedOut(Pair.Key);
+			State->State.bLocalCheckout = bUsingGitLfsLocking &&
+				(NewState.bFromStatus ? NewState.bLocalCheckout : IsLocallyCheckedOut(Pair.Key));
 			State->TimeStamp = Now;
 		}
 #if ENGINE_MAJOR_VERSION == 5
